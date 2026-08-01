@@ -72,3 +72,125 @@ jobs:
             echo '::error::expected exactly OK (skipped=2) - the DB test environment recipe broke'
             exit 1
           }
+
+  # Extraction-plan step 7 (facade hardening): grep gates pinning the runner
+  # side of the runner/GTM boundary. Plain bash, no Python, no services. All
+  # gates scan ONLY src/ — tests/ are exempt (they may spell provider names
+  # and GTM history). Each step says what it forbids, why, and its
+  # allowlist; on a hit the step prints the offending lines and exits 1.
+  # A gate must fail loudly, never pass as "no hits", when the scan itself
+  # breaks: each step first checks its scan directory exists (a renamed/
+  # removed dir — deterministic on every grep flavor), and every grep's
+  # status is captured explicitly so exit 2 (an unreadable file, a broken
+  # pattern) also fails the step.
+  boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # WHAT: any `import core...` / `from core...` in the shipped package.
+      # WHY:  the dependency arrow points one way — GTM imports agent_runner
+      #       (extraction step 6); the runner must never import GTM code.
+      # Allowlist: none.
+      - name: No GTM imports in src/
+        run: |
+          if [ ! -d src ]; then
+            echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
+            exit 2
+          fi
+          status=0
+          grep -rnE '^[[:space:]]*(from|import)[[:space:]]+core([.[:space:]]|$)' src > gtm_import_hits.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
+            exit "$status"
+          fi
+          if [ -s gtm_import_hits.txt ]; then
+            cat gtm_import_hits.txt
+            echo '::error::runner src/ imports GTM core.* - the step-7 boundary forbids any GTM dependency'
+            exit 1
+          fi
+
+      # WHAT: any reference to GTM's core/job_event.py (path or module form).
+      # WHY:  the core/job_event.py subprocess hop dies in the step-7 shims
+      #       work — this gate lands with/after that packet and keeps the hop
+      #       from creeping back afterwards.
+      # Allowlist: none.
+      - name: No core/job_event references in src/
+        run: |
+          if [ ! -d src ]; then
+            echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
+            exit 2
+          fi
+          status=0
+          grep -rnE 'core/job_event|core\.job_event' src > job_event_hits.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
+            exit "$status"
+          fi
+          if [ -s job_event_hits.txt ]; then
+            cat job_event_hits.txt
+            echo '::error::runner src/ references core/job_event - the subprocess hop died at extraction step 7 and must not return'
+            exit 1
+          fi
+
+      # WHAT: SQL against GTM business tables. The pattern is case-sensitive
+      #       (uppercase SQL keywords) ON PURPOSE so prose comments like
+      #       jobstore.py's "concurrently running institutions" don't trip.
+      # WHY:  the runner owns job orchestration, never GTM domain data.
+      #       NOTE: pipeline_jobs / pipeline_events / pipeline_runs /
+      #       pipeline_attempts are deliberately NOT in this list — until
+      #       extraction step 9 those are the runner's OWN tables (compat
+      #       store against the GTM DB); step 9 renames them to
+      #       jobs/events/leases/attempts.
+      # Allowlist: none.
+      - name: No GTM business-table SQL in src/
+        run: |
+          if [ ! -d src ]; then
+            echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
+            exit 2
+          fi
+          status=0
+          grep -rnE '(FROM|JOIN|INTO|UPDATE)[[:space:]]+(institutions|instructors|sections|teaching_assignments|departments|courses|run_requests|enrichment_runs|pipeline_manager_events)\b' src > gtm_sql_hits.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
+            exit "$status"
+          fi
+          if [ -s gtm_sql_hits.txt ]; then
+            cat gtm_sql_hits.txt
+            echo '::error::runner src/ contains SQL against GTM business tables - GTM data stays behind GTM importers'
+            exit 1
+          fi
+
+      # WHAT: the words claude/codex anywhere in src/agent_runner outside
+      #       harness/ — case-insensitive, comments included.
+      # WHY:  pluggability — every claude/codex-specific behavior lives in
+      #       harness/ (the registry in harness/__init__.py is inside the
+      #       allowed dir). A code literal outside harness/ is a design
+      #       regression to fix, never to allowlist. The exemption is
+      #       anchored to the PATH PREFIX of grep's file:line output — a
+      #       mere mention of the harness/ path elsewhere must not exempt
+      #       its own line.
+      # Allowlist: src/agent_runner/harness/ only.
+      - name: Provider-name wall (claude/codex only in harness/)
+        run: |
+          if [ ! -d src/agent_runner ]; then
+            echo '::error::scan directory src/agent_runner is missing - the gate cannot vouch for a tree it did not scan'
+            exit 2
+          fi
+          status=0
+          grep -rniE '\b(claude|codex)\b' src/agent_runner --include='*.py' > provider_hits.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/agent_runner path"
+            exit "$status"
+          fi
+          status=0
+          grep -vE '^src/agent_runner/harness/' provider_hits.txt > provider_offenders.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) while applying the harness/ exemption"
+            exit "$status"
+          fi
+          if [ -s provider_offenders.txt ]; then
+            cat provider_offenders.txt
+            echo '::error::provider name (claude/codex) outside src/agent_runner/harness/ - provider knowledge lives in the harness adapters'
+            exit 1
+          fi

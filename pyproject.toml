@@ -9,8 +9,8 @@ description = "Generic agent-CLI job runner extracted from the Uflo GTM pipeline
 requires-python = ">=3.13"        # matches Mac system python3 (3.13.3), venv-modal, GTM CI
 dependencies = ["psycopg[binary]>=3.1"]   # lazy-imported; the stdlib/no-psycopg contract holds
 
-# No [project.scripts]: the `agent-runner` CLI (emit, requeue, ...) is a
-# step-7 deliverable; entry points now would grow the surface silently.
+[project.scripts]
+agent-runner = "agent_runner.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

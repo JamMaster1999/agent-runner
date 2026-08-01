@@ -28,7 +28,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, ClassVar
 
-from agent_runner.harness.base import Capabilities, HarnessAdapter, SpawnSpec
+from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
 from agent_runner.runtime import RunnerError, RunnerJob
 from agent_runner.util import PROJECT_ROOT, ROOT
 from agent_runner.harness.codex_stream import CodexStreamParser
@@ -110,6 +110,29 @@ def codex_agent_config_args(job: RunnerJob) -> list[str]:
         for dotted_key, dotted_value in flattened_codex_config(key, value):
             args.extend(["-c", f"{dotted_key}={toml_cli_value(dotted_value)}"])
     return args
+
+
+def toml_file_value(value: Any) -> str:
+    """One config value in the rendered agent-FILE dialect (moved verbatim
+    from the client's sync_agents at extraction step 7). Distinct from
+    ``toml_cli_value``, the `-c` override dialect: this one escapes strings
+    by hand and supports inline tables."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_file_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        inner = ", ".join(f"{k} = {toml_file_value(v)}" for k, v in value.items())
+        return "{ " + inner + " }"
+    raise RunnerError(
+        f"codex agent config: unsupported value: {value!r}",
+        code="agent_render",
+        retryable=False,
+    )
 
 
 def codex_exec_command(final_message_path: Path, job: RunnerJob) -> list[str]:
@@ -329,6 +352,26 @@ class CodexAdapter(HarnessAdapter):
                 alert=True,
                 details=json.dumps(hard_failures, indent=2, sort_keys=True),
             )
+
+    def materialize_agent(self, agent: AgentDef, header: str) -> str:
+        """The `.codex/agents/<name>.toml` dialect: `# header` first line,
+        name/description, the config keys in dict order, then the body as a
+        `developer_instructions` TOML literal string (moved verbatim from
+        the client's sync_agents at extraction step 7)."""
+        if "'''" in agent.body:
+            raise RunnerError(
+                f"codex agent {agent.name}: body contains ''' which breaks "
+                "the developer_instructions TOML literal string",
+                code="agent_render",
+                retryable=False,
+            )
+        lines = [f"# {header}"]
+        lines.append(f'name = "{agent.name}"')
+        lines.append(f"description = {toml_file_value(agent.description)}")
+        for key, value in agent.config.items():
+            lines.append(f"{key} = {toml_file_value(value)}")
+        lines.append("developer_instructions = '''")
+        return "\n".join(lines) + "\n" + agent.body + "'''\n"
 
     def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
         return SpawnSpec(

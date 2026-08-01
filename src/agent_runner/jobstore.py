@@ -22,7 +22,7 @@ from agent_runner.util import clean_params
 from agent_runner import events
 from agent_runner.events import append_event_sql
 from agent_runner.runtime import RunnerError, RunnerJob
-from agent_runner.util import PROJECT_ROOT, ROOT, db_rows, db_tx
+from agent_runner.util import db_rows, db_tx
 
 
 def ensure_job(
@@ -173,38 +173,18 @@ def job_heartbeat(url: str, job: RunnerJob) -> str | None:
     'cancelled' is noticed within one heartbeat interval. Advisory — any
     failure returns None rather than killing a multi-minute agent attempt.
     """
-    # The core/job_event.py subprocess hop survives step 6 verbatim,
-    # reached through the configured project root (AGENT_RUNNER_PROJECT_ROOT);
-    # it dies at step 7 when the `agent-runner emit` CLI lands.
-    command = [
-        sys.executable,
-        str(ROOT / "core" / "job_event.py"),
-        "heartbeat",
-        job.key,
-    ]
-    if events.JOB_EVENT_RUN_ID:
-        command += ["--run-id", events.JOB_EVENT_RUN_ID]
+    # Step 7: direct call into the runner's own event SQL (SystemExit
+    # included for the transport's missing-driver guidance — advisory here).
     try:
-        result = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=120,
+        _, status = events.emit_event(
+            url, "heartbeat", job.key, run_id=events.JOB_EVENT_RUN_ID
         )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
+    except (Exception, SystemExit) as exc:
         print(
-            f"WARNING: heartbeat failed for {job.key}: "
-            f"{(result.stderr or result.stdout or '').strip()[:500]}",
+            f"WARNING: heartbeat failed for {job.key}: {str(exc).strip()[:500]}",
             file=sys.stderr,
         )
         return None
-    output = (result.stdout or "").strip()
-    _, _, status = output.rpartition("status=")
     return status or None
 
 

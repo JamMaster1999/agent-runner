@@ -108,6 +108,9 @@ class StubAdapter(HarnessAdapter):
     def build_resume(self, job, directory, session_ref):
         raise NotImplementedError
 
+    def materialize_agent(self, agent, header):
+        raise NotImplementedError
+
     def session_ref_from_log(self, stdout_path):
         raise NotImplementedError
 
