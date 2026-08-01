@@ -299,8 +299,9 @@ def claim_resumable_attempt(
         # Locality guard, Sandbox only (GTM_DATA_ROOT set): attempt dirs and
         # CLI homes share one Volume, so a missing dir means the session
         # transcript is not on this machine either. Do not burn the claim.
-        # On the Mac transcripts live under ~/.claude / ~/.codex and survive
-        # a pruned .local/runs, so the claim proceeds regardless.
+        # On the Mac transcripts live under the provider CLI's home
+        # directory and survive a pruned .local/runs, so the claim
+        # proceeds regardless.
         return None
     try:
         consumed = db_rows(

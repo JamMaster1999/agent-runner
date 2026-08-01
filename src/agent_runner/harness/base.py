@@ -52,6 +52,20 @@ class SpawnSpec:
     stderr_path: Path
 
 
+@dataclass(frozen=True)
+class AgentDef:
+    """One agent definition crossing the adapter boundary as DATA
+    (extraction plan §2, gray zone 4): the runner never reads the client's
+    source tree. ``config`` is the agent's per-harness frontmatter table
+    (the [claude] / [codex] contents); ``body`` is the verbatim prompt —
+    the caller guarantees the trailing newline."""
+
+    name: str
+    description: str
+    config: dict[str, Any]
+    body: str
+
+
 class HarnessAdapter(ABC):
     """One agent CLI's contract with the engine (design doc §2.2).
 
@@ -124,6 +138,19 @@ class HarnessAdapter(ABC):
         secret_ref, 'local-login' — the Mac's logged-in CLI state — which
         binds to nothing (D6); a real store arrives with account rotation."""
         return {}
+
+    # -- agent materialization ---------------------------------------------
+
+    @abstractmethod
+    def materialize_agent(self, agent: AgentDef, header: str) -> str:
+        """The complete discovery-file text for ``agent`` in this harness's
+        dialect (extraction step 7: rendering moved behind the adapter API;
+        authoring rules, validation, naming, and pruning stay with the
+        client). ``header`` is a caller-supplied comment STRING with no
+        comment syntax — the adapter wraps it in its own dialect — so the
+        GENERATED-marker convention stays the client's. Render constraints
+        raise RunnerError (code='agent_render', retryable=False) naming the
+        harness."""
 
     # -- spawn / resume / followup -----------------------------------------
 

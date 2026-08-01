@@ -121,6 +121,22 @@ class TransportContractTest(unittest.TestCase):
         # Retried exactly once: two connect attempts total.
         self.assertEqual(connect.call_count, 2)
 
+    def test_retry_false_is_single_try_for_non_idempotent_statements(self) -> None:
+        # The events-append CTE has no idempotency key: under autocommit a
+        # commit whose reply was lost looks like a failed try, so a replay
+        # would double-insert. retry=False opts such statements out of the
+        # one timeout retry — exactly one connect attempt.
+        connect = mock.Mock()
+        module = self.install(connect)
+        connect.side_effect = module.OperationalError("connection dropped")
+        with self.assertRaises(RunnerError) as ctx:
+            runner_util.db_rows(URL, "SELECT 1;", retry=False)
+        failure = ctx.exception
+        self.assertEqual(failure.code, "db_timeout")
+        self.assertTrue(failure.retryable)
+        self.assertEqual(str(failure), "database call timed out after 60s (1 try).")
+        self.assertEqual(connect.call_count, 1)
+
     def test_transient_operational_error_recovers_on_the_retry(self) -> None:
         connect = mock.Mock()
         module = self.install(connect)

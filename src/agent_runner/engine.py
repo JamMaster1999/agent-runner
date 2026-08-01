@@ -362,9 +362,24 @@ def maybe_validate_attempt(
     return AttemptResult(path=output_path, data=report.data or {}, attempt=attempt)
 
 
-def agent_env(run_id: str, job: RunnerJob, attempt: int, output_path: Path) -> dict[str, str]:
-    # Env names stay UFLO_* for value parity with the deployed hook/agent
-    # wiring; the RUNNER_* rename ships with the extraction.
+def agent_env(
+    run_id: str, job: RunnerJob, attempt: int, output_path: Path, database_url: str
+) -> dict[str, str]:
+    """The environment stamped onto agent CLI (and hook) processes.
+
+    RUNNER_* is the runner-native attribution set read by `agent-runner
+    emit` and the hook capture; the legacy UFLO_* names are co-emitted for
+    one release, then removed. RUNNER_EMIT_DSN carries the engine's database
+    url (same value as DATABASE_URL until step 8 swaps in the restricted
+    emitter role) so the emit CLI never needs the DSN on argv. PYTHONPATH
+    gets the runner package's src dir prepended so `python3 -m agent_runner
+    ...` works inside agent shells and hook processes without a pip
+    install. RUNNER_PYTHON carries the engine's own interpreter — the one
+    proven to have psycopg — so the CLI's process entry can re-exec onto it
+    when the shell's bare `python3` lacks the driver (otherwise every
+    in-agent emit would take the advisory exit-0 path and lose its row)."""
+    import agent_runner
+
     env = os.environ.copy()
     env.update(
         {
@@ -375,7 +390,21 @@ def agent_env(run_id: str, job: RunnerJob, attempt: int, output_path: Path) -> d
             "UFLO_AGENT_NAME": job.agent_ref,
             "UFLO_PHASE": job.task_type,
             "UFLO_BACKEND": job.harness,
+            "RUNNER_RUN_ID": run_id,
+            "RUNNER_JOB_KEY": job.key,
+            "RUNNER_ATTEMPT": str(attempt),
+            "RUNNER_OUTPUT_PATH": str(output_path),
+            "RUNNER_AGENT_NAME": job.agent_ref,
+            "RUNNER_PHASE": job.task_type,
+            "RUNNER_BACKEND": job.harness,
+            "RUNNER_EMIT_DSN": database_url,
+            "RUNNER_PYTHON": sys.executable,
+            "AGENT_RUNNER_PROJECT_ROOT": str(PROJECT_ROOT),
         }
+    )
+    package_src = str(Path(agent_runner.__file__).resolve().parents[1])
+    env["PYTHONPATH"] = package_src + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )
     return env
 
@@ -411,7 +440,7 @@ def runner_variables(
 ) -> dict[str, str]:
     """Substitution values for the D2 closed variable set, bound at attempt
     start. RUNNER_JOB_KEY carries the run id — it fills _meta.run_id and the
-    embedded job_event.py progress command until the runner's own job key
+    embedded `agent-runner emit` progress command until the runner's own job key
     replaces run ids at extraction. RUNNER_OUTPUT_PATH is the attempt's
     output directory; templates append their own artifact filenames.
     ``resource_variables`` is the provisioned-resource overlay the attempt
@@ -467,7 +496,7 @@ def repair_attempt(
             process = subprocess.Popen(
                 followup.command,
                 cwd=PROJECT_ROOT,
-                env=agent_env(run_id, job, attempt, out_path),
+                env=agent_env(run_id, job, attempt, out_path, args.database_url),
                 stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=stderr,
@@ -626,7 +655,7 @@ def run_agent_job_once(
             spawn = adapter.build_resume(job, directory, resume_session[0])
         else:
             spawn = adapter.build_spawn(job, directory)
-        env = agent_env(run_id, job, attempt, out_path)
+        env = agent_env(run_id, job, attempt, out_path, args.database_url)
         env.update(adapter.bind_credentials())
         env.update(adapter.env_overrides())
         seen_hooks: set[str] = set()
@@ -951,7 +980,7 @@ def run_with_retries(
 
         if decision.action == "halt":
             # Operator cancel: terminal, audited, no retry. The guard in
-            # job_event.py keeps the row 'cancelled'; just record the event
+            # the events module keeps the row 'cancelled'; just record the event
             # for the audit trail and surface the stop.
             run_job_event(
                 args.database_url,
