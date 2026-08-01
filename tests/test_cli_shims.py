@@ -177,11 +177,11 @@ class EmitSqlContractTest(unittest.TestCase):
 
     def test_event_insert_lands_outside_the_guard(self) -> None:
         # The audit-trail insert is unconditional: the guard fences only the
-        # pipeline_jobs UPDATE arm, never the pipeline_events INSERT.
+        # jobs UPDATE arm, never the events INSERT.
         _, conn = self.run_emit("fail", message="boom", attempt=1)
         [(sql, _)] = conn.executed
         insert_arm = sql.split("upd AS")[0]
-        self.assertIn("INSERT INTO pipeline_events", insert_arm)
+        self.assertIn("INSERT INTO events", insert_arm)
         self.assertNotIn("status <> 'cancelled'", insert_arm)
         self.assertNotIn("attempt_count = %s", insert_arm)
 
@@ -198,9 +198,12 @@ class EmitSqlContractTest(unittest.TestCase):
         self.assertIn("25/50", params)
 
     def test_heartbeat_bumps_the_run_row_when_run_id_is_given(self) -> None:
+        # Step 9: the run row is a lease now; the bump lands on the held
+        # leases row for this lease_ref.
         _, conn = self.run_emit("heartbeat", run_id="run-1")
         [(sql, params)] = conn.executed
-        self.assertIn("UPDATE pipeline_runs", sql)
+        self.assertIn("UPDATE leases", sql)
+        self.assertIn("status = 'held'", sql)
         self.assertIn("run-1", params)
         self.assertIn("status <> 'cancelled'", sql)
         # Returns the job status for the cancel poll.

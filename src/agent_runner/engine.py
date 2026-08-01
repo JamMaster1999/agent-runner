@@ -62,6 +62,7 @@ from agent_runner.runtime import (
     RunnerJob,
     attempt_dir,
     attempt_output_path,
+    project_id,
 )
 from agent_runner.templates import substitute
 from agent_runner.util import PROJECT_ROOT, db_rows, write_text
@@ -896,8 +897,8 @@ def run_with_retries(
                 if args.no_sleep:
                     db_rows(
                         args.database_url,
-                        "UPDATE pipeline_jobs SET next_retry_at = now() WHERE stable_id = %s;",
-                        [job.key],
+                        "UPDATE jobs SET next_retry_at = now() WHERE project_id = %s AND job_key = %s;",
+                        [project_id(), job.key],
                     )
                 else:
                     print(f"{job_name}: retry due in {wait_seconds}s; waiting.")

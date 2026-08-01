@@ -84,10 +84,14 @@ class EnsureJobReplayGateTest(unittest.TestCase):
         self.assertNotIn("status = 'queued'", sql)
 
     def test_replay_metadata_upsert_is_complete(self):
+        # Step-9 schema: the metadata half is the runner-vocabulary columns
+        # (what used to be institution_id/agent_name/output_path rides in
+        # agent_ref/artifact_contract/labels jsonb now).
         sql = self.ensure_job_sql(force=False, replay=True)
         tail = sql.split("ON CONFLICT")[1]
-        for column in ("institution_id", "phase", "agent_name", "backend",
-                       "output_path", "max_attempts", "updated_at"):
+        for column in ("task_type", "harness", "agent_ref",
+                       "artifact_contract", "policy", "labels",
+                       "group_key", "max_attempts", "updated_at"):
             self.assertIn(column, tail)
 
     def test_default_upsert_never_requeues_succeeded(self):
