@@ -39,4 +39,26 @@ bridge.
   instance) and skip cleanly otherwise; they self-provision a scratch
   database from `tests/fixtures/pipeline_attempts.sql`.
 
-`docs/events.md` is the runner event catalog (moved with the modules).
+## Migrations
+
+`agent-runner migrate` (or `python3 db/apply_migrations.py`, same flags)
+applies `db/migrations/` under a `schema_migrations` ledger, then re-applies
+`db/roles/` — the emitter role and its grants, deliberately unledgered so
+that re-running is the repair path for a revoked grant (`--roles-only` is
+the narrow form; `--skip-roles` opts out).
+
+**The DSN is `--database-url` or `RUNNER_DSN`, never `DATABASE_URL`** — that
+one names the *client's* database, and this chain writes generically named
+tables (`jobs`, `events`) plus a cluster-global role. The applier also
+refuses a target that carries client tables or a foreign migration ledger;
+`--i-know-this-is-the-runner-db` overrides it and says so on every run.
+
+Role provisioning needs superuser or `CREATEROLE`; the schema chain does
+not. On a cluster where the applier is unprivileged the tables still land
+and ledger — see `docs/schema.md` §4.
+
+## Docs
+
+- `docs/events.md` — the runner event catalog (moved with the modules).
+- `docs/schema.md` — the runner DB schema, rename map, emitter-role
+  contract, and every divergence from the design doc (§6).
