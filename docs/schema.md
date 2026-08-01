@@ -264,7 +264,15 @@ cap.
      column, so a straight copy hands every exhausted session a fresh
      budget — re-arming exactly the resume loop `RESUME_BUDGET` exists to
      stop. Walk the re-linked chain once (recursive CTE in 003's comment),
-     at cutover only.
+     at cutover only — and mind the direction: depth 0 is the rows that
+     consumed *nothing*; each consumer is its consumed row's depth + 1.
+     Anchoring 0 at the unconsumed heads inverts the meaning and re-arms
+     every exhausted chain.
+
+  `db/copy_attempts.py` implements all three parts (renumber, two-pass
+  re-link, corrected-direction backfill) in one target transaction, with
+  `--dry-run` and an idempotent already-copied preflight; use it rather
+  than hand-rolling the SQL.
 - Set `RUNNER_EMIT_DSN`'s *value* to the `runner_emitter` DSN and drop the
   jobs UPDATE from the emit path. The emit CLI already falls back to the
   full DSN, so both behaviors survive the bridge; no schema change is needed

@@ -95,18 +95,26 @@ all consequences of the same key change; part 1 alone is not enough.
    at claim time. A straight INSERT..SELECT therefore hands EVERY
    already-exhausted session a fresh budget at cutover — re-arming the
    resume loop RESUME_BUDGET exists to stop, on precisely the sessions that
-   earned their way out of it. After the pass-2 re-link, walk the
-   reconstructed chain once:
+   earned their way out of it. DIRECTION MATTERS: depth 0 belongs to rows
+   that CONSUMED NOTHING (no other row names them as its consumer), and
+   each consumer is its consumed row's depth + 1 — that is what makes the
+   nomination predicate `resume_depth < budget` equal the old claim-time
+   walk, which counts the chain BEHIND the candidate. Anchoring 0 at the
+   unconsumed heads and walking the other way INVERTS the meaning and
+   re-arms every exhausted chain. After the pass-2 re-link, walk once:
        WITH RECURSIVE chain AS (
-         SELECT id, 0 AS depth FROM attempts
-          WHERE consumed_by_attempt_id IS NULL
+         SELECT a.id, 0 AS depth FROM attempts a
+          WHERE NOT EXISTS (SELECT 1 FROM attempts x
+                            WHERE x.consumed_by_attempt_id = a.id)
          UNION ALL
-         SELECT a.id, chain.depth + 1 FROM attempts a
-           JOIN chain ON a.consumed_by_attempt_id = chain.id)
+         SELECT a.consumed_by_attempt_id, chain.depth + 1 FROM attempts a
+           JOIN chain ON a.id = chain.id
+          WHERE a.consumed_by_attempt_id IS NOT NULL)
        UPDATE attempts SET resume_depth = chain.depth FROM chain
         WHERE attempts.id = chain.id;
-   Run it ONCE, at cutover only. Afterwards the insert path precomputes
-   depth as parent + 1 and no walk ever runs again.
+   Run it ONCE, at cutover only — db/copy_attempts.py does exactly this.
+   Afterwards the insert path precomputes depth as parent + 1 and no walk
+   ever runs again.
 
 Column successors: lease_ref <- run_id, session_ref <- session_id,
 workspace_ref <- attempt_dir, error_code <- failure_category.
