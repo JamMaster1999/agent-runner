@@ -1,0 +1,14 @@
+{"type":"thread.started","thread_id":"019fa4e7-1eb8-73e3-b134-b4d5411b6a66"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"python3 core/job_event.py progress fixture-inst__phase4__codex --current 1 --total 6"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"python3 core/job_event.py progress fixture-inst__phase4__codex --current 1 --total 6","exit_code":0,"duration_ms":812,"status":"completed","aggregated_output":"progress: fixture-inst__phase4__codex\n"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"PROGRESS: 2/6 mapping campus buildings"}}
+{"type":"turn.completed","usage":{"input_tokens":2234830,"cached_input_tokens":2113536,"cache_write_input_tokens":0,"output_tokens":11021,"reasoning_output_tokens":2795}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Continuing the sweep."}}
+{"type":"turn.completed"}
+{"type":"turn.completed","usage":{"input_tokens":48213,"output_tokens":902,"reasoning_output_tokens":331}}
+not json noise line
+{"type":"turn.completed","usage":{}}
+{"type":"error","message":"transient stream hiccup (recovered)"}
+{"type":"turn.failed","error":{"message":"stream disconnected"}}

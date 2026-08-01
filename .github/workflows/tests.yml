@@ -1,0 +1,71 @@
+# Mirrors the GTM tests.yml two-job shape (extraction step 6). Two jobs pin
+# the suite's two contracts:
+#
+#   stdlib — bare Python 3.13, no third-party packages, no database, NO pip
+#            install: the tests' own header puts src/ on sys.path, which
+#            also proves the no-pip path the GTM bootstrap shim relies on.
+#            The psycopg-gated tests MUST skip cleanly here; that skip path
+#            is itself part of the contract.
+#   full   — Python 3.13 + psycopg[binary] + the editable install + a
+#            Postgres 16 service. No migrations step: the resume-claim test
+#            self-provisions its scratch database from
+#            tests/fixtures/pipeline_attempts.sql (the service role is a
+#            superuser, so CREATE DATABASE works). Zero skips allowed: a
+#            skip here means the environment recipe silently broke, so the
+#            job greps for it and fails loudly.
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  stdlib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run suite (psycopg tests must skip cleanly)
+        run: |
+          set -o pipefail  # tee must not mask the unittest exit code
+          python -m unittest discover tests 2>&1 | tee stdlib_output.txt
+          # The DB-gated tests must have SKIPPED, not silently run or erred.
+          grep -E 'OK \(skipped=[0-9]+\)$' stdlib_output.txt
+
+  full:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gtm
+          POSTGRES_PASSWORD: gtm
+          POSTGRES_DB: uflo_gtm_production
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U gtm -d uflo_gtm_production"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      GTM_TEST_DATABASE_URL: postgres://gtm:gtm@127.0.0.1:55432/uflo_gtm_production
+      DATABASE_URL: postgres://gtm:gtm@127.0.0.1:55432/uflo_gtm_production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install psycopg
+        run: pip install 'psycopg[binary]'
+      - name: Install the package (editable)
+        run: pip install -e .
+      - name: Run suite (zero skips allowed)
+        run: |
+          set -o pipefail  # tee must not mask the unittest exit code
+          python -m unittest discover tests 2>&1 | tee full_output.txt
+          if grep -qi 'skipped' full_output.txt; then
+            echo '::error::skips detected in the full job - the DB test environment recipe broke'
+            exit 1
+          fi
+          grep -qx 'OK' full_output.txt

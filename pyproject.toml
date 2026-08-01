@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runner"
+version = "0.1.0"
+description = "Generic agent-CLI job runner extracted from the Uflo GTM pipeline (extraction plan step 6)."
+requires-python = ">=3.13"        # matches Mac system python3 (3.13.3), venv-modal, GTM CI
+dependencies = ["psycopg[binary]>=3.1"]   # lazy-imported; the stdlib/no-psycopg contract holds
+
+# No [project.scripts]: the `agent-runner` CLI (emit, requeue, ...) is a
+# step-7 deliverable; entry points now would grow the surface silently.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_runner = ["py.typed"]
