@@ -9,10 +9,16 @@
 #   full   — Python 3.13 + psycopg[binary] + the editable install + a
 #            Postgres 16 service. No migrations step: the resume-claim test
 #            self-provisions its scratch database from
-#            tests/fixtures/pipeline_attempts.sql (the service role is a
-#            superuser, so CREATE DATABASE works). Zero skips allowed: a
-#            skip here means the environment recipe silently broke, so the
-#            job greps for it and fails loudly.
+#            tests/fixtures/pipeline_attempts.sql, and the schema test
+#            applies db/migrations + db/roles to a scratch database of its
+#            own (the service role is a superuser, so CREATE DATABASE and
+#            CREATE ROLE both work). That superuser is also the reason
+#            db/roles has never run here as a role WITHOUT createrole —
+#            RoleProvisioningPrivilegeTest covers that path with fake
+#            privilege answers, because a real unprivileged login would need
+#            a password and an hba rule this service does not have. Zero
+#            unexpected skips: a skip here means the environment recipe
+#            silently broke, so the job greps for it and fails loudly.
 name: tests
 
 on: [push, pull_request]
@@ -66,7 +72,7 @@ jobs:
           python -m unittest discover tests 2>&1 | tee full_output.txt
           # The ONLY sanctioned skips are test_usage_parity's two live-capture
           # sweeps (they scan .local/runs transcripts, which never exist in CI).
-          # The 11 psycopg-gated DB tests must RUN here - a skip count other
+          # Every psycopg-gated DB test must RUN here - a skip count other
           # than exactly 2 means the DB test environment recipe broke.
           grep -qxE 'OK \(skipped=2\)' full_output.txt || {
             echo '::error::expected exactly OK (skipped=2) - the DB test environment recipe broke'

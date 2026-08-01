@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The `agent-runner` CLI: emit / requeue / hook subcommands.
+"""The `agent-runner` CLI: emit / requeue / hook / migrate subcommands.
 
 Step 7 of the extraction plan: the runner writes its events SQL directly
 (``agent_runner.events``), so the client-repo job_event script and its
@@ -17,8 +17,16 @@ until the step-8 restricted emitter role exists).
 ``emit`` and ``hook`` are advisory at the process boundary: an internal
 failure (DB hiccup, capture crash) logs to stderr and exits 0, because
 these run inside agent shell commands and hook processes that must never
-fail over telemetry. ``requeue`` is an operator command and keeps loud
-failures.
+fail over telemetry. ``requeue`` and ``migrate`` are operator commands and
+keep loud failures — a schema change that half-worked must never exit 0.
+
+``migrate`` (extraction step 8) applies the runner database's own
+migrations through ``agent_runner.migrations``; db/apply_migrations.py is
+the same call from a repo checkout. Its DSN comes from --database-url or
+RUNNER_DSN and NEVER from DATABASE_URL — that variable names the client's
+database, and the schema this command writes uses generic table names. The
+applier also refuses a target that carries client tables or a foreign
+migration ledger.
 
 Import-light on purpose: no driver (and no agent_runner submodule) at
 parse time — the stdlib suite imports this module cleanly; handlers import
@@ -173,6 +181,23 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    from agent_runner import migrations  # lazy: keeps parse time driver-free
+
+    # apply_pending prints what it applied (or the dry-run list) and raises
+    # SystemExit on any failure — operator command, no advisory swallow. It
+    # also refuses a target that looks like a client database, which is why
+    # the override rides through here rather than being decided locally.
+    migrations.apply_pending(
+        args.database_url,
+        dry_run=args.dry_run,
+        with_roles=not args.skip_roles,
+        roles_only=args.roles_only,
+        allow_foreign=args.i_know_this_is_the_runner_db,
+    )
+    return 0
+
+
 def cmd_hook(args: argparse.Namespace) -> int:
     try:
         from importlib import import_module
@@ -243,6 +268,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Harness provider name; dispatches to agent_runner.harness.<provider>_hook_event",
     )
     hook.set_defaults(handler=cmd_hook)
+
+    migrate = subparsers.add_parser(
+        "migrate",
+        help="Apply pending runner-database migrations (operator command: loud failures).",
+    )
+    migrate.add_argument(
+        "--database-url",
+        help=(
+            "Runner DSN; falls back to RUNNER_DSN. DATABASE_URL is never "
+            "used — it names the client's database"
+        ),
+    )
+    migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the migration filenames without connecting",
+    )
+    migrate.add_argument(
+        "--skip-roles",
+        action="store_true",
+        help="Schema chain only; skip db/roles (emitter role + grants)",
+    )
+    migrate.add_argument(
+        "--roles-only",
+        action="store_true",
+        help="Re-apply db/roles only — the repair path for revoked grants",
+    )
+    migrate.add_argument(
+        "--i-know-this-is-the-runner-db",
+        action="store_true",
+        help=(
+            "Override the client-database guard (target carries client "
+            "tables or a foreign migration ledger)"
+        ),
+    )
+    migrate.set_defaults(handler=cmd_migrate)
     return parser
 
 
