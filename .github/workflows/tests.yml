@@ -60,12 +60,15 @@ jobs:
         run: pip install 'psycopg[binary]'
       - name: Install the package (editable)
         run: pip install -e .
-      - name: Run suite (zero skips allowed)
+      - name: Run suite (exactly the 2 sanctioned skips)
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee full_output.txt
-          if grep -qi 'skipped' full_output.txt; then
-            echo '::error::skips detected in the full job - the DB test environment recipe broke'
+          # The ONLY sanctioned skips are test_usage_parity's two live-capture
+          # sweeps (they scan .local/runs transcripts, which never exist in CI).
+          # The 11 psycopg-gated DB tests must RUN here - a skip count other
+          # than exactly 2 means the DB test environment recipe broke.
+          grep -qxE 'OK \(skipped=2\)' full_output.txt || {
+            echo '::error::expected exactly OK (skipped=2) - the DB test environment recipe broke'
             exit 1
-          fi
-          grep -qx 'OK' full_output.txt
+          }
