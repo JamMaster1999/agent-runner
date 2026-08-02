@@ -370,9 +370,12 @@ def agent_env(
 
     RUNNER_* is the runner-native attribution set read by `agent-runner
     emit` and the hook capture; the legacy UFLO_* names are co-emitted for
-    one release, then removed. RUNNER_EMIT_DSN carries the engine's database
-    url (same value as DATABASE_URL until step 8 swaps in the restricted
-    emitter role) so the emit CLI never needs the DSN on argv. PYTHONPATH
+    one release, then removed. RUNNER_EMIT_DSN carries the restricted
+    ``runner_emitter`` DSN when the engine's own environment provides one
+    (step 10.5 — agents get INSERT-on-events and nothing else), else the
+    engine's database url, so the emit CLI never needs the DSN on argv.
+    RUNNER_GROUP_KEY rides alongside because the INSERT-only emit path can
+    no longer look the group up from the jobs row. PYTHONPATH
     gets the runner package's src dir prepended so `python3 -m agent_runner
     ...` works inside agent shells and hook processes without a pip
     install. RUNNER_PYTHON carries the engine's own interpreter — the one
@@ -398,7 +401,8 @@ def agent_env(
             "RUNNER_AGENT_NAME": job.agent_ref,
             "RUNNER_PHASE": job.task_type,
             "RUNNER_BACKEND": job.harness,
-            "RUNNER_EMIT_DSN": database_url,
+            "RUNNER_GROUP_KEY": job.group_key,
+            "RUNNER_EMIT_DSN": os.environ.get("RUNNER_EMIT_DSN") or database_url,
             "RUNNER_PYTHON": sys.executable,
             "AGENT_RUNNER_PROJECT_ROOT": str(PROJECT_ROOT),
         }

@@ -9,10 +9,13 @@ hook processes, and operators invoke. Pinned here:
 - DSN precedence: RUNNER_EMIT_DSN wins over DATABASE_URL (never argv).
 - Attribution precedence per value: explicit flag > RUNNER_* env > legacy
   UFLO_* env (co-honored for one release).
-- The ported SQL preserves the load-bearing guards: status <> 'cancelled'
-  on every pipeline_jobs update, the attempt_count fence, finish/fail
+- The ported engine-path SQL preserves the load-bearing guards: status <>
+  'cancelled' on every jobs update, the attempt_count fence, finish/fail
   terminal-row rules, and the unconditional event insert (patched at the
   psycopg seam with the fake driver from test_transport.py).
+- The 10.5 agent path (`agent-runner emit` -> append_agent_events) is a
+  pure events INSERT executable under the INSERT-only runner_emitter role:
+  no jobs read/update, no RETURNING, attribution bound from the caller.
 - hook prints the JSON continue reply and exits 0 even when the harness
   capture main raises; emit exits 0 on internal failure (advisory).
 - requeue calls jobstore.requeue_job with the resolved DSN.
@@ -312,13 +315,14 @@ class EmitCliTest(unittest.TestCase):
     def call_emit(self, argv, env):
         captured: dict = {}
 
-        def fake_emit_event(url, command, job_key, **kwargs):
+        def fake_append(url, command, job_key, **kwargs):
+            # 10.5: cmd_emit dispatches onto the append-only agent path,
+            # which returns nothing (no jobs read under the emitter role).
             captured.update(url=url, command=command, job_key=job_key, **kwargs)
-            return ("job-1", "running")
 
         with (
             mock.patch.dict(_os.environ, env, clear=False),
-            mock.patch.object(events, "emit_event", fake_emit_event),
+            mock.patch.object(events, "append_agent_events", fake_append),
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
             for name in cli.ENV_FALLBACKS.values():
@@ -400,18 +404,32 @@ class EmitCliTest(unittest.TestCase):
         self.assertEqual(captured["phase"], "phase5")
         self.assertEqual(captured["backend"], "someharness")
 
-    def test_heartbeat_prints_the_status_line(self) -> None:
+    def test_heartbeat_no_longer_prints_a_status_line(self) -> None:
+        # 10.5: append-only under the emitter role — there is no jobs read,
+        # so the historical `status=` cancel-poll suffix is gone.
         _, _, stdout = self.call_emit(
             ["emit", "heartbeat", "job-1"], {"DATABASE_URL": "postgresql://default"}
         )
-        self.assertEqual(stdout.strip(), "heartbeat: job-1 status=running")
+        self.assertEqual(stdout.strip(), "heartbeat: job-1")
+
+    def test_group_key_resolves_flag_then_runner_env(self) -> None:
+        _, captured, _ = self.call_emit(
+            ["emit", "progress", "job-1", "--group-key", "flag-group"],
+            {"DATABASE_URL": "postgresql://default", "RUNNER_GROUP_KEY": "env-group"},
+        )
+        self.assertEqual(captured["group_key"], "flag-group")
+        _, captured, _ = self.call_emit(
+            ["emit", "progress", "job-1"],
+            {"DATABASE_URL": "postgresql://default", "RUNNER_GROUP_KEY": "env-group"},
+        )
+        self.assertEqual(captured["group_key"], "env-group")
 
     def test_internal_failure_still_exits_zero(self) -> None:
         # Advisory contract: a DB hiccup (or any internal failure) must never
         # fail the agent's shell command.
         with (
             mock.patch.dict(_os.environ, {"DATABASE_URL": "postgresql://default"}),
-            mock.patch.object(events, "emit_event", side_effect=RunnerError("db down", code="db_error")),
+            mock.patch.object(events, "append_agent_events", side_effect=RunnerError("db down", code="db_error")),
             contextlib.redirect_stderr(io.StringIO()) as err,
         ):
             code = cli.main(["emit", "progress", "job-1"])
@@ -427,6 +445,101 @@ class EmitCliTest(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     code, _, _ = self.call_emit(argv, env)
                 self.assertEqual(code, 0)
+
+
+class AgentEmitAppendOnlySqlTest(unittest.TestCase):
+    """The 10.5 agent emit SQL must be executable by a role holding INSERT
+    on events and nothing else."""
+
+    def build(self, command="progress", batch=None, **kwargs):
+        from types import SimpleNamespace
+
+        call = SimpleNamespace(
+            command=command,
+            stable_id=kwargs.get("stable_id", "job-1"),
+            group_key=kwargs.get("group_key"),
+            run_id=kwargs.get("run_id"),
+            phase=kwargs.get("phase"),
+            backend=kwargs.get("backend"),
+            attempt=kwargs.get("attempt"),
+            event_name=kwargs.get("event_name"),
+            message=kwargs.get("message"),
+            current=kwargs.get("current"),
+            total=kwargs.get("total"),
+        )
+        return events.append_events_sql(call, list(batch or []))
+
+    def test_no_jobs_read_update_or_returning(self) -> None:
+        sql, _ = self.build(message="tick", attempt=2)
+        self.assertIn("INSERT INTO events", sql)
+        self.assertNotIn("UPDATE", sql)
+        self.assertNotIn("FROM jobs", sql)
+        self.assertNotIn("RETURNING", sql)
+
+    def test_attribution_binds_from_the_caller_not_the_jobs_row(self) -> None:
+        _, params = self.build(
+            group_key="grp", run_id="run-9", phase="phase5",
+            backend="claude", attempt=3, message="tick",
+        )
+        # project_id, job_key, group_key, lease_ref, harness, task_type, attempt
+        self.assertEqual(params[1:7], ["job-1", "grp", "run-9", "claude", "phase5", 3])
+
+    def test_batch_is_one_statement_with_typed_usage(self) -> None:
+        batch = [
+            {"event": "turn_completed", "message": "turn 1", "tok_input": 10},
+            {"event": "progress", "message": "25/50", "current": 25, "total": 50},
+        ]
+        sql, params = self.build(batch=batch, attempt=1)
+        self.assertEqual(sql.count("(%s"), len(batch))
+        self.assertIn("turn 1", params)
+        self.assertIn(10, params)
+
+    def test_transport_is_single_try(self) -> None:
+        connect = mock.Mock()
+        module = fake_psycopg(connect)
+        saved, had = sys.modules.get("psycopg"), "psycopg" in sys.modules
+        sys.modules["psycopg"] = module
+        try:
+            connect.side_effect = module.OperationalError("connection dropped")
+            with self.assertRaises(RunnerError):
+                events.append_agent_events(URL, "progress", "job-1", message="tick")
+            self.assertEqual(connect.call_count, 1)
+        finally:
+            if had:
+                sys.modules["psycopg"] = saved
+            else:
+                sys.modules.pop("psycopg", None)
+
+
+class AgentEnvEmitDsnTest(unittest.TestCase):
+    """agent_env hands agents the restricted emitter DSN when the engine's
+    environment provides one (10.5), and stamps the group key the
+    INSERT-only path can no longer look up."""
+
+    def _job(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            key="job-1", group_key="grp-1", agent_ref="someagent",
+            task_type="phase5", harness="claude",
+        )
+
+    def test_restricted_dsn_wins_and_group_key_is_stamped(self) -> None:
+        from agent_runner import engine
+
+        with mock.patch.dict(
+            _os.environ, {"RUNNER_EMIT_DSN": "postgresql://emitter"}, clear=False
+        ):
+            env = engine.agent_env("run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full")
+        self.assertEqual(env["RUNNER_EMIT_DSN"], "postgresql://emitter")
+        self.assertEqual(env["RUNNER_GROUP_KEY"], "grp-1")
+
+    def test_engine_dsn_is_the_fallback(self) -> None:
+        from agent_runner import engine
+
+        _os.environ.pop("RUNNER_EMIT_DSN", None)
+        env = engine.agent_env("run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full")
+        self.assertEqual(env["RUNNER_EMIT_DSN"], "postgresql://full")
 
 
 class HookCliTest(unittest.TestCase):

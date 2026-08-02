@@ -11,8 +11,12 @@ Attribution falls back per value: explicit flag > RUNNER_* environment
 (stamped by the engine's ``agent_env``) > the legacy UFLO_* names
 (co-honored for one release, then removed). The DSN comes from
 RUNNER_EMIT_DSN, else DATABASE_URL — never from argv, so it stays out of
-process listings and the publicly served command_* stream events (a bridge
-until the step-8 restricted emitter role exists).
+process listings and the publicly served command_* stream events. Since
+extraction step 10.5 that DSN is expected to be the restricted
+``runner_emitter`` role (INSERT on events, nothing else) and ``emit`` is
+append-only: it dispatches onto ``events.append_agent_events``, never
+reads or updates jobs, and job state (status flips, progress mirrors,
+heartbeats) is the engine's act alone.
 
 ``emit`` and ``hook`` are advisory at the process boundary: an internal
 failure (DB hiccup, capture crash) logs to stderr and exits 0, because
@@ -59,6 +63,10 @@ ENV_FALLBACKS = {
     "attempt": ("RUNNER_ATTEMPT", "UFLO_ATTEMPT"),
     "phase": ("RUNNER_PHASE", "UFLO_PHASE"),
     "backend": ("RUNNER_BACKEND", "UFLO_BACKEND"),
+    # No legacy twin: group attribution arrived with the append-only emit
+    # path (10.5) — under the INSERT-only role the value can no longer be
+    # looked up from the jobs row.
+    "group_key": ("RUNNER_GROUP_KEY",),
 }
 
 # The JSON hook-output contract: providers that parse hook stdout (the
@@ -142,10 +150,11 @@ def cmd_emit(args: argparse.Namespace) -> int:
                 "emit needs a job key: pass it on argv or set RUNNER_JOB_KEY."
             )
         attempt = args.attempt if args.attempt is not None else resolved(None, "attempt")
-        stable_id, status = events.emit_event(
+        events.append_agent_events(
             emit_dsn(),
             args.lifecycle,
             job_key,
+            group_key=resolved(args.group_key, "group_key"),
             run_id=resolved(args.run_id, "run_id"),
             phase=resolved(args.phase, "phase"),
             backend=resolved(args.backend, "backend"),
@@ -163,12 +172,10 @@ def cmd_emit(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
-    if args.lifecycle == "heartbeat":
-        # Keep the historical `status=` line for anything still reading the
-        # cancel poll off CLI stdout.
-        print(f"heartbeat: {stable_id} status={status}")
-    else:
-        print(f"{args.lifecycle}: {stable_id}")
+    # Append-only under the emitter role (10.5): there is no job row read,
+    # so the historical heartbeat `status=` cancel-poll line is gone — no
+    # consumer of it survives in any client repo.
+    print(f"{args.lifecycle}: {job_key}")
     return 0
 
 
@@ -246,18 +253,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     emit = subparsers.add_parser(
         "emit",
-        help="Append pipeline event(s) and run the guarded job update (advisory: exits 0 on failure).",
+        help="Append event row(s) — INSERT-only under the restricted emitter role (advisory: exits 0 on failure).",
     )
     emit.add_argument("lifecycle", choices=LIFECYCLES)
     emit.add_argument(
         "job_key",
         nargs="?",
-        help="pipeline_jobs stable id; falls back to RUNNER_JOB_KEY / UFLO_JOB_STABLE_ID",
+        help="job key; falls back to RUNNER_JOB_KEY / UFLO_JOB_STABLE_ID",
     )
     emit.add_argument("--message")
     emit.add_argument("--current", type=int)
     emit.add_argument("--total", type=int)
     emit.add_argument("--run-id")
+    emit.add_argument(
+        "--group-key", help="group attribution; falls back to RUNNER_GROUP_KEY"
+    )
     emit.add_argument("--phase")
     emit.add_argument("--backend")
     emit.add_argument("--attempt", type=int)

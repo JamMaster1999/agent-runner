@@ -11,11 +11,20 @@ project-scoped); the Python keyword surface keeps the historical
 
 Step 7: the client-repo job_event script (and the subprocess hop to it) is
 gone — the SQL it owned lives here as direct functions over the runner's own
-transport (``util.db_rows``). ``emit_event`` is the one entry point: one
-statement appends the event row(s) and runs the guarded jobs update in a
-single round trip; the ``agent-runner emit`` CLI (``agent_runner.cli``) and
-the engine's ``run_job_event`` both dispatch onto it. The guards are
-load-bearing and preserved exactly:
+transport (``util.db_rows``). Two entry points since extraction step 10.5:
+
+- ``emit_event`` — the ENGINE path (full-privilege DSN): one statement
+  appends the event row(s) and runs the guarded jobs update in a single
+  round trip; ``run_job_event`` dispatches onto it.
+- ``append_agent_events`` — the AGENT path (``agent-runner emit`` CLI,
+  restricted ``runner_emitter`` DSN): a pure parameterized INSERT into
+  events with no jobs SELECT/UPDATE and no RETURNING, because the emitter
+  role holds INSERT on events and nothing else (migration 004's no-FK
+  design: routing columns come from RUNNER_* attribution, orphan rows are
+  legal). Job state — status flips, progress mirrors, heartbeats — is the
+  engine's act alone.
+
+The engine-path guards are load-bearing and preserved exactly:
 
 - ``status <> 'cancelled'`` on every jobs update (late writers cannot
   resurrect a cancelled job).
@@ -153,6 +162,84 @@ def event_rows(call: SimpleNamespace, batch: list[dict]) -> tuple[list[str], lis
         )
         params += [event, message, as_integer(current), as_integer(total), *typed]
     return rendered, params
+
+
+def append_events_sql(call: SimpleNamespace, batch: list[dict]) -> tuple[str, list[object]]:
+    """(sql, params) for the agent emit path: a pure INSERT into events.
+
+    Runs under the restricted ``runner_emitter`` role (INSERT on events,
+    nothing else — db/roles/020), so it must not read jobs, update jobs, or
+    RETURNING anything. Every routing column binds from the caller's
+    RUNNER_* attribution; a job_key with no jobs row is a legal orphan by
+    migration 004's design. The VALUES casts come from ``event_rows``.
+    """
+    rows, values_params = event_rows(call, batch)
+    rows_sql = ",\n    ".join(rows)
+    sql = f"""
+INSERT INTO events
+  (project_id, job_key, group_key, lease_ref, harness, task_type, attempt,
+   kind, message, progress_current, progress_total,
+   tok_input, tok_cache_write, tok_cache_read, tok_output, cost_usd)
+SELECT %s, %s, %s, %s, %s, %s, %s,
+       v.event, v.message, v.progress_current, v.progress_total,
+       v.tok_input, v.tok_cache_write, v.tok_cache_read, v.tok_output, v.cost_usd
+FROM (VALUES
+    {rows_sql}
+  ) AS v(event, message, progress_current, progress_total,
+         tok_input, tok_cache_write, tok_cache_read, tok_output, cost_usd);
+""".strip()
+    params: list[object] = [
+        project_id(),
+        call.stable_id,
+        call.group_key,
+        call.run_id,
+        call.backend,
+        call.phase,
+        as_integer(call.attempt),
+        *values_params,
+    ]
+    return sql, params
+
+
+def append_agent_events(
+    url: str,
+    command: str,
+    stable_id: str,
+    *,
+    group_key: str | None = None,
+    run_id: str | None = None,
+    phase: str | None = None,
+    backend: str | None = None,
+    attempt: int | None = None,
+    event_name: str | None = None,
+    message: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+    batch: list[dict[str, Any]] | None = None,
+) -> None:
+    """Append event row(s) only — the ``agent-runner emit`` entry point
+    (extraction step 10.5).
+
+    No jobs read, no jobs update, no return value: under the INSERT-only
+    emitter role a status/cancel poll is impossible by construction, and job
+    state is the engine's act. Single-try for the same
+    no-idempotency-key reason as ``emit_event``.
+    """
+    call = SimpleNamespace(
+        command=command,
+        stable_id=stable_id,
+        group_key=group_key,
+        run_id=run_id,
+        phase=phase,
+        backend=backend,
+        attempt=attempt,
+        event_name=event_name,
+        message=message,
+        current=current,
+        total=total,
+    )
+    sql, params = append_events_sql(call, list(batch or []))
+    db_rows(url, sql, params, timeout=DB_TIMEOUT_SECONDS, retry=False)
 
 
 def update_guard(call: SimpleNamespace) -> tuple[str, list[object]]:
