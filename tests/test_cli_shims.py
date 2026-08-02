@@ -147,6 +147,43 @@ class MigrateSecretTransportTest(unittest.TestCase):
         self.assertIn("001_create_projects.sql", rendered)
         self.assertIn("010_create_runner_emitter_role.sql (roles", rendered)
 
+    def test_dry_run_rejects_literal_uri_and_empty_selectors_without_echo(self) -> None:
+        sentinel = "postgresql://runner:SENTINEL_CLI_DRY_RUN@db.invalid/runner"
+        cases = (
+            ("--database-url-env", sentinel),
+            ("--database-url-file", sentinel),
+            ("--database-url-env", ""),
+            ("--database-url-file", ""),
+        )
+        for selector, value in cases:
+            with (
+                self.subTest(selector=selector, empty=not value),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                cli.main(["migrate", "--dry-run", selector, value])
+            rendered = str(caught.exception)
+            self.assertIn("not a value", rendered)
+            self.assertNotIn(sentinel, rendered)
+            self.assertNotIn("SENTINEL_CLI_DRY_RUN", rendered)
+
+    def test_valid_named_selector_dry_run_is_dsn_and_driver_free(self) -> None:
+        selector = "UNSET_BUT_VALID_RUNNER_DSN"
+        with (
+            mock.patch.dict(_os.environ, {}, clear=False),
+            mock.patch(
+                "agent_runner.migrations._psycopg",
+                side_effect=AssertionError("dry-run imported the driver"),
+            ),
+        ):
+            _os.environ.pop(selector, None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = cli.main(
+                    ["migrate", "--dry-run", "--database-url-env", selector]
+                )
+        self.assertEqual(code, 0)
+        self.assertIn("001_create_projects.sql", output.getvalue())
+
     def test_help_exposes_selectors_but_no_raw_database_url_value(self) -> None:
         parser = cli.build_parser()
         subparsers = parser._subparsers._group_actions[0]

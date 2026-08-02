@@ -184,7 +184,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     from agent_runner import migrations  # lazy: keeps parse time driver-free
-    from agent_runner.secret_input import secret_value
+    from agent_runner.secret_input import secret_value, validate_secret_selector
 
     # apply_pending prints what it applied (or the dry-run list) and raises
     # SystemExit on any failure — operator command, no advisory swallow. It
@@ -193,7 +193,13 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     # Dry-run is intentionally offline: apply_pending lists schema + role
     # files before it ever resolves a DSN or imports psycopg.
     url = None
-    if not args.dry_run:
+    if args.dry_run:
+        validate_secret_selector(
+            label="runner database URL",
+            env_name=args.database_url_env,
+            file_path=args.database_url_file,
+        )
+    else:
         url = secret_value(
             label="runner database URL",
             env_name=args.database_url_env,
