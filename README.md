@@ -32,6 +32,8 @@ bridge.
 
 - Editable install: `pip install -e .` (psycopg ships as a dependency but is
   lazily imported; `import agent_runner` needs neither the driver nor a DB).
+- The cutover transport is pinned to `psycopg[binary]==3.3.4` in both package
+  metadata and CI; dependency updates are an explicit reviewed change.
 - No-pip: put `src/` on `sys.path` (the tests' own headers do this), which
   is exactly the path the GTM bootstrap shim uses on the Mac.
 - Tests: `python -m unittest discover tests` — DB-backed tests need psycopg

@@ -35,7 +35,11 @@ except ImportError:
     sys.path.insert(0, str(ROOT / "src"))
 
 from agent_runner.attempts_copy import copy_attempts  # noqa: E402
-from agent_runner.migrations import _psycopg, assert_runner_target  # noqa: E402
+from agent_runner.migrations import (  # noqa: E402
+    _psycopg,
+    _safe_exception_kind,
+    assert_runner_target,
+)
 from agent_runner.secret_input import secret_value  # noqa: E402
 
 
@@ -119,10 +123,8 @@ def main() -> None:
         # an arbitrary exception that may have incorporated a connection URI.
         # The class + optional SQLSTATE remain enough to distinguish network,
         # authentication, and SQL failures without exposing either selector.
-        sqlstate = getattr(exc, "sqlstate", None)
-        suffix = f", SQLSTATE {sqlstate}" if sqlstate else ""
         raise SystemExit(
-            f"Attempts copy failed ({type(exc).__name__}{suffix});"
+            f"Attempts copy failed ({_safe_exception_kind(exc)});"
             " database URL values were not logged."
         ) from None
 

@@ -63,7 +63,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install psycopg
-        run: pip install 'psycopg[binary]'
+        run: pip install 'psycopg[binary]==3.3.4'
       - name: Install the package (editable)
         run: pip install -e .
       - name: Run suite (exactly the 2 sanctioned skips)

@@ -47,6 +47,19 @@ class SecretInputTest(unittest.TestCase):
         self.assertNotIn(SENTINEL_PASSWORD, message)
         self.assertIn("variable name", message)
 
+    def test_explicit_empty_environment_selector_never_falls_back(self) -> None:
+        with mock.patch.dict(os.environ, {"RUNNER_DSN": SENTINEL_URL}):
+            with self.assertRaises(SystemExit) as caught:
+                secret_value(
+                    label="runner database URL",
+                    env_name="",
+                    default_env="RUNNER_DSN",
+                )
+        message = str(caught.exception)
+        self.assertIn("non-empty variable name", message)
+        self.assertNotIn(SENTINEL_URL, message)
+        self.assertNotIn(SENTINEL_PASSWORD, message)
+
     def test_private_one_value_file_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runner.dsn"
@@ -82,6 +95,24 @@ class SecretInputTest(unittest.TestCase):
         self.assertNotIn(SENTINEL_PASSWORD, message)
         self.assertIn("chmod 600", message)
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "POSIX no-follow contract",
+    )
+    def test_symlink_secret_file_is_refused_without_reading_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.dsn"
+            target.write_text(SENTINEL_URL, encoding="utf-8")
+            target.chmod(0o600)
+            link = Path(directory) / "runner.dsn"
+            link.symlink_to(target)
+            with self.assertRaises(SystemExit) as caught:
+                secret_value(label="runner database URL", file_path=link)
+        message = str(caught.exception)
+        self.assertNotIn(SENTINEL_URL, message)
+        self.assertNotIn(SENTINEL_PASSWORD, message)
+        self.assertIn("Cannot read", message)
+
 
 class MigrationScriptDryRunTest(unittest.TestCase):
     def test_repo_entrypoint_dry_run_needs_no_dsn_and_lists_roles(self) -> None:
@@ -99,6 +130,44 @@ class MigrationScriptDryRunTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("001_create_projects.sql", rendered)
         self.assertIn("010_create_runner_emitter_role.sql (roles", rendered)
+
+    def test_valid_explicit_selector_is_checked_but_not_resolved(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "apply_migrations.py",
+                    "--dry-run",
+                    "--database-url-env",
+                    "UNSET_BUT_SYNTACTICALLY_VALID",
+                ],
+            ),
+        ):
+            os.environ.pop("UNSET_BUT_SYNTACTICALLY_VALID", None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                migration_script.main()
+        self.assertIn("001_create_projects.sql", output.getvalue())
+
+    def test_dry_run_rejects_uri_in_either_selector_without_echo(self) -> None:
+        selectors = ("--database-url-env", "--database-url-file")
+        for selector in selectors:
+            with (
+                self.subTest(selector=selector),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["apply_migrations.py", "--dry-run", selector, SENTINEL_URL],
+                ),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                migration_script.main()
+            message = str(caught.exception)
+            self.assertNotIn(SENTINEL_URL, message)
+            self.assertNotIn(SENTINEL_PASSWORD, message)
+            self.assertIn("not a value", message)
 
 
 if __name__ == "__main__":

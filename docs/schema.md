@@ -256,8 +256,9 @@ cap.
      surrogate id that does not exist until the rows are inserted — and a
      renumbering pass would destroy the very coordinates that pair resolves
      through. Insert with the link NULL and the old triple carried along,
-     then resolve it in a second pass. Rows whose consumer failed to resolve
-     read as *resumable again*, so count the NULLs you end up with.
+     then resolve it in a second pass. An unresolved full pair or a
+     half-present pair would land NULL and read as *resumable again*; the
+     copy tool therefore treats either condition as fatal before writing.
   2. **`resume_depth` needs a backfill.** It defaults to 0 with no source
      column, so a straight copy hands every exhausted session a fresh
      budget — re-arming exactly the resume loop `RESUME_BUDGET` exists to
@@ -276,8 +277,11 @@ cap.
   read as duplicates in the run view; that is now a choice.
 
   The tool implements both parts above plus that renumber in one target
-  transaction, with `--dry-run` and an idempotent already-copied preflight;
-  use it rather than hand-rolling the SQL.
+  transaction, with `--dry-run`. Its idempotence check compares every
+  copy-owned field, resolved consumer FK, and derived resume depth against
+  the source plan; the first copy runs that same exact verification before
+  commit and rolls back on any mismatch. Use it rather than hand-rolling
+  the SQL.
 - Set `RUNNER_EMIT_DSN`'s *value* to the `runner_emitter` DSN and drop the
   jobs UPDATE from the emit path. The emit CLI already falls back to the
   full DSN, so both behaviors survive the bridge; no schema change is needed

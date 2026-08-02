@@ -57,6 +57,7 @@ AGENT_RUNNER_ROLES_DIR) to directories of .sql files in that case.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,32 @@ CLIENT_TABLES = (
 # per-database GRANTs the owner of the tables can run.
 CLUSTER_ROLE_FILE = "010_create_runner_emitter_role.sql"
 EMITTER_ROLE = "runner_emitter"
+
+_SAFE_EXCEPTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_SAFE_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+def _safe_exception_kind(exc: BaseException) -> str:
+    """Bounded driver diagnostic that cannot include an exception message."""
+    name = getattr(type(exc), "__name__", "")
+    if not isinstance(name, str) or not _SAFE_EXCEPTION_NAME.fullmatch(name):
+        name = "Exception"
+    try:
+        sqlstate = getattr(exc, "sqlstate", None)
+    except Exception:
+        sqlstate = None
+    if isinstance(sqlstate, str) and _SAFE_SQLSTATE.fullmatch(sqlstate):
+        return f"{name}, SQLSTATE {sqlstate}"
+    return name
+
+
+def _rollback_result(conn: Any) -> str:
+    """Attempt rollback and describe it without rendering driver text."""
+    try:
+        conn.rollback()
+    except Exception as exc:
+        return f"rollback failed ({_safe_exception_kind(exc)})"
+    return "rolled back"
 
 
 def _psycopg():
@@ -327,8 +354,11 @@ def apply_migration(conn: Any, path: Path) -> None:
         )
         conn.commit()
     except Exception as exc:
-        conn.rollback()
-        raise SystemExit(f"Migration {path.name} FAILED (rolled back): {exc}") from exc
+        rollback = _rollback_result(conn)
+        raise SystemExit(
+            f"Migration {path.name} FAILED ({rollback}; "
+            f"{_safe_exception_kind(exc)})."
+        ) from None
 
 
 def run_role_file(conn: Any, path: Path) -> None:
@@ -343,13 +373,14 @@ def run_role_file(conn: Any, path: Path) -> None:
         conn.execute(path.read_text())
         conn.commit()
     except Exception as exc:
-        conn.rollback()
+        rollback = _rollback_result(conn)
         raise SystemExit(
-            f"Role provisioning {path.name} FAILED (rolled back): {exc}\n"
+            f"Role provisioning {path.name} FAILED ({rollback}; "
+            f"{_safe_exception_kind(exc)}).\n"
             "The schema chain is unaffected — it committed and ledgered "
             "before this ran. Re-run just this part with "
             "`agent-runner migrate --roles-only` as a privileged role."
-        ) from exc
+        ) from None
 
 
 def can_provision_roles(conn: Any) -> bool:
@@ -437,7 +468,13 @@ def apply_pending(
     # Config before driver: a missing DSN is the likelier operator mistake and
     # its message is the more useful one when both are missing.
     dsn = resolve_url(url)
-    conn = _psycopg().connect(dsn, autocommit=False)
+    try:
+        conn = _psycopg().connect(dsn, autocommit=False)
+    except Exception as exc:
+        raise SystemExit(
+            "Runner database connection failed "
+            f"({_safe_exception_kind(exc)}); the database URL was not logged."
+        ) from None
     try:
         # Before anything is written: is this even the runner's database?
         assert_runner_target(conn, allow_foreign=allow_foreign)

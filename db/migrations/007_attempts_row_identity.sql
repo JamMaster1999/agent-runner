@@ -78,9 +78,10 @@ that migration's header).
         job_stable_id, consumed_by_attempt) — resolved through the mapping
         from (a), never through target-table coordinates (a renumbering pass
         edits exactly those).
-   A consumer that fails to resolve leaves NULL behind, which reads as
-   'unconsumed' and makes a dead session resumable again — so count the
-   NULLs you end up with.
+   A consumer that fails to resolve would leave NULL behind, which reads as
+   'unconsumed' and makes a dead session resumable again. The sanctioned
+   copy refuses unresolved full pairs and half-present pairs before writing;
+   it never accepts that lossy state.
 
 2. resume_depth NEEDS A BACKFILL. It is DEFAULT 0 and has no source column:
    the old schema computed depth by walking the chain with a recursive CTE

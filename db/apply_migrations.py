@@ -40,7 +40,7 @@ except ImportError:
     sys.path.insert(0, str(ROOT / "src"))
 
 from agent_runner.migrations import apply_pending  # noqa: E402
-from agent_runner.secret_input import secret_value  # noqa: E402
+from agent_runner.secret_input import secret_value, validate_secret_selector  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,9 +66,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     # apply_pending's dry-run deliberately lists both migration and role files
-    # without resolving a DSN or importing the driver.
+    # without resolving a DSN or importing the driver. Explicit selectors are
+    # still syntax-checked so a URI accidentally placed on argv fails closed.
     url = None
-    if not args.dry_run:
+    if args.dry_run:
+        validate_secret_selector(
+            label="runner database URL",
+            env_name=args.database_url_env,
+            file_path=args.database_url_file,
+        )
+    else:
         url = secret_value(
             label="runner database URL",
             env_name=args.database_url_env,
