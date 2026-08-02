@@ -32,6 +32,8 @@ bridge.
 
 - Editable install: `pip install -e .` (psycopg ships as a dependency but is
   lazily imported; `import agent_runner` needs neither the driver nor a DB).
+- The cutover transport is pinned to `psycopg[binary]==3.3.4` in both package
+  metadata and CI; dependency updates are an explicit reviewed change.
 - No-pip: put `src/` on `sys.path` (the tests' own headers do this), which
   is exactly the path the GTM bootstrap shim uses on the Mac.
 - Tests: `python -m unittest discover tests` — DB-backed tests need psycopg
@@ -47,9 +49,11 @@ applies `db/migrations/` under a `schema_migrations` ledger, then re-applies
 that re-running is the repair path for a revoked grant (`--roles-only` is
 the narrow form; `--skip-roles` opts out).
 
-**The DSN is `--database-url` or `RUNNER_DSN`, never `DATABASE_URL`** — that
-one names the *client's* database, and this chain writes generically named
-tables (`jobs`, `events`) plus a cluster-global role. The applier also
+**The DSN value never rides argv.** Set `RUNNER_DSN`, name another variable
+with `--database-url-env NAME`, or point at a private one-value file with
+`--database-url-file PATH`; `DATABASE_URL` is never consulted. That one names
+the *client's* database, and this chain writes generically named tables
+(`jobs`, `events`) plus a cluster-global role. The applier also
 refuses a target that carries client tables or a foreign migration ledger;
 `--i-know-this-is-the-runner-db` overrides it and says so on every run.
 

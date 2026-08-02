@@ -11,11 +11,23 @@ stays in ``core/runner/types.py`` for the chain driver; the local facade
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from agent_runner.protocol import SubmitRequest
+
+
+def project_id() -> str:
+    """The tenant every store statement scopes on (step-9 schema).
+
+    Read at call time, not import time, so a test (or a future multi-tenant
+    engine) can flip RUNNER_PROJECT_ID without re-importing the store
+    modules. 'gtm' matches the projects row migration 001 seeds — the
+    single-tenant floor.
+    """
+    return os.environ.get("RUNNER_PROJECT_ID", "gtm")
 
 
 class RunnerError(Exception):

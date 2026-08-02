@@ -62,6 +62,7 @@ from agent_runner.runtime import (
     RunnerJob,
     attempt_dir,
     attempt_output_path,
+    project_id,
 )
 from agent_runner.templates import substitute
 from agent_runner.util import PROJECT_ROOT, db_rows, write_text
@@ -557,10 +558,11 @@ def run_agent_job_once(
     hooks: dict[str, Callable[..., Any]] | None = None,
     resources: dict[str, Any] | None = None,
 ) -> AttemptResult:
-    # resume_state is the caller's view of the session claim: candidate_id +
-    # directory when the DB claim won, session_recorded once the resumed CLI
-    # proved it opened a session. run_with_retries reads it after a failure
-    # to release a claim the attempt consumed but never used.
+    # resume_state is the caller's view of this attempt: attempt_id (the
+    # attempts row this launch owns — migration 007's identity), candidate_id
+    # + directory when the DB claim won, session_recorded once the resumed CLI
+    # proved it opened a session. run_with_retries reads it to close the
+    # attempt out and to release a claim the attempt consumed but never used.
     #
     # template is the D2 substitution contract's input: the job's
     # PRE-substitution prompt template exactly as submitted (the text behind
@@ -612,6 +614,14 @@ def run_agent_job_once(
         # identity is invariant across runs/attempts by construction (D2).
         fingerprint = resume_prompt_fingerprint(template)
         prompt = substitute(template, runner_variables(run_id, attempt, directory, resource_variables))
+
+        # Recorded BEFORE the claim: the resume chain is a self-FK, so the
+        # consuming statement needs this attempt's row to exist (007). The
+        # row is the attempt's identity from here on — attempt numbers repeat
+        # across runs and key nothing.
+        attempt_id = record_attempt_start(args, job, run_id, attempt, fingerprint, directory)
+        resume_state["attempt_id"] = attempt_id
+
         resume_session: tuple[str, Path] | None = None
         if not args.force_rerun and bool(job.policy.get("resume")):
             # The pipeline_attempts store is the ONLY source of resume rights
@@ -620,7 +630,9 @@ def run_agent_job_once(
             # DB-tracked. The claim path is pinned by
             # tests/test_resume_claim_sql.py; a None claim means a fresh
             # session, full stop.
-            claimed = claim_resumable_attempt(args, job, run_id, attempt, fingerprint)
+            claimed = claim_resumable_attempt(
+                args, job, attempt_id, fingerprint, run_id, attempt
+            )
             if claimed is not None:
                 claimed_session, claimed_dir, claimed_id = claimed
                 resume_session = (claimed_session, claimed_dir)
@@ -638,7 +650,6 @@ def run_agent_job_once(
                 attempt=attempt,
                 event_name="session_resume",
             )
-        record_attempt_start(args, job, run_id, attempt, fingerprint, directory)
 
         write_text(prompt_path, prompt)
 
@@ -718,7 +729,7 @@ def run_agent_job_once(
                     if not session_recorded:
                         live_session_ref = adapter.session_ref_from_log(spawn.stdout_path)
                         if live_session_ref:
-                            record_attempt_session(args, job, run_id, attempt, live_session_ref)
+                            record_attempt_session(args, job, attempt_id, live_session_ref)
                             session_recorded = True
                             resume_state["session_recorded"] = True
                     if (
@@ -896,8 +907,8 @@ def run_with_retries(
                 if args.no_sleep:
                     db_rows(
                         args.database_url,
-                        "UPDATE pipeline_jobs SET next_retry_at = now() WHERE stable_id = %s;",
-                        [job.key],
+                        "UPDATE jobs SET next_retry_at = now() WHERE project_id = %s AND job_key = %s;",
+                        [project_id(), job.key],
                     )
                 else:
                     print(f"{job_name}: retry due in {wait_seconds}s; waiting.")
@@ -946,7 +957,9 @@ def run_with_retries(
                 hooks=hooks,
                 resources=resources,
             )
-            record_attempt_outcome(args, job, run_id, attempt, "succeeded")
+            record_attempt_outcome(
+                args, job, resume_state.get("attempt_id"), "succeeded"
+            )
             # Success promotion (canonical copy + siblings) is the client's
             # act — it runs facade-side right after this returns (design §3).
             return result
@@ -961,7 +974,9 @@ def run_with_retries(
                 details=traceback.format_exc(),
             )
 
-        record_attempt_outcome(args, job, run_id, attempt, "failed", failure.code)
+        record_attempt_outcome(
+            args, job, resume_state.get("attempt_id"), "failed", failure.code
+        )
         if resume_state.get("candidate_id") is not None and not resume_state.get("session_recorded"):
             # The attempt consumed a resume candidate but died before its own
             # session ref was recorded, so the consumed row points at a
@@ -969,8 +984,8 @@ def run_with_retries(
             # is already dead (run_agent_job_once never leaks a live child),
             # so releasing the owner's claim cannot race a live resume.
             unconsume_attempt(
-                args, job, resume_state["candidate_id"], run_id, attempt,
-                resume_state["directory"],
+                args, job, resume_state["candidate_id"],
+                resume_state.get("attempt_id"), resume_state["directory"],
             )
         message = f"{job_name} attempt {attempt} failed: {failure}"
 

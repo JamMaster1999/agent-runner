@@ -74,6 +74,7 @@ EXPECTED_MIGRATIONS = [
     "004_create_events.sql",
     "005_create_leases.sql",
     "006_create_accounts.sql",
+    "007_attempts_row_identity.sql",
 ]
 
 # db/roles is NOT part of the chain and never reaches the ledger: CREATE ROLE
@@ -398,7 +399,25 @@ class RunnerMigrationsTest(unittest.TestCase):
             )
         }
         self.assertIn(("jobs", "UNIQUE (project_id, job_key)"), unique)
-        self.assertIn(("attempts", "UNIQUE (project_id, job_key, attempt)"), unique)
+        # attempts is the exception: 007 dropped the (project, job, attempt)
+        # uniqueness because attempt numbers repeat across runs of one job
+        # (requeue and --force-rerun both reset the counter). The row id is
+        # the identity; the ordinal keeps only a lookup index.
+        self.assertNotIn(("attempts", "UNIQUE (project_id, job_key, attempt)"), unique)
+        self.assertEqual(
+            [table for table, _ in unique if table == "attempts"],
+            [],
+            "an attempt is identified by its row id, never by its ordinal",
+        )
+        self.assertTrue(
+            any(
+                " ON public.attempts " in definition
+                and definition.endswith("(project_id, job_key, attempt)")
+                and not definition.startswith("CREATE UNIQUE INDEX")
+                for definition in self.index_defs().values()
+            ),
+            "the attempts-of-this-job lookup keeps a non-unique index",
+        )
 
     def test_lock_and_scan_indexes(self) -> None:
         defs = self.index_defs()

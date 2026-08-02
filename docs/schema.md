@@ -25,8 +25,10 @@ during the bridge `runner_dsn` still points at GTM — so "applied to the
 wrong database" is the likely operator mistake, not an exotic one. Two
 guards, both in `agent_runner.migrations`:
 
-1. **The DSN never falls back to `DATABASE_URL`.** It resolves
-   `--database-url` > `RUNNER_DSN` and stops. `DATABASE_URL` is the
+1. **The DSN never falls back to `DATABASE_URL` or rides argv.** The CLI reads
+   `RUNNER_DSN` by default, another named variable via
+   `--database-url-env NAME`, or a mode-0600 one-value file via
+   `--database-url-file PATH`. `DATABASE_URL` is the
    *client's* variable: GTM's `core/db.py` reads exactly it, this repo's own
    CI `full` job sets it to the GTM database, and so does the Modal Secret.
 2. **The applier refuses a client-looking target** before writing anything:
@@ -89,7 +91,7 @@ Dropped outright: `institution_id` and every business FK,
 | `consumed_at` | — | **dropped, no successor**: the consumption *fact* is `consumed_by_attempt_id IS NOT NULL` (what every claim predicate tests) and the *time* is the consuming row's `created_at`. Unconsume becomes one column, so it can no longer half-clear a pair |
 | `consumed_by_run_id` + `consumed_by_attempt` | `consumed_by_attempt_id` | self-FK; the resume chain becomes one column |
 | — | `resume_depth` | new, precomputed — replaces the recursive-CTE budget walk |
-| `UNIQUE (run_id, job_stable_id, attempt)` | `UNIQUE (project_id, job_key, attempt)` | see the copy hazard in §5 — three parts, not one |
+| `UNIQUE (run_id, job_stable_id, attempt)` | — (**no uniqueness**; non-unique index on `(project_id, job_key, attempt)`) | migration 007: attempt numbers repeat across runs of one job, so the identity is the row id. `attempt` is a display ordinal |
 
 ### `pipeline_runs` → `leases`
 
@@ -246,21 +248,18 @@ cap.
 - Flip `runner_dsn` from the GTM database to the runner DB, between runs.
 - Point the package's SQL at the new names (`jobs`/`events`/`attempts`/
   `leases`). Step 8 authored the schema; it did not retype the SQL.
-- Copy `pipeline_attempts` → `attempts` — **not one `INSERT..SELECT`.** The
-  key change from `(run_id, job_stable_id, attempt)` to
-  `(project_id, job_key, attempt)` has three consequences, spelled out in
-  full in 003's table comment:
-  1. **Uniqueness.** `--force-rerun` resets `attempt_count` to 0, so attempt
-     numbers repeat across runs; the copy must dedupe or renumber first.
-  2. **The resume chain is re-linked, never copied.** The old chain is the
+- Copy `pipeline_attempts` → `attempts` — **not one `INSERT..SELECT`.** Two
+  consequences of the key change from `(run_id, job_stable_id, attempt)`,
+  spelled out in full in 003's table comment as amended by 007:
+  1. **The resume chain is re-linked, never copied.** The old chain is the
      pair `(consumed_by_run_id, consumed_by_attempt)`; the new one is a
-     surrogate id that does not exist until the rows are inserted — and the
-     dedupe/renumber from (1) destroys the very coordinates that pair
-     resolves through. Insert with the link NULL and the old triple carried
-     along, then resolve it in a second pass. Rows whose consumer got
-     dropped resolve to NULL and read as *resumable again*, which is the
-     argument for renumbering over deduping.
-  3. **`resume_depth` needs a backfill.** It defaults to 0 with no source
+     surrogate id that does not exist until the rows are inserted — and a
+     renumbering pass would destroy the very coordinates that pair resolves
+     through. Insert with the link NULL and the old triple carried along,
+     then resolve it in a second pass. An unresolved full pair or a
+     half-present pair would land NULL and read as *resumable again*; the
+     copy tool therefore treats either condition as fatal before writing.
+  2. **`resume_depth` needs a backfill.** It defaults to 0 with no source
      column, so a straight copy hands every exhausted session a fresh
      budget — re-arming exactly the resume loop `RESUME_BUDGET` exists to
      stop. Walk the re-linked chain once (recursive CTE in 003's comment),
@@ -269,10 +268,20 @@ cap.
      Anchoring 0 at the unconsumed heads inverts the meaning and re-arms
      every exhausted chain.
 
-  `db/copy_attempts.py` implements all three parts (renumber, two-pass
-  re-link, corrected-direction backfill) in one target transaction, with
-  `--dry-run` and an idempotent already-copied preflight; use it rather
-  than hand-rolling the SQL.
+  A third hazard used to live here: the target's
+  `UNIQUE (project_id, job_key, attempt)` would have rejected the repeated
+  ordinals `--force-rerun` produces, forcing a dedupe-or-renumber pass.
+  **007 dropped that constraint** — it was wrong for live writes too, not
+  just the copy — so a straight copy of the old numbers is now valid.
+  `db/copy_attempts.py` still renumbers per job because repeated ordinals
+  read as duplicates in the run view; that is now a choice.
+
+  The tool implements both parts above plus that renumber in one target
+  transaction, with `--dry-run`. Its idempotence check compares every
+  copy-owned field, resolved consumer FK, and derived resume depth against
+  the source plan; the first copy runs that same exact verification before
+  commit and rolls back on any mismatch. Use it rather than hand-rolling
+  the SQL.
 - Set `RUNNER_EMIT_DSN`'s *value* to the `runner_emitter` DSN and drop the
   jobs UPDATE from the emit path. The emit CLI already falls back to the
   full DSN, so both behaviors survive the bridge; no schema change is needed

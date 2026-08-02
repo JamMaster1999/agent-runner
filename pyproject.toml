@@ -7,7 +7,7 @@ name = "agent-runner"
 version = "0.1.0"
 description = "Generic agent-CLI job runner extracted from the Uflo GTM pipeline (extraction plan step 6)."
 requires-python = ">=3.13"        # matches Mac system python3 (3.13.3), venv-modal, GTM CI
-dependencies = ["psycopg[binary]>=3.1"]   # lazy-imported; the stdlib/no-psycopg contract holds
+dependencies = ["psycopg[binary]==3.3.4"]   # reviewed cutover transport; lazy import preserves stdlib contract
 
 [project.scripts]
 agent-runner = "agent_runner.cli:main"

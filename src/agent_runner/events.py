@@ -1,22 +1,24 @@
-"""pipeline_events writes: the run-id global, event SQL, and the direct
+"""events writes: the run-id global, event SQL, and the direct
 event/lifecycle update path.
 
 The facade sets JOB_EVENT_RUN_ID via module attribute
-(``events.JOB_EVENT_RUN_ID = run_id``) once per process (acquire_lease, R2).
-Step-5 retype: callers hand in the generic ``RunnerJob``; the event columns
-``phase``/``backend`` carry ``task_type``/``harness`` — identical values,
-runner vocabulary.
+(``events.JOB_EVENT_RUN_ID = run_id``) once per process (acquire_lease, R2);
+it lands in the ``lease_ref`` routing column. Step-9 retype: every
+statement targets the runner schema (``jobs``/``events``/``leases``,
+project-scoped); the Python keyword surface keeps the historical
+``phase``/``backend`` spellings so callers are untouched — they bind the
+``task_type``/``harness`` columns.
 
 Step 7: the client-repo job_event script (and the subprocess hop to it) is
 gone — the SQL it owned lives here as direct functions over the runner's own
 transport (``util.db_rows``). ``emit_event`` is the one entry point: one
-statement appends the event row(s) and runs the guarded pipeline_jobs
-update in a single round trip; the ``agent-runner emit`` CLI
-(``agent_runner.cli``) and the engine's ``run_job_event`` both dispatch onto
-it. The guards are load-bearing and preserved exactly:
+statement appends the event row(s) and runs the guarded jobs update in a
+single round trip; the ``agent-runner emit`` CLI (``agent_runner.cli``) and
+the engine's ``run_job_event`` both dispatch onto it. The guards are
+load-bearing and preserved exactly:
 
-- ``status <> 'cancelled'`` on every pipeline_jobs update (late writers
-  cannot resurrect a cancelled job).
+- ``status <> 'cancelled'`` on every jobs update (late writers cannot
+  resurrect a cancelled job).
 - ``attempt_count = N`` when an attempt is given: a late writer from a
   reaped-and-reclaimed attempt cannot flip the row.
 - ``finish`` never resurrects blocked/failed rows; ``fail`` never overwrites
@@ -31,7 +33,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner.runtime import RunnerError, RunnerJob, project_id
 from agent_runner.util import db_rows
 
 
@@ -46,28 +48,31 @@ def append_event_sql(
     message: str,
     data: dict[str, Any] | None = None,
 ) -> tuple[str, list[Any]]:
-    """(sql, params) for a parameterized INSERT appending one pipeline_events
-    row for a job.
+    """(sql, params) for a parameterized INSERT appending one events row for
+    a job.
 
     Executed by the lifecycle helpers in the same transaction as the guarded
-    pipeline_jobs UPDATE it fences (jobstore.mark_retry/mark_blocked);
-    ``emit_event`` below handles the general event-writing path. The jsonb
-    payload binds as serialized text through ``%s::jsonb`` so building the
-    statement needs no driver import. JOB_EVENT_RUN_ID is read at call time.
+    jobs UPDATE it fences (jobstore.mark_retry/mark_blocked); ``emit_event``
+    below handles the general event-writing path. The jsonb payload binds as
+    serialized text through ``%s::jsonb`` so building the statement needs no
+    driver import. JOB_EVENT_RUN_ID is read at call time and lands in
+    lease_ref; group_key rides from the job row (SELECT form kept so the
+    caller never supplies it).
     """
     payload = json.dumps(data, separators=(",", ":")) if data else None
     sql = """
-INSERT INTO pipeline_events (job_id, job_stable_id, run_id, phase, backend, event, message, data, group_key)
-SELECT id, stable_id, %s, %s, %s, %s, %s, %s::jsonb, group_key
-FROM pipeline_jobs WHERE stable_id = %s
+INSERT INTO events (project_id, job_key, group_key, lease_ref, harness, task_type, kind, message, data)
+SELECT project_id, job_key, group_key, %s, %s, %s, %s, %s, %s::jsonb
+FROM jobs WHERE project_id = %s AND job_key = %s
 """.strip()
     return sql, [
         JOB_EVENT_RUN_ID,
-        job.task_type,
         job.harness,
+        job.task_type,
         event,
         message,
         payload,
+        project_id(),
         job.key,
     ]
 
@@ -162,8 +167,8 @@ def update_guard(call: SimpleNamespace) -> tuple[str, list[object]]:
       failed rows), ``fail`` only on queued/running rows (never overwrites
       an already-terminal status).
     """
-    guard = "stable_id = %s AND status <> 'cancelled'"
-    params: list[object] = [call.stable_id]
+    guard = "project_id = %s AND job_key = %s AND status <> 'cancelled'"
+    params: list[object] = [project_id(), call.stable_id]
     if call.attempt is not None:
         guard += " AND attempt_count = %s"
         params.append(as_integer(call.attempt))
@@ -185,34 +190,35 @@ def update_sql(call: SimpleNamespace, batch: list[dict]) -> tuple[str, list[obje
         if call.run_id:
             runs_cte = """,
 runs AS (
-  UPDATE pipeline_runs
+  UPDATE leases
   SET heartbeat_at = now()
-  WHERE run_id = %s AND status = 'running'
+  WHERE project_id = %s AND lease_ref = %s AND status = 'held'
   RETURNING 1
 )"""
-            runs_params = [call.run_id]
+            runs_params = [project_id(), call.run_id]
         sql = f"""
 WITH j AS (
-  SELECT stable_id, status FROM pipeline_jobs WHERE stable_id = %s
+  SELECT job_key, status FROM jobs WHERE project_id = %s AND job_key = %s
 ),
 upd AS (
-  UPDATE pipeline_jobs
+  UPDATE jobs
   SET heartbeat_at = now(), updated_at = now()
   WHERE {guard_sql}
   RETURNING 1
 ){runs_cte}
-SELECT j.stable_id, j.status FROM j;
+SELECT j.job_key, j.status FROM j;
 """
-        return sql, [call.stable_id, *guard_params, *runs_params]
+        return sql, [project_id(), call.stable_id, *guard_params, *runs_params]
 
     rows, values_params = event_rows(call, batch)
 
     # Agents report against an earlier-discovered total, so 'PROGRESS: 110/107'
-    # happens. The pipeline_jobs CHECK (progress_current <= progress_total)
-    # would fail the whole statement and discard every batched event row, so
-    # sanitize the denormalized columns only: a zero/negative total carries no
-    # usable progress, and current > total widens the total. Event rows keep
-    # the raw values for the audit trail (pipeline_events has no CHECK).
+    # happens. The jobs CHECK (progress_current <= progress_total) would fail
+    # the whole statement and discard every batched event row, so sanitize
+    # the denormalized columns only: a zero/negative total carries no usable
+    # progress, and current > total widens the total. Event rows keep the
+    # raw values for the audit trail (events has no CHECK — 004 keeps them
+    # truthful on purpose).
     current, total = call.current, call.total
     if total is not None and total <= 0:
         current, total = None, None
@@ -281,16 +287,15 @@ SELECT j.stable_id, j.status FROM j;
 
     sql = f"""
 WITH j AS (
-  SELECT id, stable_id, status, group_key FROM pipeline_jobs WHERE stable_id = %s
+  SELECT project_id, job_key, status, group_key FROM jobs WHERE project_id = %s AND job_key = %s
 ),
 ins AS (
-  INSERT INTO pipeline_events
-    (job_id, job_stable_id, run_id, phase, backend, attempt, group_key,
-     event, message, progress_current, progress_total,
+  INSERT INTO events
+    (project_id, job_key, group_key, lease_ref, harness, task_type, attempt,
+     kind, message, progress_current, progress_total,
      tok_input, tok_cache_write, tok_cache_read, tok_output, cost_usd)
-  SELECT j.id, j.stable_id,
-         %s, %s,
-         %s, %s, j.group_key,
+  SELECT j.project_id, j.job_key, j.group_key,
+         %s, %s, %s, %s,
          v.event, v.message, v.progress_current, v.progress_total,
          v.tok_input, v.tok_cache_write, v.tok_cache_read, v.tok_output, v.cost_usd
   FROM j
@@ -301,19 +306,20 @@ ins AS (
   RETURNING 1
 ),
 upd AS (
-  UPDATE pipeline_jobs
+  UPDATE jobs
   SET
     {assignments_sql}
   WHERE {guard_sql}
   RETURNING 1
 )
-SELECT j.stable_id, j.status FROM j;
+SELECT j.job_key, j.status FROM j;
 """
     params: list[object] = [
+        project_id(),
         call.stable_id,
         call.run_id,
-        call.phase,
         call.backend,
+        call.phase,
         as_integer(call.attempt),
         *values_params,
         *assignment_params,
@@ -341,13 +347,13 @@ def emit_event(
     batch: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     """One database round trip for a lifecycle command: append the event
-    row(s) and run the guarded pipeline_jobs update; returns the job's
-    (stable_id, status) for the heartbeat cancel poll.
+    row(s) and run the guarded jobs update; returns the job's
+    (job_key, status) for the heartbeat cancel poll.
 
     ``batch`` appends many stream-derived events in the same single
     statement — one transaction regardless of how many events it drained.
-    Raises RunnerError('job_missing') when no pipeline_jobs row matches;
-    transport failures surface as the util module's db_timeout/db_error.
+    Raises RunnerError('job_missing') when no jobs row matches; transport
+    failures surface as the util module's db_timeout/db_error.
     """
     call = SimpleNamespace(
         command=command,
@@ -371,13 +377,13 @@ def emit_event(
     if not rows:
         # The j CTE found no job row — the old empty-output contract.
         raise RunnerError(
-            f"No pipeline_jobs row matched stable_id {stable_id!r}.",
+            f"No jobs row matched job_key {stable_id!r}.",
             code="job_missing",
             retryable=False,
             alert=True,
         )
-    job_stable_id, status = rows[0]
-    return job_stable_id, status
+    job_key, status = rows[0]
+    return job_key, status
 
 
 def run_job_event(
@@ -393,7 +399,7 @@ def run_job_event(
     batch: list[dict[str, Any]] | None = None,
     fatal: bool = True,
 ) -> None:
-    """Append event(s) to pipeline_events and update the job's progress columns.
+    """Append event(s) to events and update the job's progress columns.
 
     ``batch`` appends many stream-derived events in one round trip.
     ``fatal=False`` downgrades a failed update to a stderr warning — used for
@@ -431,7 +437,7 @@ def run_job_event(
             )
             return
         raise RunnerError(
-            "pipeline_jobs event update failed.",
+            "jobs event update failed.",
             code="job_event_failed",
             retryable=False,
             alert=True,

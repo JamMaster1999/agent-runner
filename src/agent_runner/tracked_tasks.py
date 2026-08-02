@@ -14,7 +14,7 @@ import argparse
 from agent_runner import events as runner_events
 from agent_runner.events import run_job_event
 from agent_runner.jobstore import claim_job, mark_blocked
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner.runtime import RunnerError, RunnerJob, project_id
 from agent_runner.util import db_rows
 
 
@@ -39,8 +39,8 @@ def claim_script_job(args: argparse.Namespace, job: RunnerJob, message: str) -> 
         if claim["status"] == "queued" and claim["wait_seconds"]:
             db_rows(
                 args.database_url,
-                "UPDATE pipeline_jobs SET next_retry_at = now() WHERE stable_id = %s;",
-                [job.key],
+                "UPDATE jobs SET next_retry_at = now() WHERE project_id = %s AND job_key = %s;",
+                [project_id(), job.key],
             )
             continue
         break

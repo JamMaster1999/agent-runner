@@ -85,10 +85,11 @@ all consequences of the same key change; part 1 alone is not enough.
         whose OLD triple equals this row's (consumed_by_run_id,
         job_stable_id, consumed_by_attempt) — resolved through the mapping
         from (a), never through the new key.
-   A row whose consumer the dedupe dropped resolves to NULL, which reads as
-   'unconsumed' and makes a dead session resumable again. That is the
-   reason to prefer the renumber rule over the dedupe rule; either way,
-   count the NULLs you end up with.
+   A row whose consumer fails to resolve would land NULL, which reads as
+   'unconsumed' and makes a dead session resumable again. The sanctioned
+   copy therefore renumbers without dropping rows and refuses any unresolved
+   full pair or half-present pair before writing; it never accepts a NULL as
+   a lossy substitute for source consumption state.
 
 3. resume_depth NEEDS A BACKFILL. It is DEFAULT 0 and has no source column:
    the old schema computed depth by walking the chain with a recursive CTE

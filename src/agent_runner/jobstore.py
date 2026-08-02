@@ -1,9 +1,13 @@
-"""pipeline_jobs store: upsert/claim, heartbeats, leases, reaper, retention.
+"""jobs store: upsert/claim, heartbeats, leases, reaper, retention.
 
-Step-5 retype: every entry point takes the generic ``RunnerJob`` (or plain
-scalars) and raises ``RunnerError``; the pipeline_jobs/pipeline_runs column
-values are byte-identical to the pre-retype rows — ``phase``/``backend``/
-``agent_name`` carry ``task_type``/``harness``/``agent_ref``.
+Step-9 retype: every statement targets the runner database's own schema
+(db/migrations — ``jobs``/``events``/``leases``), scoped by
+``runtime.project_id()``. The caller-facing surface is unchanged: entry
+points take the generic ``RunnerJob`` (or plain scalars) and raise
+``RunnerError``. What used to be GTM columns rides as data now —
+``agent_ref``/``artifact_contract``/``policy`` jsonb, ``unit_type``/
+``unit_key`` inside ``labels`` — and the transitional
+``client_refs['institution_id']`` business ref dies here (plan §3).
 """
 
 from __future__ import annotations
@@ -15,13 +19,12 @@ import socket
 import subprocess
 import sys
 import time
-import uuid
 from typing import Any
 
 from agent_runner.util import clean_params
 from agent_runner import events
 from agent_runner.events import append_event_sql
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner.runtime import RunnerError, RunnerJob, project_id
 from agent_runner.util import db_rows, db_tx
 
 
@@ -55,16 +58,12 @@ def ensure_job(
     # that ships with the facade hardening, not with this relocation.
     replay = bool(os.environ.get("GTM_RUN_REPLAY"))
     assignments = [
-        "institution_id = EXCLUDED.institution_id",
-        "phase = EXCLUDED.phase",
-        "unit_type = EXCLUDED.unit_type",
-        "unit_key = EXCLUDED.unit_key",
-        "agent_name = EXCLUDED.agent_name",
-        "backend = EXCLUDED.backend",
-        "output_path = EXCLUDED.output_path",
+        "task_type = EXCLUDED.task_type",
+        "harness = EXCLUDED.harness",
+        "agent_ref = EXCLUDED.agent_ref",
+        "artifact_contract = EXCLUDED.artifact_contract",
+        "policy = EXCLUDED.policy",
         "max_attempts = EXCLUDED.max_attempts",
-        # Always-on metadata (migration 031): replay/force/default all
-        # backfill group_key/labels onto pre-031 rows.
         "group_key = EXCLUDED.group_key",
         "labels = EXCLUDED.labels",
         "updated_at = now()",
@@ -90,75 +89,71 @@ def ensure_job(
         ]
     else:
         terminal = ["'failed'", "'blocked'", "'cancelled'"]
-        requeue = f"pipeline_jobs.status IN ({', '.join(terminal)})"
+        requeue = f"jobs.status IN ({', '.join(terminal)})"
         assignments += [
-            f"status = CASE WHEN {requeue} THEN 'queued' ELSE pipeline_jobs.status END",
-            f"attempt_count = CASE WHEN {requeue} THEN 0 ELSE pipeline_jobs.attempt_count END",
-            f"next_retry_at = CASE WHEN {requeue} THEN NULL ELSE pipeline_jobs.next_retry_at END",
-            f"finished_at = CASE WHEN {requeue} THEN NULL ELSE pipeline_jobs.finished_at END",
-            f"claimed_by = CASE WHEN {requeue} THEN NULL ELSE pipeline_jobs.claimed_by END",
-            f"claimed_at = CASE WHEN {requeue} THEN NULL ELSE pipeline_jobs.claimed_at END",
-            f"error_message = CASE WHEN {requeue} THEN NULL ELSE pipeline_jobs.error_message END",
-            f"error_details = CASE WHEN {requeue} THEN '{{}}'::jsonb ELSE pipeline_jobs.error_details END",
+            f"status = CASE WHEN {requeue} THEN 'queued' ELSE jobs.status END",
+            f"attempt_count = CASE WHEN {requeue} THEN 0 ELSE jobs.attempt_count END",
+            f"next_retry_at = CASE WHEN {requeue} THEN NULL ELSE jobs.next_retry_at END",
+            f"finished_at = CASE WHEN {requeue} THEN NULL ELSE jobs.finished_at END",
+            f"claimed_by = CASE WHEN {requeue} THEN NULL ELSE jobs.claimed_by END",
+            f"claimed_at = CASE WHEN {requeue} THEN NULL ELSE jobs.claimed_at END",
+            f"error_message = CASE WHEN {requeue} THEN NULL ELSE jobs.error_message END",
+            f"error_details = CASE WHEN {requeue} THEN '{{}}'::jsonb ELSE jobs.error_details END",
         ]
 
     sql = f"""
-INSERT INTO pipeline_jobs (
-  id,
-  stable_id,
-  institution_id,
-  phase,
-  status,
-  unit_type,
-  unit_key,
-  agent_name,
-  backend,
-  output_path,
-  max_attempts,
+INSERT INTO jobs (
+  project_id,
+  job_key,
   group_key,
+  task_type,
+  harness,
+  agent_ref,
   labels,
+  artifact_contract,
+  policy,
+  status,
+  max_attempts,
   created_at,
   updated_at
 )
 VALUES (
-  %s::uuid,
-  %s,
-  %s::uuid,
-  %s,
-  'queued',
-  'institution',
-  %s,
   %s,
   %s,
   %s,
   %s,
   %s,
   %s::jsonb,
+  %s::jsonb,
+  %s::jsonb,
+  %s::jsonb,
+  'queued',
+  %s,
   now(),
   now()
 )
-ON CONFLICT (stable_id) DO UPDATE SET
+ON CONFLICT (project_id, job_key) DO UPDATE SET
   {", ".join(assignments)};
 """
     db_rows(
         url,
         sql,
         [
-            str(uuid.uuid5(uuid.UUID("da5d14f7-c638-47a4-a8d2-7c08d84df608"), job.key)),
+            project_id(),
             job.key,
-            # TRANSITIONAL business ref (client_refs) — dies at cutover,
-            # plan §3.
-            job.client_refs.get("institution_id"),
+            job.group_key,
             job.task_type,
-            job.group_key,
-            job.agent_ref,
             job.harness,
-            job.canonical_relpath,
+            # AgentDef as data (002): name now, per-harness config and the
+            # prompt body ref as the submit surface grows into them.
+            json.dumps({"name": job.agent_ref}),
+            # unit_type/unit_key were caller-vocabulary columns; they ride in
+            # labels now (display only — the dashboard reads
+            # labels->>'unit_key').
+            json.dumps({**job.labels, "unit_type": "institution", "unit_key": job.group_key}),
+            json.dumps({"canonical_path": job.canonical_relpath}),
+            json.dumps({"max_attempts": max_attempts}),
             max_attempts,
-            # group_key + labels arrive verbatim from the submit request
-            # (display strings only).
-            job.group_key,
-            json.dumps(job.labels),
         ],
     )
 
@@ -167,7 +162,7 @@ HEARTBEAT_SECONDS = 60
 
 
 def job_heartbeat(url: str, job: RunnerJob) -> str | None:
-    """Bump job (and run) heartbeats; returns the job's current status.
+    """Bump job (and lease) heartbeats; returns the job's current status.
 
     The returned status is the cancel poll: an operator setting a job to
     'cancelled' is noticed within one heartbeat interval. Advisory — any
@@ -215,10 +210,10 @@ def poll_heartbeat(
 
 def ownership_guard_sql() -> tuple[str, list[str | None]]:
     """(WHERE fragment, params) fencing lifecycle writes to the job this
-    process still owns: claim_job stamps claimed_by/run_id, so a job reaped
-    and re-claimed by another worker no longer matches and a late local
-    failure cannot clobber the live attempt."""
-    return "AND claimed_by = %s AND run_id = %s", [WORKER_ID, events.JOB_EVENT_RUN_ID]
+    process still owns: claim_job stamps claimed_by/lease_ref, so a job
+    reaped and re-claimed by another worker no longer matches and a late
+    local failure cannot clobber the live attempt."""
+    return "AND claimed_by = %s AND lease_ref = %s", [WORKER_ID, events.JOB_EVENT_RUN_ID]
 
 
 def mark_retry(
@@ -236,7 +231,7 @@ def mark_retry(
     attempt_reset = "" if consume_attempt else "\n    attempt_count = GREATEST(attempt_count - 1, 0),"
     guard_sql, guard_params = ownership_guard_sql()
     update_sql = f"""
-UPDATE pipeline_jobs
+UPDATE jobs
 SET
   status = 'queued',{attempt_reset}
   next_retry_at = now() + (%s || ' seconds')::interval,
@@ -246,7 +241,7 @@ SET
   progress_updated_at = now(),
   heartbeat_at = now(),
   updated_at = now()
-WHERE stable_id = %s AND status <> 'cancelled'
+WHERE project_id = %s AND job_key = %s AND status <> 'cancelled'
   {guard_sql};
 """
     event_sql, event_params = append_event_sql(
@@ -256,7 +251,7 @@ WHERE stable_id = %s AND status <> 'cancelled'
     def script(conn) -> int:
         updated = conn.execute(
             update_sql,
-            clean_params([delay_seconds, message, job.key, *guard_params]),
+            clean_params([delay_seconds, message, project_id(), job.key, *guard_params]),
         ).rowcount
         if updated:
             # The event is fenced on the guarded UPDATE landing — same
@@ -282,7 +277,7 @@ def mark_blocked(
 ) -> None:
     guard_sql, guard_params = ownership_guard_sql()
     update_sql = f"""
-UPDATE pipeline_jobs
+UPDATE jobs
 SET
   status = 'blocked',
   finished_at = now(),
@@ -292,7 +287,7 @@ SET
   error_message = %s,
   error_details = jsonb_build_object('category', %s::text, 'details', %s::text),
   updated_at = now()
-WHERE stable_id = %s AND status <> 'cancelled'
+WHERE project_id = %s AND job_key = %s AND status <> 'cancelled'
   {guard_sql};
 """
     event_sql, event_params = append_event_sql(job, "blocked", message, {"category": category})
@@ -305,6 +300,7 @@ WHERE stable_id = %s AND status <> 'cancelled'
                     message,
                     category,
                     details[-4000:] if details else "",
+                    project_id(),
                     job.key,
                     *guard_params,
                 ]
@@ -335,22 +331,21 @@ def acquire_run_lease(
     run_id: str,
     *,
     lease_key: str,
-    institution_id: str,
     stale_seconds: int,
     poll_seconds: float = LEASE_POLL_SECONDS,
     timeout_seconds: float = LEASE_WAIT_TIMEOUT_SECONDS,
 ) -> None:
-    """Take the per-institution run lease, reaping a stale holder first.
+    """Take the run lease for ``lease_key``, reaping a stale holder first.
 
-    ``lease_key`` is the caller's opaque name for the lease (today the
-    institution stable_id — operator prints only); ``institution_id`` is the
-    TRANSITIONAL business column the pipeline_runs row still keys on (dies
-    at cutover, plan §3).
+    ``lease_key`` is the caller's opaque exclusivity name (today the
+    institution stable_id) — with the step-9 schema it IS the key the
+    partial unique index locks on; the old transitional ``institution_id``
+    business column died with the cutover (plan §3).
 
     Lease, not advisory lock: DB access is short-lived one-shot connections,
     so a session-scoped lock cannot be held. The partial unique index
-    pipeline_runs_one_running_per_institution enforces single-holder; a holder
-    whose heartbeat is older than ``stale_seconds`` is flipped to 'abandoned'
+    ``leases_one_held_per_key`` enforces single-holder; a holder whose
+    heartbeat is older than ``stale_seconds`` is flipped to 'expired'
     inside the same transaction so takeover is race-free.
 
     A held lease queues rather than fails: the acquire is retried every
@@ -362,35 +357,38 @@ def acquire_run_lease(
     the first attempt acquires immediately, no sleep.
     """
     reap_sql = """
-UPDATE pipeline_runs
-SET status = 'abandoned', finished_at = now()
-WHERE institution_id = %s::uuid
-  AND status = 'running'
+UPDATE leases
+SET status = 'expired', finished_at = now()
+WHERE project_id = %s
+  AND lease_key = %s
+  AND status = 'held'
   AND heartbeat_at < now() - (%s || ' seconds')::interval;
 """
     insert_sql = """
-INSERT INTO pipeline_runs (run_id, institution_id, claimed_by)
-VALUES (%s, %s::uuid, %s)
-ON CONFLICT (institution_id) WHERE status = 'running' DO NOTHING
-RETURNING run_id;
+INSERT INTO leases (project_id, lease_ref, lease_key, holder)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (project_id, lease_key) WHERE status = 'held' DO NOTHING
+RETURNING lease_ref;
 """
 
     def acquire(conn):
         # The stale-holder reap and the insert commit together, so takeover
         # stays race-free — the old BEGIN..COMMIT script, statement by
         # statement. A returned row means this run holds the lease.
-        conn.execute(reap_sql, [institution_id, stale_seconds])
-        return conn.execute(insert_sql, [run_id, institution_id, WORKER_ID]).fetchone()
+        conn.execute(reap_sql, [project_id(), lease_key, stale_seconds])
+        return conn.execute(
+            insert_sql, [project_id(), run_id, lease_key, WORKER_ID]
+        ).fetchone()
 
     holder_sql = """
-SELECT run_id || ' held by ' || claimed_by || ', heartbeat ' ||
+SELECT lease_ref || ' held by ' || holder || ', heartbeat ' ||
        COALESCE(EXTRACT(EPOCH FROM now() - heartbeat_at)::int::text, '?') || 's ago'
-FROM pipeline_runs
-WHERE institution_id = %s::uuid AND status = 'running';
+FROM leases
+WHERE project_id = %s AND lease_key = %s AND status = 'held';
 """
 
     def current_holder() -> str | None:
-        rows = db_rows(url, holder_sql, [institution_id])
+        rows = db_rows(url, holder_sql, [project_id(), lease_key])
         return rows[0][0] if rows else None
 
     deadline = time.monotonic() + timeout_seconds
@@ -425,54 +423,63 @@ WHERE institution_id = %s::uuid AND status = 'running';
 
 
 def release_run_lease(url: str, run_id: str, outcome: str) -> None:
-    """Release the per-institution run lease (the pipeline_runs UPDATE).
+    """Release the run lease (the leases UPDATE).
 
-    This is the LEASE half of what used to be finalize_run: pipeline_runs is
-    runner state and stays written with the same outcome vocabulary, so old
-    dashboards keep rendering. The run SUMMARY — the pipeline manager's
-    judgment of the run — is GTM's and lives in enrichment_runs (written by
-    the orchestrator's finalize_run wrapper via GTM's manager-events module).
+    This is the LEASE half of what used to be finalize_run. Release is
+    release however the work went (005's status mapping: succeeded /
+    succeeded_with_failures / failed / cancelled all land 'released'); the
+    run SUMMARY — the pipeline manager's judgment, including ``outcome`` —
+    is GTM's and lives in enrichment_runs. ``outcome`` stays in the
+    signature for the callers that pass it, and an exclusive lease leaves
+    the leases outcome columns NULL by design (005: nobody judges a lock).
     """
+    del outcome  # recorded GTM-side (enrichment_runs); a lock has no verdict
     db_rows(
         url,
         """
-UPDATE pipeline_runs
-SET status = %s, finished_at = now()
-WHERE run_id = %s AND status = 'running';
+UPDATE leases
+SET status = 'released', finished_at = now()
+WHERE project_id = %s AND lease_ref = %s AND status = 'held';
 """,
-        [outcome, run_id],
+        [project_id(), run_id],
     )
 
 
 def interrupt_run_jobs(url: str, run_id: str) -> list[str]:
     """Flag a run's still-'running' jobs for the stranded-job reaper.
 
-    The `interrupt` protocol op's store write (step 4) — SQL moved verbatim
-    from orchestrate_foundation.mark_run_jobs_interrupted; WORKER_ID is
-    stamped runner-side. heartbeat_at = NULL is what reap_stale_jobs already
-    treats as stale, so the next orchestrator start (or the recovery cron)
-    requeues these rows immediately instead of waiting out the staleness
-    window. Ownership-guarded like the other lifecycle writes: only rows
-    this process claimed for this run are touched — jobs a concurrent run
-    owns stay put. Returns 'stable_id -> interrupted' lines for the
-    shutdown log.
+    The `interrupt` protocol op's store write (step 4) — heartbeat_at = NULL
+    is what reap_stale_jobs already treats as stale, so the next
+    orchestrator start (or the recovery cron) requeues these rows
+    immediately instead of waiting out the staleness window.
+    Ownership-guarded like the other lifecycle writes: only rows this
+    process claimed for this run are touched — jobs a concurrent run owns
+    stay put. Returns 'job_key -> interrupted' lines for the shutdown log.
     """
     sql = """
 WITH marked AS (
-  UPDATE pipeline_jobs
+  UPDATE jobs
   SET heartbeat_at = NULL, updated_at = now()
-  WHERE status = 'running'
-    AND run_id = %s
+  WHERE project_id = %s
+    AND status = 'running'
+    AND lease_ref = %s
     AND claimed_by = %s
-  RETURNING id, stable_id, phase, backend, attempt_count, group_key
+  RETURNING job_key, group_key, task_type, harness, attempt_count
 )
-INSERT INTO pipeline_events (job_id, job_stable_id, run_id, phase, backend, attempt, group_key, event, message)
-SELECT id, stable_id, %s, phase, backend, attempt_count, group_key, 'interrupted',
+INSERT INTO events (project_id, job_key, group_key, lease_ref, harness, task_type, attempt, kind, message)
+SELECT %s, job_key, group_key, %s, harness, task_type, attempt_count, 'interrupted',
        'SIGTERM shutdown by ' || %s || '; left for stranded-job recovery'
 FROM marked
-RETURNING job_stable_id || ' -> interrupted';
+RETURNING job_key || ' -> interrupted';
 """
-    return [row[0] for row in db_rows(url, sql, [run_id, WORKER_ID, run_id, WORKER_ID])]
+    return [
+        row[0]
+        for row in db_rows(
+            url,
+            sql,
+            [project_id(), run_id, WORKER_ID, project_id(), run_id, WORKER_ID],
+        )
+    ]
 
 
 def local_worker_alive(claimed_by: str | None) -> bool:
@@ -501,21 +508,22 @@ def local_worker_alive(claimed_by: str | None) -> bool:
 
 
 def live_local_claim_ids(url: str, *, stale_seconds: int) -> list[str]:
-    """stable_ids of stale-heartbeat 'running' rows still held by a live local
+    """job_keys of stale-heartbeat 'running' rows still held by a live local
     process — the reaper's exemption list."""
     rows = db_rows(
         url,
         """
-SELECT claimed_by, stable_id
-FROM pipeline_jobs
-WHERE status = 'running'
+SELECT claimed_by, job_key
+FROM jobs
+WHERE project_id = %s
+  AND status = 'running'
   AND claimed_by IS NOT NULL
   AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s || ' seconds')::interval);
 """,
-        [stale_seconds],
+        [project_id(), stale_seconds],
     )
     return [
-        stable_id for claimed_by, stable_id in rows if stable_id and local_worker_alive(claimed_by)
+        job_key for claimed_by, job_key in rows if job_key and local_worker_alive(claimed_by)
     ]
 
 
@@ -536,10 +544,10 @@ def reap_stale_jobs(url: str, run_id: str, *, stale_seconds: int) -> None:
         return
     if exempt:
         print(f"Reaper: skipping live local job(s): {', '.join(sorted(exempt))}")
-    exempt_clause = "AND NOT (stable_id = ANY(%s))" if exempt else ""
+    exempt_clause = "AND NOT (job_key = ANY(%s))" if exempt else ""
     sql = f"""
 WITH reaped AS (
-  UPDATE pipeline_jobs
+  UPDATE jobs
   SET
     status = CASE WHEN attempt_count >= max_attempts THEN 'blocked' ELSE 'queued' END,
     error_message = CASE WHEN attempt_count >= max_attempts
@@ -552,21 +560,22 @@ WITH reaped AS (
     claimed_at = NULL,
     next_retry_at = now(),
     updated_at = now()
-  WHERE status = 'running'
+  WHERE project_id = %s
+    AND status = 'running'
     AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s || ' seconds')::interval)
     {exempt_clause}
-  RETURNING id, stable_id, phase, backend, attempt_count, status, group_key
+  RETURNING job_key, group_key, task_type, harness, attempt_count, status
 )
-INSERT INTO pipeline_events (job_id, job_stable_id, run_id, phase, backend, attempt, group_key, event, message)
-SELECT id, stable_id, %s, phase, backend, attempt_count, group_key, 'reaped',
+INSERT INTO events (project_id, job_key, group_key, lease_ref, harness, task_type, attempt, kind, message)
+SELECT %s, job_key, group_key, %s, harness, task_type, attempt_count, 'reaped',
        'stale heartbeat; set to ' || status || ' by ' || %s
 FROM reaped
-RETURNING job_stable_id || ' -> reaped';
+RETURNING job_key || ' -> reaped';
 """
-    params: list = [stale_seconds]
+    params: list = [project_id(), stale_seconds]
     if exempt:
         params.append(exempt)
-    params += [run_id, WORKER_ID]
+    params += [project_id(), run_id, WORKER_ID]
     reaped = [row[0] for row in db_rows(url, sql, params)]
     if reaped:
         print(f"Reaper: {'; '.join(reaped)}")
@@ -585,19 +594,19 @@ RETURNING job_stable_id || ' -> reaped';
         )
 
 
-def requeue_job(url: str, stable_id: str) -> None:
+def requeue_job(url: str, job_key: str) -> None:
     """Operator recovery command (--requeue-job): put a terminally-stopped job
     back in the queue without touching its attempt history.
 
     status -> 'queued'; error state, next_retry_at, and the attempt budget
-    are cleared — but pipeline_attempts rows are left untouched, so the next
-    attempt still reopens the prior session (standard recovery: fix the bug
-    -> requeue -> the session continues). Refuses queued/running/succeeded
+    are cleared — but attempts rows are left untouched, so the next attempt
+    still reopens the prior session (standard recovery: fix the bug ->
+    requeue -> the session continues). Refuses queued/running/succeeded
     rows.
     """
     sql = """
 WITH upd AS (
-  UPDATE pipeline_jobs
+  UPDATE jobs
   SET
     status = 'queued',
     attempt_count = 0,
@@ -608,31 +617,36 @@ WITH upd AS (
     error_message = NULL,
     error_details = '{}'::jsonb,
     updated_at = now()
-  WHERE stable_id = %s
+  WHERE project_id = %s
+    AND job_key = %s
     AND status IN ('blocked', 'failed', 'cancelled')
-  RETURNING id, stable_id, phase, backend, group_key
+  RETURNING job_key, group_key, task_type, harness
 ),
 ev AS (
-  INSERT INTO pipeline_events (job_id, job_stable_id, phase, backend, group_key, event, message)
-  SELECT id, stable_id, phase, backend, group_key, 'requeued',
+  INSERT INTO events (project_id, job_key, group_key, harness, task_type, kind, message)
+  SELECT %s, job_key, group_key, harness, task_type, 'requeued',
          'Requeued by operator (' || %s || '); session-resume eligibility preserved'
   FROM upd
   RETURNING 1
 )
-SELECT stable_id || ' -> queued' FROM upd;
+SELECT job_key || ' -> queued' FROM upd;
 """
-    hits = db_rows(url, sql, [stable_id, WORKER_ID])
+    hits = db_rows(url, sql, [project_id(), job_key, project_id(), WORKER_ID])
     if hits:
         print(
-            f"Requeued {stable_id}: status -> queued, error state cleared, "
+            f"Requeued {job_key}: status -> queued, error state cleared, "
             "session-resume eligibility preserved."
         )
         return
-    status_rows = db_rows(url, "SELECT status FROM pipeline_jobs WHERE stable_id = %s;", [stable_id])
+    status_rows = db_rows(
+        url,
+        "SELECT status FROM jobs WHERE project_id = %s AND job_key = %s;",
+        [project_id(), job_key],
+    )
     if not status_rows:
-        raise SystemExit(f"No pipeline_jobs row matched stable_id {stable_id!r}.")
+        raise SystemExit(f"No jobs row matched job_key {job_key!r}.")
     raise SystemExit(
-        f"{stable_id} is {status_rows[0][0]!r} — only blocked/failed/cancelled jobs can be requeued."
+        f"{job_key} is {status_rows[0][0]!r} — only blocked/failed/cancelled jobs can be requeued."
     )
 
 
@@ -643,12 +657,12 @@ def prune_old_events(url: str) -> None:
     removed = len(
         db_rows(
             url,
-            "DELETE FROM pipeline_events WHERE at < now() - (%s || ' days')::interval RETURNING 1;",
+            "DELETE FROM events WHERE at < now() - (%s || ' days')::interval RETURNING 1;",
             [EVENT_RETENTION_DAYS],
         )
     )
     if removed:
-        print(f"Pruned {removed} pipeline_events rows older than {EVENT_RETENTION_DAYS} days.")
+        print(f"Pruned {removed} events rows older than {EVENT_RETENTION_DAYS} days.")
 
 
 def claim_job(url: str, job: RunnerJob, run_id: str) -> dict[str, Any]:
@@ -662,19 +676,20 @@ def claim_job(url: str, job: RunnerJob, run_id: str) -> dict[str, Any]:
     """
     sql = """
 WITH candidate AS (
-  SELECT id FROM pipeline_jobs
-  WHERE stable_id = %s
+  SELECT id FROM jobs
+  WHERE project_id = %s
+    AND job_key = %s
     AND status IN ('queued', 'succeeded')
     AND (next_retry_at IS NULL OR next_retry_at <= now())
   FOR UPDATE SKIP LOCKED
 ),
 claimed AS (
-  UPDATE pipeline_jobs p
+  UPDATE jobs p
   SET
     status = 'running',
     claimed_by = %s,
     claimed_at = now(),
-    run_id = %s,
+    lease_ref = %s,
     attempt_count = p.attempt_count + 1,
     started_at = COALESCE(p.started_at, now()),
     finished_at = NULL,
@@ -685,11 +700,12 @@ claimed AS (
     updated_at = now()
   FROM candidate
   WHERE p.id = candidate.id
-  RETURNING p.id, p.stable_id, p.phase, p.backend, p.attempt_count, p.max_attempts, p.group_key
+  RETURNING p.project_id, p.job_key, p.group_key, p.task_type, p.harness,
+            p.attempt_count, p.max_attempts
 ),
 ev AS (
-  INSERT INTO pipeline_events (job_id, job_stable_id, run_id, phase, backend, attempt, group_key, event, message)
-  SELECT id, stable_id, %s, phase, backend, attempt_count, group_key, 'start',
+  INSERT INTO events (project_id, job_key, group_key, lease_ref, harness, task_type, attempt, kind, message)
+  SELECT project_id, job_key, group_key, %s, harness, task_type, attempt_count, 'start',
          'Claimed by ' || %s || ' (attempt ' || attempt_count || ' of ' || max_attempts || ')'
   FROM claimed
   RETURNING 1
@@ -697,7 +713,7 @@ ev AS (
 SELECT attempt_count, max_attempts FROM claimed;
 """
     rows = db_rows(
-        url, sql, [job.key, WORKER_ID, run_id, run_id, WORKER_ID]
+        url, sql, [project_id(), job.key, WORKER_ID, run_id, run_id, WORKER_ID]
     )
     if rows:
         attempt, max_attempts = rows[0]
@@ -707,12 +723,12 @@ SELECT attempt_count, max_attempts FROM claimed;
 SELECT status,
        CASE WHEN next_retry_at IS NULL THEN NULL
             ELSE GREATEST(0, CEIL(EXTRACT(EPOCH FROM next_retry_at - now())))::int END
-FROM pipeline_jobs WHERE stable_id = %s;
+FROM jobs WHERE project_id = %s AND job_key = %s;
 """
-    status_rows = db_rows(url, status_sql, [job.key])
+    status_rows = db_rows(url, status_sql, [project_id(), job.key])
     if not status_rows:
         raise RunnerError(
-            f"No pipeline_jobs row for {job.key}.",
+            f"No jobs row for {job.key}.",
             code="job_missing",
             retryable=False,
             alert=True,

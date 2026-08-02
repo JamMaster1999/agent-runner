@@ -8,8 +8,8 @@ session that must STAY exhausted after the resume_depth backfill. The source
 scratch database is built from a verbatim copy of GTM migration 026's DDL;
 the target is built by the real applier over db/migrations.
 
-The plan tests at the bottom (renumber, link resolution, malformed pairs)
-are pure Python and run everywhere; the DB tests carry the same environment
+The plan and exact-snapshot tests (renumber, link resolution, unsafe source
+states, drift rejection) are pure Python and run everywhere; the DB tests carry the same environment
 contract as test_runner_migrations.py (psycopg + reachable Postgres, skip
 cleanly otherwise).
 """
@@ -20,9 +20,13 @@ import getpass
 import os
 import subprocess
 import sys
+import threading
+import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlsplit, urlunsplit
 
 import os as _os
@@ -36,7 +40,10 @@ except ImportError:
 
 from agent_runner import migrations  # noqa: E402
 from agent_runner.attempts import RESUME_BUDGET  # noqa: E402
+from agent_runner import attempts_copy as attempts_copy_module  # noqa: E402
 from agent_runner.attempts_copy import build_plan, copy_attempts  # noqa: E402
+
+import db.copy_attempts as copy_cli  # noqa: E402
 
 TEST_URL = os.environ.get(
     "GTM_TEST_DATABASE_URL",
@@ -108,8 +115,8 @@ def _admin_exec(sql: str) -> None:
 # The force-rerun hazard, literally: job J ran twice (R1 then R2, attempt
 # numbers restarting at 1), with a resume chain crossing the run boundary:
 # (R1,1) <- (R1,2) <- (R2,1) <- (R2,2), head open with a session. Job K is a
-# single fresh attempt; job M carries the half-cleared consumer pair the old
-# two-column unconsume could leave behind.
+# single fresh attempt. Unsafe malformed source state is isolated in the
+# pure plan test because the real copy now refuses it before writing.
 SEED_ROWS = [
     # (job, run, attempt, session, consumed_by_run, consumed_by_attempt, created_at)
     ("J", "R1", 1, "sess-a", "R1", 2, _ts(1)),
@@ -117,19 +124,22 @@ SEED_ROWS = [
     ("J", "R2", 1, "sess-c", "R2", 2, _ts(3)),
     ("J", "R2", 2, "sess-d", None, None, _ts(4)),
     ("K", "R2", 1, "sess-k", None, None, _ts(5)),
-    ("M", "R1", 1, "sess-m", "R9", None, _ts(6)),
 ]
+
+
+def _source_rows(seed_rows=SEED_ROWS):
+    return [
+        (job, run, attempt, "codex", f"fp-{job}", session,
+         f"/tmp/{job}-{run}-{attempt}", None, None, c_run, c_att, created, None)
+        for (job, run, attempt, session, c_run, c_att, created) in seed_rows
+    ]
 
 
 class BuildPlanTest(unittest.TestCase):
     """Pure-Python plan logic; no database anywhere."""
 
     def source_rows(self):
-        return [
-            (job, run, attempt, "codex", f"fp-{job}", session, f"/tmp/{job}-{run}-{attempt}",
-             None, None, c_run, c_att, created, None)
-            for (job, run, attempt, session, c_run, c_att, created) in SEED_ROWS
-        ]
+        return _source_rows()
 
     def test_renumber_is_per_job_chronological(self) -> None:
         plan = build_plan(self.source_rows())
@@ -141,7 +151,11 @@ class BuildPlanTest(unittest.TestCase):
         self.assertEqual(by_triple[("R2", "K", 1)], 1)
 
     def test_links_and_malformed_pairs_are_counted(self) -> None:
-        plan = build_plan(self.source_rows())
+        rows = self.source_rows()
+        rows.extend(_source_rows([
+            ("M", "R1", 1, "sess-m", "R9", None, _ts(6)),
+        ]))
+        plan = build_plan(rows)
         self.assertEqual(plan.source_count, 6)
         self.assertEqual(plan.linked_count, 3)
         self.assertEqual(plan.malformed_count, 1)
@@ -150,18 +164,246 @@ class BuildPlanTest(unittest.TestCase):
         self.assertIsNone(malformed[0].consumed_by)
 
 
-class CopyCliGuardTest(unittest.TestCase):
-    """The argv surface refuses same-DSN copies before dialing anything."""
+class ExactSnapshotTest(unittest.TestCase):
+    """Idempotence means exact source-plan identity, not equal aggregates."""
 
-    def test_same_url_refused(self) -> None:
+    def setUp(self) -> None:
+        self.plan = build_plan(_source_rows())
+        self.expected = attempts_copy_module._plan_expectations(self.plan)
+        ids = {key: index for index, key in enumerate(self.expected, start=100)}
+        self.rows = [
+            (
+                ids[item.key],
+                *item.fields,
+                None if item.consumer_key is None else ids[item.consumer_key],
+                item.resume_depth,
+            )
+            for item in self.expected.values()
+        ]
+
+    def compare(self, rows):
+        return attempts_copy_module._compare_target_snapshot(
+            self.plan, self.expected, rows, note="test"
+        )
+
+    def test_exact_snapshot_is_accepted(self) -> None:
+        summary = self.compare(self.rows)
+        self.assertTrue(summary["exact_match"])
+        self.assertEqual(summary["target_rows"], 5)
+
+    def test_same_count_and_aggregates_do_not_hide_field_link_or_depth_drift(self) -> None:
+        cases = []
+
+        field_rows = list(self.rows)
+        field_row = list(field_rows[0])
+        field_row[9] = "/tmp/drift"
+        field_rows[0] = tuple(field_row)
+        cases.append(("copied-fields", field_rows))
+
+        link_rows = list(self.rows)
+        linked_index = next(i for i, row in enumerate(link_rows) if row[20] is not None)
+        link_row = list(link_rows[linked_index])
+        other_id = next(row[0] for row in link_rows if row[0] != link_row[20])
+        link_row[20] = other_id  # still non-NULL: aggregate link count is unchanged
+        link_rows[linked_index] = tuple(link_row)
+        cases.append(("consumer-links", link_rows))
+
+        depth_rows = list(self.rows)
+        depth_index = next(i for i, row in enumerate(depth_rows) if row[21] == 1)
+        depth_row = list(depth_rows[depth_index])
+        depth_row[21] = 2  # max depth remains 3
+        depth_rows[depth_index] = tuple(depth_row)
+        cases.append(("resume-depth", depth_rows))
+
+        for label, rows in cases:
+            with self.subTest(label=label), self.assertRaises(SystemExit) as caught:
+                self.compare(rows)
+            self.assertIn(label, str(caught.exception))
+
+    def test_unsafe_source_links_fail_before_copy(self) -> None:
+        cases = {
+            "malformed consumer": [
+                ("M", "R1", 1, "sess-m", "R9", None, _ts(6)),
+            ],
+            "unresolved consumer": [
+                ("U", "R1", 1, "sess-u", "missing", 9, _ts(6)),
+            ],
+            "consumer cycle": [
+                ("C", "R1", 1, "sess-c1", "R1", 2, _ts(6)),
+                ("C", "R1", 2, "sess-c2", "R1", 1, _ts(7)),
+            ],
+            "branched consumer": [
+                ("B", "R1", 1, "sess-b1", "R1", 3, _ts(6)),
+                ("B", "R1", 2, "sess-b2", "R1", 3, _ts(7)),
+                ("B", "R1", 3, "sess-b3", None, None, _ts(8)),
+            ],
+        }
+        for label, seed in cases.items():
+            with self.subTest(label=label), self.assertRaises(SystemExit) as caught:
+                attempts_copy_module._plan_expectations(build_plan(_source_rows(seed)))
+            self.assertIn(label, str(caught.exception))
+
+    def test_failed_in_transaction_verification_rolls_back(self) -> None:
+        class FakeCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.result = []
+                self.rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, _params=None):
+                self.conn.calls.append(sql)
+                if "FROM pipeline_attempts" in sql:
+                    self.result = _source_rows(SEED_ROWS[-1:])
+                elif "SELECT count(*) FROM attempts" in sql:
+                    self.result = [(0,)]
+                elif "INSERT INTO attempts" in sql:
+                    self.conn.next_id += 1
+                    self.result = [(self.conn.next_id,)]
+                elif "UPDATE attempts SET consumed_by_attempt_id" in sql:
+                    self.rowcount = 1
+                else:
+                    self.result = []
+                return self
+
+            def fetchone(self):
+                return self.result[0]
+
+            def fetchall(self):
+                return list(self.result)
+
+        class FakeConn:
+            def __init__(self):
+                self.next_id = 100
+                self.commits = 0
+                self.rollbacks = 0
+                self.calls = []
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+        source = FakeConn()
+        target = FakeConn()
+        with (
+            mock.patch.object(
+                attempts_copy_module,
+                "_verify_exact",
+                side_effect=SystemExit("forced exact mismatch"),
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            copy_attempts(source, target)
+        self.assertEqual(target.rollbacks, 1)
+        self.assertEqual(target.commits, 0)
+        lock_index = next(
+            i for i, sql in enumerate(target.calls) if "pg_advisory_xact_lock" in sql
+        )
+        count_index = next(
+            i for i, sql in enumerate(target.calls) if "SELECT count(*)" in sql
+        )
+        self.assertLess(lock_index, count_index)
+
+    def test_autocommit_target_is_refused_before_source_or_target_queries(self) -> None:
+        target = types.SimpleNamespace(autocommit=True)
+        with self.assertRaises(SystemExit) as caught:
+            copy_attempts(types.SimpleNamespace(), target)
+        self.assertIn("autocommit=False", str(caught.exception))
+
+
+class CopyCliGuardTest(unittest.TestCase):
+    """The argv surface carries selector names, never database secrets."""
+
+    def test_same_url_refused_without_url_in_argv_or_logs(self) -> None:
+        sentinel = "postgres://copy:SENTINEL_COPY_PASSWORD@same.invalid/db"
+        command = [
+            sys.executable,
+            str(REPO / "db" / "copy_attempts.py"),
+            "--source-url-env",
+            "COPY_TEST_SOURCE",
+            "--target-url-env",
+            "COPY_TEST_TARGET",
+        ]
+        self.assertNotIn(sentinel, command)
+        environment = dict(os.environ)
+        environment.update(COPY_TEST_SOURCE=sentinel, COPY_TEST_TARGET=sentinel)
         proc = subprocess.run(
-            [sys.executable, str(REPO / "db" / "copy_attempts.py"),
-             "--source-url", "postgres://same.invalid/db",
-             "--target-url", "postgres://same.invalid/db"],
+            command,
+            env=environment,
             capture_output=True, text=True,
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("same DSN", proc.stderr)
+        self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+        self.assertNotIn("SENTINEL_COPY_PASSWORD", proc.stdout + proc.stderr)
+
+    def test_no_generic_database_fallback(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("ATTEMPTS_COPY_SOURCE_DSN", None)
+        environment.pop("ATTEMPTS_COPY_TARGET_DSN", None)
+        environment["DATABASE_URL"] = (
+            "postgres://wrong:GENERIC_PASSWORD@client.invalid/db"
+        )
+        environment["RUNNER_DSN"] = (
+            "postgres://wrong:RUNNER_PASSWORD@runner.invalid/db"
+        )
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "db" / "copy_attempts.py")],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ATTEMPTS_COPY_SOURCE_DSN", proc.stderr)
+        self.assertNotIn("GENERIC_PASSWORD", proc.stdout + proc.stderr)
+        self.assertNotIn("RUNNER_PASSWORD", proc.stdout + proc.stderr)
+
+    def test_driver_exception_cannot_render_either_url(self) -> None:
+        source = "postgres://source:SENTINEL_SOURCE_PASSWORD@source.invalid/db"
+        target = "postgres://target:SENTINEL_TARGET_PASSWORD@target.invalid/db"
+
+        class DriverFailure(Exception):
+            sqlstate = "28P01"
+
+        fake_driver = types.SimpleNamespace(
+            connect=mock.Mock(side_effect=DriverFailure(source + " " + target))
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"COPY_TEST_SOURCE": source, "COPY_TEST_TARGET": target},
+            ),
+            mock.patch.object(copy_cli, "_psycopg", return_value=fake_driver),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "copy_attempts.py",
+                    "--source-url-env",
+                    "COPY_TEST_SOURCE",
+                    "--target-url-env",
+                    "COPY_TEST_TARGET",
+                ],
+            ),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            copy_cli.main()
+        rendered = str(caught.exception)
+        self.assertIn("DriverFailure, SQLSTATE 28P01", rendered)
+        self.assertNotIn(source, rendered)
+        self.assertNotIn(target, rendered)
+        self.assertNotIn("SENTINEL_SOURCE_PASSWORD", rendered)
+        self.assertNotIn("SENTINEL_TARGET_PASSWORD", rendered)
 
 
 @unittest.skipUnless(_live_db_available(), "psycopg + local Postgres required")
@@ -213,16 +455,18 @@ class CopyAttemptsLiveTest(unittest.TestCase):
     def test_01_dry_run_writes_nothing(self) -> None:
         source, target = self.connections()
         summary = copy_attempts(source, target, dry_run=True)
-        self.assertEqual(summary["source_rows"], 6)
+        self.assertEqual(summary["source_rows_planned"], 5)
+        self.assertIn("no post-copy target metrics", summary["note"])
         self.assertEqual(self.target_rows("SELECT count(*) FROM attempts")[0][0], 0)
 
     def test_02_copy_renumbers_relinks_and_backfills(self) -> None:
         source, target = self.connections()
         summary = copy_attempts(source, target)
-        self.assertEqual(summary["target_rows"], 6)
+        self.assertEqual(summary["target_rows"], 5)
         self.assertEqual(summary["chain_links_present"], 3)
         self.assertEqual(summary["unresolved_links"], 0)
-        self.assertEqual(summary["malformed_pairs"], 1)
+        self.assertEqual(summary["malformed_pairs"], 0)
+        self.assertTrue(summary["exact_match"])
 
         rows = self.target_rows(
             "SELECT attempt, session_ref, consumed_by_attempt_id, resume_depth"
@@ -260,9 +504,53 @@ class CopyAttemptsLiveTest(unittest.TestCase):
         source, target = self.connections()
         summary = copy_attempts(source, target)
         self.assertIn("already copied", summary["note"])
-        self.assertEqual(self.target_rows("SELECT count(*) FROM attempts")[0][0], 6)
+        self.assertEqual(self.target_rows("SELECT count(*) FROM attempts")[0][0], 5)
 
-    def test_05_mismatched_target_refuses(self) -> None:
+    def test_05_exact_preflight_rejects_field_link_and_depth_drift(self) -> None:
+        import psycopg
+
+        ids = dict(self.target_rows(
+            "SELECT attempt, id FROM attempts WHERE job_key = 'J' ORDER BY attempt"
+        ))
+        mutations = [
+            (
+                "copied-fields",
+                "UPDATE attempts SET workspace_ref = '/tmp/drift'"
+                " WHERE job_key = 'J' AND attempt = 1",
+                "UPDATE attempts SET workspace_ref = '/tmp/J-R1-1'"
+                " WHERE job_key = 'J' AND attempt = 1",
+            ),
+            (
+                "consumer-links",
+                "UPDATE attempts SET consumed_by_attempt_id = %s"
+                " WHERE job_key = 'J' AND attempt = 1",
+                "UPDATE attempts SET consumed_by_attempt_id = %s"
+                " WHERE job_key = 'J' AND attempt = 1",
+            ),
+            (
+                "resume-depth",
+                "UPDATE attempts SET resume_depth = 2"
+                " WHERE job_key = 'J' AND attempt = 2",
+                "UPDATE attempts SET resume_depth = 1"
+                " WHERE job_key = 'J' AND attempt = 2",
+            ),
+        ]
+        for label, mutate, restore in mutations:
+            mutate_params = (ids[4],) if label == "consumer-links" else None
+            restore_params = (ids[2],) if label == "consumer-links" else None
+            with self.subTest(label=label):
+                with psycopg.connect(TARGET_URL, autocommit=True) as conn:
+                    conn.execute(mutate, mutate_params)
+                try:
+                    source, target = self.connections()
+                    with self.assertRaises(SystemExit) as caught:
+                        copy_attempts(source, target)
+                    self.assertIn(label, str(caught.exception))
+                finally:
+                    with psycopg.connect(TARGET_URL, autocommit=True) as conn:
+                        conn.execute(restore, restore_params)
+
+    def test_06_mismatched_target_refuses(self) -> None:
         import psycopg
 
         with psycopg.connect(TARGET_URL, autocommit=True) as conn:
@@ -275,10 +563,49 @@ class CopyAttemptsLiveTest(unittest.TestCase):
             source, target = self.connections()
             with self.assertRaises(SystemExit) as ctx:
                 copy_attempts(source, target)
-            self.assertIn("refusing to guess", str(ctx.exception))
+            self.assertIn("row-count", str(ctx.exception))
         finally:
             with psycopg.connect(TARGET_URL, autocommit=True) as conn:
                 conn.execute("DELETE FROM attempts WHERE job_key = 'EXTRA'")
+
+    def test_07_concurrent_copies_serialize_to_one_exact_copy(self) -> None:
+        import psycopg
+
+        project = "gtm-concurrent-copy-test"
+        with psycopg.connect(TARGET_URL, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO projects (project_id, name) VALUES (%s, 'test')"
+                " ON CONFLICT DO NOTHING",
+                (project,),
+            )
+            conn.execute("DELETE FROM attempts WHERE project_id = %s", (project,))
+
+        barrier = threading.Barrier(2)
+
+        def run_copy():
+            with (
+                psycopg.connect(SOURCE_URL) as source,
+                psycopg.connect(TARGET_URL) as target,
+            ):
+                target.autocommit = False
+                barrier.wait(timeout=10)
+                return copy_attempts(source, target, project=project)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: run_copy(), range(2)))
+
+        self.assertEqual(
+            self.target_rows(
+                "SELECT count(*) FROM attempts WHERE project_id = %s", (project,)
+            )[0][0],
+            5,
+        )
+        self.assertEqual(
+            sum(result["note"].startswith("copied") for result in results), 1
+        )
+        self.assertEqual(
+            sum("already copied" in result["note"] for result in results), 1
+        )
 
 
 if __name__ == "__main__":
