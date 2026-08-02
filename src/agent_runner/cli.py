@@ -22,8 +22,9 @@ keep loud failures — a schema change that half-worked must never exit 0.
 
 ``migrate`` (extraction step 8) applies the runner database's own
 migrations through ``agent_runner.migrations``; db/apply_migrations.py is
-the same call from a repo checkout. Its DSN comes from --database-url or
-RUNNER_DSN and NEVER from DATABASE_URL — that variable names the client's
+the same call from a repo checkout. Its DSN comes from a named environment
+variable (RUNNER_DSN by default) or a private one-value file, never a raw
+argv value and NEVER from DATABASE_URL — that variable names the client's
 database, and the schema this command writes uses generic table names. The
 applier also refuses a target that carries client tables or a foreign
 migration ledger.
@@ -183,13 +184,24 @@ def cmd_requeue(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     from agent_runner import migrations  # lazy: keeps parse time driver-free
+    from agent_runner.secret_input import secret_value
 
     # apply_pending prints what it applied (or the dry-run list) and raises
     # SystemExit on any failure — operator command, no advisory swallow. It
     # also refuses a target that looks like a client database, which is why
     # the override rides through here rather than being decided locally.
+    # Dry-run is intentionally offline: apply_pending lists schema + role
+    # files before it ever resolves a DSN or imports psycopg.
+    url = None
+    if not args.dry_run:
+        url = secret_value(
+            label="runner database URL",
+            env_name=args.database_url_env,
+            file_path=args.database_url_file,
+            default_env="RUNNER_DSN",
+        )
     migrations.apply_pending(
-        args.database_url,
+        url,
         dry_run=args.dry_run,
         with_roles=not args.skip_roles,
         roles_only=args.roles_only,
@@ -273,12 +285,16 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate",
         help="Apply pending runner-database migrations (operator command: loud failures).",
     )
-    migrate.add_argument(
-        "--database-url",
-        help=(
-            "Runner DSN; falls back to RUNNER_DSN. DATABASE_URL is never "
-            "used — it names the client's database"
-        ),
+    database = migrate.add_mutually_exclusive_group()
+    database.add_argument(
+        "--database-url-env",
+        metavar="NAME",
+        help="environment variable holding the runner DSN (default: RUNNER_DSN)",
+    )
+    database.add_argument(
+        "--database-url-file",
+        metavar="PATH",
+        help="private (mode 0600) file containing only the runner DSN",
     )
     migrate.add_argument(
         "--dry-run",

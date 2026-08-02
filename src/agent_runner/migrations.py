@@ -190,7 +190,7 @@ def resolve_url(explicit: str | None = None) -> str:
                 " bridge they usually are)."
             )
         raise SystemExit(
-            "No runner database URL. Pass --database-url or set RUNNER_DSN."
+            "No runner database URL. Set RUNNER_DSN or use a CLI secret selector."
             + extra
         )
     return url
@@ -274,7 +274,7 @@ def assert_runner_target(conn: Any, *, allow_foreign: bool = False) -> None:
         "would create generically named tables (jobs, events, …), a "
         "cluster-global role, and 'runner-migrations/*' rows in a ledger "
         "another migration runner shares.\n"
-        "Point --database-url / RUNNER_DSN at the runner database, or pass "
+        "Point RUNNER_DSN (or the selected secret input) at the runner database, or pass "
         "--i-know-this-is-the-runner-db if the two really are one database."
     )
 

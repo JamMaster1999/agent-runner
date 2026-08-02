@@ -20,9 +20,11 @@ import getpass
 import os
 import subprocess
 import sys
+import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlsplit, urlunsplit
 
 import os as _os
@@ -37,6 +39,8 @@ except ImportError:
 from agent_runner import migrations  # noqa: E402
 from agent_runner.attempts import RESUME_BUDGET  # noqa: E402
 from agent_runner.attempts_copy import build_plan, copy_attempts  # noqa: E402
+
+import db.copy_attempts as copy_cli  # noqa: E402
 
 TEST_URL = os.environ.get(
     "GTM_TEST_DATABASE_URL",
@@ -151,17 +155,88 @@ class BuildPlanTest(unittest.TestCase):
 
 
 class CopyCliGuardTest(unittest.TestCase):
-    """The argv surface refuses same-DSN copies before dialing anything."""
+    """The argv surface carries selector names, never database secrets."""
 
-    def test_same_url_refused(self) -> None:
+    def test_same_url_refused_without_url_in_argv_or_logs(self) -> None:
+        sentinel = "postgres://copy:SENTINEL_COPY_PASSWORD@same.invalid/db"
+        command = [
+            sys.executable,
+            str(REPO / "db" / "copy_attempts.py"),
+            "--source-url-env",
+            "COPY_TEST_SOURCE",
+            "--target-url-env",
+            "COPY_TEST_TARGET",
+        ]
+        self.assertNotIn(sentinel, command)
+        environment = dict(os.environ)
+        environment.update(COPY_TEST_SOURCE=sentinel, COPY_TEST_TARGET=sentinel)
         proc = subprocess.run(
-            [sys.executable, str(REPO / "db" / "copy_attempts.py"),
-             "--source-url", "postgres://same.invalid/db",
-             "--target-url", "postgres://same.invalid/db"],
+            command,
+            env=environment,
             capture_output=True, text=True,
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("same DSN", proc.stderr)
+        self.assertNotIn(sentinel, proc.stdout + proc.stderr)
+        self.assertNotIn("SENTINEL_COPY_PASSWORD", proc.stdout + proc.stderr)
+
+    def test_no_generic_database_fallback(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("ATTEMPTS_COPY_SOURCE_DSN", None)
+        environment.pop("ATTEMPTS_COPY_TARGET_DSN", None)
+        environment["DATABASE_URL"] = (
+            "postgres://wrong:GENERIC_PASSWORD@client.invalid/db"
+        )
+        environment["RUNNER_DSN"] = (
+            "postgres://wrong:RUNNER_PASSWORD@runner.invalid/db"
+        )
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "db" / "copy_attempts.py")],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ATTEMPTS_COPY_SOURCE_DSN", proc.stderr)
+        self.assertNotIn("GENERIC_PASSWORD", proc.stdout + proc.stderr)
+        self.assertNotIn("RUNNER_PASSWORD", proc.stdout + proc.stderr)
+
+    def test_driver_exception_cannot_render_either_url(self) -> None:
+        source = "postgres://source:SENTINEL_SOURCE_PASSWORD@source.invalid/db"
+        target = "postgres://target:SENTINEL_TARGET_PASSWORD@target.invalid/db"
+
+        class DriverFailure(Exception):
+            sqlstate = "28P01"
+
+        fake_driver = types.SimpleNamespace(
+            connect=mock.Mock(side_effect=DriverFailure(source + " " + target))
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"COPY_TEST_SOURCE": source, "COPY_TEST_TARGET": target},
+            ),
+            mock.patch.object(copy_cli, "_psycopg", return_value=fake_driver),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "copy_attempts.py",
+                    "--source-url-env",
+                    "COPY_TEST_SOURCE",
+                    "--target-url-env",
+                    "COPY_TEST_TARGET",
+                ],
+            ),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            copy_cli.main()
+        rendered = str(caught.exception)
+        self.assertIn("DriverFailure, SQLSTATE 28P01", rendered)
+        self.assertNotIn(source, rendered)
+        self.assertNotIn(target, rendered)
+        self.assertNotIn("SENTINEL_SOURCE_PASSWORD", rendered)
+        self.assertNotIn("SENTINEL_TARGET_PASSWORD", rendered)
 
 
 @unittest.skipUnless(_live_db_available(), "psycopg + local Postgres required")

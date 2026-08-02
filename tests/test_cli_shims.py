@@ -116,6 +116,46 @@ class ParserDispatchTest(unittest.TestCase):
                 cli.build_parser().parse_args(["emit", "explode", "job-1"])
 
 
+class MigrateSecretTransportTest(unittest.TestCase):
+    def test_migrate_argv_contains_only_environment_variable_name(self) -> None:
+        sentinel = "postgresql://runner:SENTINEL_MIGRATE_PASSWORD@db.invalid/runner"
+        argv = ["migrate", "--database-url-env", "CUTOVER_RUNNER_DSN"]
+        self.assertNotIn(sentinel, argv)
+        with (
+            mock.patch.dict(_os.environ, {"CUTOVER_RUNNER_DSN": sentinel}),
+            mock.patch("agent_runner.migrations.apply_pending") as apply_pending,
+        ):
+            code = cli.main(argv)
+        self.assertEqual(code, 0)
+        apply_pending.assert_called_once_with(
+            sentinel,
+            dry_run=False,
+            with_roles=True,
+            roles_only=False,
+            allow_foreign=False,
+        )
+
+    def test_dry_run_needs_no_dsn_and_lists_schema_and_roles(self) -> None:
+        with mock.patch.dict(_os.environ, {}, clear=False):
+            _os.environ.pop("RUNNER_DSN", None)
+            _os.environ.pop("DATABASE_URL", None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = cli.main(["migrate", "--dry-run"])
+        self.assertEqual(code, 0)
+        rendered = output.getvalue()
+        self.assertIn("001_create_projects.sql", rendered)
+        self.assertIn("010_create_runner_emitter_role.sql (roles", rendered)
+
+    def test_help_exposes_selectors_but_no_raw_database_url_value(self) -> None:
+        parser = cli.build_parser()
+        subparsers = parser._subparsers._group_actions[0]
+        help_text = subparsers.choices["migrate"].format_help()
+        self.assertIn("--database-url-env NAME", help_text)
+        self.assertIn("--database-url-file PATH", help_text)
+        self.assertNotIn("--database-url URL", help_text)
+
+
 class EmitSqlContractTest(unittest.TestCase):
     """The ported update SQL, executed through the fake driver seam."""
 

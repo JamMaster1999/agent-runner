@@ -25,8 +25,10 @@ during the bridge `runner_dsn` still points at GTM — so "applied to the
 wrong database" is the likely operator mistake, not an exotic one. Two
 guards, both in `agent_runner.migrations`:
 
-1. **The DSN never falls back to `DATABASE_URL`.** It resolves
-   `--database-url` > `RUNNER_DSN` and stops. `DATABASE_URL` is the
+1. **The DSN never falls back to `DATABASE_URL` or rides argv.** The CLI reads
+   `RUNNER_DSN` by default, another named variable via
+   `--database-url-env NAME`, or a mode-0600 one-value file via
+   `--database-url-file PATH`. `DATABASE_URL` is the
    *client's* variable: GTM's `core/db.py` reads exactly it, this repo's own
    CI `full` job sets it to the GTM database, and so does the Modal Secret.
 2. **The applier refuses a client-looking target** before writing anything:

@@ -47,9 +47,11 @@ applies `db/migrations/` under a `schema_migrations` ledger, then re-applies
 that re-running is the repair path for a revoked grant (`--roles-only` is
 the narrow form; `--skip-roles` opts out).
 
-**The DSN is `--database-url` or `RUNNER_DSN`, never `DATABASE_URL`** — that
-one names the *client's* database, and this chain writes generically named
-tables (`jobs`, `events`) plus a cluster-global role. The applier also
+**The DSN value never rides argv.** Set `RUNNER_DSN`, name another variable
+with `--database-url-env NAME`, or point at a private one-value file with
+`--database-url-file PATH`; `DATABASE_URL` is never consulted. That one names
+the *client's* database, and this chain writes generically named tables
+(`jobs`, `events`) plus a cluster-global role. The applier also
 refuses a target that carries client tables or a foreign migration ledger;
 `--i-know-this-is-the-runner-db` overrides it and says so on every run.
 
