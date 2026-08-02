@@ -22,13 +22,27 @@ import shutil
 from pathlib import Path
 from typing import Any, ClassVar
 
-from agent_runner.harness.base import Capabilities, HarnessAdapter, SpawnSpec
-from agent_runner.runtime import RunnerJob
+from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
+from agent_runner.runtime import RunnerError, RunnerJob
 from agent_runner.util import ROOT
 from agent_runner.harness.claude_stream import ClaudeStreamParser
 
 
 CLAUDE_HOOK_EVENT_LOG = ROOT / ".local" / "claude_hooks" / "events.jsonl"
+
+
+def yaml_scalar(value: object) -> str:
+    """One frontmatter value as a YAML scalar (moved verbatim from the
+    client's sync_agents at extraction step 7)."""
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)  # JSON strings are valid YAML double-quoted scalars
+    if not isinstance(value, (int, float, bool)):
+        raise RunnerError(
+            f"claude agent config: unsupported frontmatter value: {value!r}",
+            code="agent_render",
+            retryable=False,
+        )
+    return str(value)
 
 
 def claude_session_id(stdout_path: Path) -> str | None:
@@ -134,6 +148,23 @@ class ClaudeCodeAdapter(HarnessAdapter):
             ],
             args.health_timeout_seconds,
         )
+
+    def materialize_agent(self, agent: AgentDef, header: str) -> str:
+        """The `.claude/agents/<name>.md` dialect: YAML frontmatter between
+        `---` lines (header comment first, then name + description, then the
+        config keys in dict order), a blank line, then the verbatim body
+        (moved verbatim from the client's sync_agents at extraction step 7)."""
+        lines = ["---", f"# {header}"]
+        lines.append(f"name: {yaml_scalar(agent.name)}")
+        lines.append(f"description: {yaml_scalar(agent.description)}")
+        for key, value in agent.config.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                lines.extend(f"  - {yaml_scalar(item)}" for item in value)
+            else:
+                lines.append(f"{key}: {yaml_scalar(value)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n" + agent.body
 
     def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
         return SpawnSpec(
