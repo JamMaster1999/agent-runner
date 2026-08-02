@@ -9,14 +9,13 @@ table (003). The resume chain is the single self-FK
 (validate -> decide reuse -> promote behind ``get_artifacts``/
 ``await_outcome``) stayed in the GTM tree at ``core/runner/attempts.py``.
 
-BRIDGE NOTE (flagged in docs/step9_cutover.md): the new key
-(project_id, job_key, attempt) has no run dimension, so a --force-rerun —
-which resets the jobs attempt counter — collides with the earlier run's
-rows for the same attempt numbers. record_attempt_start treats that
-collision as a fresh-attempt overwrite (session/outcome/consumption
-cleared). The pre-cutover schema kept those rows apart by run_id; if the
-lost history matters, the successor is a global per-job attempt ordinal —
-a design decision for the window review, not improvised here.
+IDENTITY (migration 007): an attempt IS its row id. ``attempt`` is a display
+ordinal that repeats across runs for one job — requeue and --force-rerun
+both reset the jobs attempt counter — so it can key nothing. record_attempt_start
+inserts and returns the id; every later write for that attempt (session ref,
+outcome, consumption, release) addresses it. That is also why the engine now
+records the attempt BEFORE claiming a resume candidate: the chain is a self-FK,
+so the consuming statement needs the claiming row to already exist.
 """
 
 from __future__ import annotations
@@ -91,17 +90,17 @@ def record_attempt_start(
     attempt: int,
     fingerprint: str,
     directory: Path,
-) -> None:
-    """Register the attempt in attempts before launch. Bookkeeping: a DB
-    hiccup here must not kill the attempt itself. workspace_ref is stored
+) -> int | None:
+    """Register the attempt in attempts before launch and return its row id —
+    the handle every later write for this attempt uses. Bookkeeping: a DB
+    hiccup here must not kill the attempt itself, so a failed insert returns
+    None and the attempt runs untracked (no session ref, no outcome row, and
+    no resume claim: the chain's self-FK has nothing to point at).
+
+    A plain INSERT, never an upsert: two launches are two attempts even when
+    they carry the same ordinal (migration 007). workspace_ref is stored
     relative to the data root (attempt_dir_for_db) so the row stays valid
     across Mac/Volume mount points.
-
-    The conflict target is the new key (project_id, job_key, attempt): a
-    same-run re-upsert refreshes fingerprint/workspace as before, and a
-    force-rerun collision with an EARLIER run's row becomes a fresh-attempt
-    overwrite — session/outcome/consumption cleared, resume_depth reset
-    (see the module docstring's bridge note).
 
     Also drops a ``pipeline_attempt.json`` marker in the attempt dir so the
     legacy filesystem resume matchers skip DB-tracked attempts entirely:
@@ -123,24 +122,13 @@ def record_attempt_start(
     except OSError:
         pass
     try:
-        db_rows(
+        rows = db_rows(
             args.database_url,
             """
             INSERT INTO attempts
               (project_id, job_key, attempt, harness, lease_ref, prompt_fingerprint, workspace_ref)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id, job_key, attempt)
-            DO UPDATE SET prompt_fingerprint = EXCLUDED.prompt_fingerprint,
-                          workspace_ref = EXCLUDED.workspace_ref,
-                          lease_ref = EXCLUDED.lease_ref,
-                          harness = EXCLUDED.harness,
-                          session_ref = NULL,
-                          outcome = NULL,
-                          error_code = NULL,
-                          outcome_code = NULL,
-                          consumed_by_attempt_id = NULL,
-                          resume_depth = 0,
-                          finished_at = NULL;
+            RETURNING id;
             """,
             [
                 project_id(),
@@ -154,24 +142,24 @@ def record_attempt_start(
         )
     except RunnerError as exc:
         print(f"WARNING: attempts insert failed for {job.key}: {exc}")
+        return None
+    return rows[0][0] if rows else None
 
 
 def record_attempt_session(
-    args: argparse.Namespace, job: RunnerJob, run_id: str, attempt: int, session_id: str
+    args: argparse.Namespace, job: RunnerJob, attempt_id: int | None, session_id: str
 ) -> None:
-    # (project, job_key, attempt) IS the key now; run_id stays in the
-    # signature for callers but the row identity no longer includes it.
-    del run_id
+    """Stamp the session ref on THIS attempt's row, first write wins."""
+    if attempt_id is None:
+        return
     try:
         db_rows(
             args.database_url,
             """
             UPDATE attempts SET session_ref = %s
-            WHERE project_id = %s
-              AND job_key = %s
-              AND attempt = %s AND session_ref IS NULL;
+            WHERE id = %s AND session_ref IS NULL;
             """,
-            [session_id, project_id(), job.key, attempt],
+            [session_id, attempt_id],
         )
     except RunnerError as exc:
         print(f"WARNING: attempts session update failed for {job.key}: {exc}")
@@ -180,12 +168,12 @@ def record_attempt_session(
 def record_attempt_outcome(
     args: argparse.Namespace,
     job: RunnerJob,
-    run_id: str,
-    attempt: int,
+    attempt_id: int | None,
     outcome: str,
     failure_category: str | None = None,
 ) -> None:
-    del run_id  # row identity is (project, job_key, attempt) now
+    if attempt_id is None:
+        return  # the insert never landed; there is no row to close out
     try:
         db_rows(
             args.database_url,
@@ -194,11 +182,9 @@ def record_attempt_outcome(
             SET outcome = %s,
                 error_code = %s,
                 finished_at = now()
-            WHERE project_id = %s
-              AND job_key = %s
-              AND attempt = %s;
+            WHERE id = %s;
             """,
-            [outcome, failure_category, project_id(), job.key, attempt],
+            [outcome, failure_category, attempt_id],
         )
     except RunnerError as exc:
         print(f"WARNING: attempts outcome update failed for {job.key}: {exc}")
@@ -236,9 +222,10 @@ RESUME_BUDGET = 3
 def claim_resumable_attempt(
     args: argparse.Namespace,
     job: RunnerJob,
+    attempt_id: int | None,
+    fingerprint: str,
     run_id: str,
     attempt: int,
-    fingerprint: str,
 ) -> tuple[str, Path, int] | None:
     """Atomically consume the newest resumable prior attempt for this job +
     fingerprint. Resume policy (2026-07-28): a prior session is resumed
@@ -264,15 +251,22 @@ def claim_resumable_attempt(
     nothing. The consuming UPDATE keeps the ``consumed_by_attempt_id IS
     NULL`` predicate as the race guard: two concurrent claimants can never
     resume the same session, the loser's UPDATE simply matches zero rows.
-    The same statement resolves THIS attempt's row by the new key
-    (project, job_key, attempt) and stamps its resume_depth as the
-    candidate's + 1 — the insert-path precompute 003 documents.
+    The same statement stamps THIS attempt's resume_depth as the candidate's
+    + 1 — the insert-path precompute 003 documents.
+
+    ``attempt_id`` is the CLAIMING attempt's row — the chain's self-FK points
+    at it, so it must already be inserted (migration 007; the engine records
+    the attempt before it claims). None means the insert never landed, and an
+    attempt the store cannot name may not consume a session: it would end the
+    lineage with a row nothing can follow.
 
     Returns (session_id, attempt_dir, candidate row id); the id lets the
     engine release the claim via unconsume_attempt if the resumed attempt
-    dies before ever recording a session ref of its own. ``run_id`` no
-    longer enters the DB chain (single self-FK) — it survives only in the
+    dies before ever recording a session ref of its own. ``run_id`` and
+    ``attempt`` no longer enter the DB chain — they survive only in the
     filesystem consumption marker, display only."""
+    if attempt_id is None:
+        return None
     try:
         rows = db_rows(
             args.database_url,
@@ -286,6 +280,7 @@ def claim_resumable_attempt(
               AND session_ref IS NOT NULL
               AND consumed_by_attempt_id IS NULL
               AND resume_depth < %(budget)s
+              AND id <> %(claimer)s
             ORDER BY id DESC LIMIT 1;
             """,
             {
@@ -294,6 +289,9 @@ def claim_resumable_attempt(
                 "backend": job.harness,
                 "fingerprint": fingerprint,
                 "budget": RESUME_BUDGET,
+                # Belt and braces: this attempt's own row is inserted by now
+                # and a session ref would make it look nominable.
+                "claimer": attempt_id,
             },
         )
     except RunnerError as exc:
@@ -315,37 +313,29 @@ def claim_resumable_attempt(
         consumed = db_rows(
             args.database_url,
             """
-            WITH claimer AS (
-              SELECT id FROM attempts
-              WHERE project_id = %(project)s AND job_key = %(job)s AND attempt = %(attempt)s
-            ),
-            consumed AS (
-              UPDATE attempts a
-              SET consumed_by_attempt_id = claimer.id
-              FROM claimer
-              WHERE a.id = %(candidate)s
-                AND a.consumed_by_attempt_id IS NULL
-              RETURNING a.resume_depth
+            WITH consumed AS (
+              UPDATE attempts
+              SET consumed_by_attempt_id = %(claimer)s
+              WHERE id = %(candidate)s
+                AND consumed_by_attempt_id IS NULL
+              RETURNING resume_depth
             )
-            UPDATE attempts a
+            UPDATE attempts
             SET resume_depth = consumed.resume_depth + 1
-            FROM consumed, claimer
-            WHERE a.id = claimer.id
-            RETURNING a.id;
+            FROM consumed
+            WHERE attempts.id = %(claimer)s
+            RETURNING attempts.id;
             """,
             {
-                "project": project_id(),
-                "job": job.key,
-                "attempt": attempt,
+                "claimer": attempt_id,
                 "candidate": candidate_id,
             },
         )
     except RunnerError as exc:
         print(f"WARNING: attempts resume claim failed for {job.key}: {exc}")
         return None
-    # No RETURNING row = another claimant won the verify-before-consume race
-    # (or this attempt's own row is missing — its advisory insert failed —
-    # in which case nothing was consumed either).
+    # No RETURNING row = another claimant won the verify-before-consume race:
+    # its UPDATE matched zero rows, so the depth stamp had nothing to join.
     if not consumed:
         return None
     mark_session_consumed(resumed_dir, session_id, run_id, attempt)
@@ -356,33 +346,40 @@ def unconsume_attempt(
     args: argparse.Namespace,
     job: RunnerJob,
     candidate_id: int,
-    run_id: str,
-    attempt: int,
+    attempt_id: int | None,
     directory: Path,
 ) -> None:
     """Release a consumed candidate whose resuming attempt died without ever
     recording a session ref of its own: that attempt's row has session_ref
     NULL, so the candidate's lineage would end here and the session's
-    research be redone. Owner-guarded — the consumer pointer must resolve to
-    THIS attempt's row by the new key, and the engine calls this only after
-    that attempt's CLI is dead — so the claim-time
-    ``consumed_by_attempt_id IS NULL`` race guard is intact: at no instant
-    can two claimants hold the same session. Unconsume is one column now
-    (003 dropped consumed_at), so it can never half-clear a pair."""
-    del run_id  # the owner guard resolves through (project, job_key, attempt)
+    research be redone. Owner-guarded — the consumer pointer must BE this
+    attempt's row — and the engine calls this only after that attempt's CLI
+    is dead, so the claim-time ``consumed_by_attempt_id IS NULL`` race guard
+    is intact: at no instant can two claimants hold the same session.
+
+    The exact inverse of the claim: one statement releases the candidate and
+    rolls this attempt's resume_depth back to 0, so a released claim leaves
+    nothing behind. Unconsume is one column now (003 dropped consumed_at), so
+    it can never half-clear a pair."""
+    if attempt_id is None:
+        return
     try:
         db_rows(
             args.database_url,
             """
+            WITH released AS (
+              UPDATE attempts
+              SET consumed_by_attempt_id = NULL
+              WHERE id = %(candidate)s
+                AND consumed_by_attempt_id = %(claimer)s
+              RETURNING id
+            )
             UPDATE attempts
-            SET consumed_by_attempt_id = NULL
-            WHERE id = %s
-              AND consumed_by_attempt_id = (
-                SELECT id FROM attempts
-                WHERE project_id = %s AND job_key = %s AND attempt = %s
-              );
+            SET resume_depth = 0
+            FROM released
+            WHERE attempts.id = %(claimer)s;
             """,
-            [candidate_id, project_id(), job.key, attempt],
+            {"candidate": candidate_id, "claimer": attempt_id},
         )
     except RunnerError as exc:
         print(f"WARNING: attempts un-consume failed for {job.key}: {exc}")

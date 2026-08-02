@@ -5,10 +5,11 @@
                               --target-url postgres://…runner… [--dry-run]
 
 Copies GTM's pipeline_attempts into the runner database's attempts table,
-implementing the three-part hazard on the attempts table comment
-(db/migrations/003): per-job renumber, two-pass chain re-link, and the
-resume_depth backfill. Logic lives in ``agent_runner.attempts_copy``; this
-file is only the argv surface.
+handling the hazard on the attempts table comment (db/migrations/003, as
+amended by 007): two-pass chain re-link and the resume_depth backfill, plus
+a per-job renumber that is now cosmetic rather than forced by a unique key.
+Logic lives in ``agent_runner.attempts_copy``; this file is only the argv
+surface.
 
 Both URLs are explicit and required — this tool never reads DATABASE_URL or
 RUNNER_DSN, because pointing either end at the wrong database is the whole

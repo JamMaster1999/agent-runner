@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """Resume-claim SQL against a scratch database (design-doc step-0 gate item).
 
-Runs the REAL pipeline_attempts statements in agent_runner/attempts.py —
+Runs the REAL attempts statements in agent_runner/attempts.py —
 record_attempt_start / record_attempt_session / record_attempt_outcome /
 claim_resumable_attempt / unconsume_attempt — against a live Postgres, in a
-scratch database this class creates from the migration-026 snapshot
-(tests/fixtures/pipeline_attempts.sql) and drops again.
-GTM's tests/test_attempt_paths.py covers the same claim logic with
-`db_rows` mocked; this file is the one place the recursive-CTE nomination, the
+scratch database this class builds from the REAL db/migrations DDL and drops
+again. GTM's tests/test_attempt_paths.py covers the same claim logic with
+`db_rows` mocked; this file is the one place the nomination SELECT, the
 verify-before-consume UPDATE, and the budget arithmetic execute for real.
 
-Same environment contract as GTM's tests/test_db_transport.py: needs psycopg plus
-a reachable Postgres (the .local instance on 55432, or GTM_TEST_DATABASE_URL)
-and skips cleanly otherwise, so the stdlib-only suite stays green. The
-connecting role must be able to CREATE DATABASE (true for the local dev
-instance and the CI service container).
+Step-9 retype: the target is the runner's own `attempts` table, not the
+compat-bridge pipeline_attempts. Two things changed shape and both are
+pinned below — the resume chain is one self-FK (consumed_by_attempt_id)
+instead of the (consumed_by_run_id, consumed_by_attempt) pair, and an
+attempt is identified by its ROW ID, so the engine records the attempt
+before it claims (migration 007). The attempt ORDINAL repeats across runs
+of one job and keys nothing; test_a_force_rerun_ordinal_collision_keeps_both
+_rows is the regression for the schema that assumed otherwise.
+
+The migration files are executed directly rather than through
+migrations.apply_pending: this file needs no ledger and no runner_emitter
+role, so its environment contract stays psycopg + a Postgres the connecting
+role can CREATE DATABASE on (the .local instance on 55432, or
+GTM_TEST_DATABASE_URL), skipping cleanly otherwise so the stdlib-only suite
+stays green.
 """
 
 from __future__ import annotations
@@ -42,7 +51,7 @@ try:
 except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
-from agent_runner import attempts  # noqa: E402
+from agent_runner import attempts, migrations  # noqa: E402
 from agent_runner.runtime import RunnerJob  # noqa: E402
 
 TEST_URL = os.environ.get(
@@ -51,10 +60,6 @@ TEST_URL = os.environ.get(
 )
 
 SCRATCH_DB = "gtm_test_resume_claim_scratch"
-
-# Byte-identical snapshot of GTM migration 026 — the compat-bridge schema
-# (runner-owned migrations supersede it at extraction step 8).
-MIGRATION_026 = REPO / "tests" / "fixtures" / "pipeline_attempts.sql"
 
 FP = "a" * 64
 OTHER_FP = "b" * 64
@@ -112,22 +117,23 @@ def make_job(backend: str = "claude", key: str | None = None) -> RunnerJob:
 
 @unittest.skipUnless(_live_db_available(), "psycopg + local Postgres required")
 class ResumeClaimSqlTest(unittest.TestCase):
-    """The pipeline_attempts statements, executed for real."""
+    """The attempts statements, executed for real."""
 
     @classmethod
     def setUpClass(cls) -> None:
         _admin_exec(f"DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")
         _admin_exec(f"CREATE DATABASE {SCRATCH_DB}")
         # The real migration DDL, not a hand-copied schema: drift between the
-        # migration and the claim SQL fails here first.
-        _scratch_rows(MIGRATION_026.read_text())
+        # migrations and the claim SQL fails here first.
+        for path in migrations.migration_paths():
+            _scratch_rows(path.read_text())
 
     @classmethod
     def tearDownClass(cls) -> None:
         _admin_exec(f"DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")
 
     def setUp(self) -> None:
-        _scratch_rows("TRUNCATE pipeline_attempts RESTART IDENTITY")
+        _scratch_rows("TRUNCATE attempts RESTART IDENTITY")
         self.args = argparse.Namespace(database_url=SCRATCH_URL)
         self.job = make_job()
         self.tmp = Path(tempfile.mkdtemp(prefix="gtm_resume_claim_")).resolve()
@@ -135,7 +141,7 @@ class ResumeClaimSqlTest(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------
 
-    def start_attempt(
+    def start(
         self,
         run_id: str,
         attempt: int,
@@ -143,118 +149,182 @@ class ResumeClaimSqlTest(unittest.TestCase):
         fingerprint: str = FP,
         session_id: str | None = None,
         job: RunnerJob | None = None,
-    ) -> Path:
+    ) -> tuple[Path, int]:
+        """Record one attempt launch; returns its workspace and its row id."""
         job = job or self.job
         directory = self.tmp / run_id / f"attempt-{attempt:02d}"
-        attempts.record_attempt_start(
+        attempt_id = attempts.record_attempt_start(
             self.args, job, run_id, attempt, fingerprint, directory
         )
+        self.assertIsNotNone(attempt_id, "record_attempt_start must return a row id")
         if session_id is not None:
-            attempts.record_attempt_session(self.args, job, run_id, attempt, session_id)
-        return directory
+            attempts.record_attempt_session(self.args, job, attempt_id, session_id)
+        return directory, attempt_id
 
-    def claim(self, run_id: str, attempt: int, *, fingerprint: str = FP):
+    def claim(
+        self, attempt_id: int | None, run_id: str, attempt: int, *, fingerprint: str = FP
+    ):
         return attempts.claim_resumable_attempt(
-            self.args, self.job, run_id, attempt, fingerprint
+            self.args, self.job, attempt_id, fingerprint, run_id, attempt
+        )
+
+    def resume(self, run_id: str, attempt: int, *, fingerprint: str = FP):
+        """The engine's order: record THIS attempt, then claim a candidate.
+        Returns (claim result, this attempt's row id)."""
+        _, attempt_id = self.start(run_id, attempt, fingerprint=fingerprint)
+        return (
+            self.claim(attempt_id, run_id, attempt, fingerprint=fingerprint),
+            attempt_id,
         )
 
     def rows(self) -> list[tuple]:
         return _scratch_rows(
-            "SELECT run_id, attempt, session_id, consumed_by_run_id,"
-            " consumed_by_attempt, consumed_at"
-            " FROM pipeline_attempts ORDER BY id"
+            "SELECT id, lease_ref, attempt, session_ref, consumed_by_attempt_id,"
+            " resume_depth FROM attempts ORDER BY id"
         )
+
+    def row(self, attempt_id: int) -> tuple:
+        return _scratch_rows(
+            "SELECT id, lease_ref, attempt, session_ref, consumed_by_attempt_id,"
+            " resume_depth FROM attempts WHERE id = %s",
+            (attempt_id,),
+        )[0]
 
     # -- record statements ------------------------------------------------
 
     def test_record_start_then_claim_round_trip(self) -> None:
-        directory = self.start_attempt("run-a", 1, session_id="sess-a")
-        claimed = self.claim("run-b", 1)
+        directory, candidate = self.start("run-a", 1, session_id="sess-a")
+        claimed, claimer = self.resume("run-b", 1)
         self.assertIsNotNone(claimed)
         session_id, resumed_dir, candidate_id = claimed
         self.assertEqual(session_id, "sess-a")
         self.assertEqual(resumed_dir, directory)
-        (row,) = self.rows()
-        self.assertEqual(row[:5], ("run-a", 1, "sess-a", "run-b", 1))
-        self.assertIsNotNone(row[5])  # consumed_at stamped
-        self.assertEqual(
-            _scratch_rows("SELECT id FROM pipeline_attempts")[0][0], candidate_id
-        )
+        self.assertEqual(candidate_id, candidate)
+        # The chain is one self-FK, and the consumer's depth is precomputed.
+        self.assertEqual(self.row(candidate)[4], claimer)
+        self.assertEqual(self.row(claimer)[5], 1)
         # Filesystem mirror of the DB consumption.
         self.assertTrue((directory / "resume_consumed.json").exists())
 
-    def test_record_start_upserts_the_same_attempt_row(self) -> None:
-        directory = self.start_attempt("run-a", 1)
-        attempts.record_attempt_start(
-            self.args, self.job, "run-a", 1, OTHER_FP, directory
+    def test_record_start_never_upserts_a_second_launch(self) -> None:
+        # Two launches are two rows even with one ordinal: an attempt IS its
+        # row (007). The pre-007 upsert overwrote the earlier row here.
+        directory, first = self.start("run-a", 1, session_id="sess-a")
+        attempts.record_attempt_start(self.args, self.job, "run-a", 1, OTHER_FP, directory)
+        fingerprints = _scratch_rows(
+            "SELECT prompt_fingerprint FROM attempts ORDER BY id"
         )
-        rows = _scratch_rows("SELECT prompt_fingerprint FROM pipeline_attempts")
-        self.assertEqual(rows, [(OTHER_FP,)])
+        self.assertEqual(fingerprints, [(FP,), (OTHER_FP,)])
+        self.assertEqual(self.row(first)[3], "sess-a", "the earlier session survives")
+
+    def test_a_force_rerun_ordinal_collision_keeps_both_rows(self) -> None:
+        # The regression for the schema flaw 007 fixes. --force-rerun resets
+        # jobs.attempt_count, so the next run launches attempt 1 again. Under
+        # UNIQUE (project_id, job_key, attempt) that second launch clobbered
+        # the first row — including the session ref resume exists to find.
+        _, first = self.start("run-a", 1, session_id="sess-a")
+        attempts.record_attempt_outcome(self.args, self.job, first, "failed", "timeout")
+        claimed, second = self.resume("run-b", 1)  # same ordinal, new run
+        self.assertNotEqual(first, second, "two launches, two rows")
+        self.assertIsNotNone(claimed, "the earlier run's session is still resumable")
+        self.assertEqual(claimed[0], "sess-a")
+        self.assertEqual(
+            [(row[1], row[2]) for row in self.rows()],
+            [("run-a", 1), ("run-b", 1)],
+            "history keeps both launches of ordinal 1",
+        )
 
     def test_session_ref_first_write_wins(self) -> None:
-        self.start_attempt("run-a", 1, session_id="sess-first")
-        attempts.record_attempt_session(self.args, self.job, "run-a", 1, "sess-late")
-        (row,) = self.rows()
-        self.assertEqual(row[2], "sess-first")
+        _, attempt_id = self.start("run-a", 1, session_id="sess-first")
+        attempts.record_attempt_session(self.args, self.job, attempt_id, "sess-late")
+        self.assertEqual(self.row(attempt_id)[3], "sess-first")
 
     def test_failed_attempt_is_still_resumable(self) -> None:
         # 2026-07-28 resume policy: failed-in-any-category resumes too; only
         # a changed fingerprint or a spent budget blocks the claim.
-        self.start_attempt("run-a", 1, session_id="sess-a")
+        _, attempt_id = self.start("run-a", 1, session_id="sess-a")
         attempts.record_attempt_outcome(
-            self.args, self.job, "run-a", 1, "failed", "agent_error"
+            self.args, self.job, attempt_id, "failed", "agent_error"
         )
-        outcome = _scratch_rows(
-            "SELECT outcome, failure_category, finished_at IS NOT NULL"
-            " FROM pipeline_attempts"
+        self.assertEqual(
+            _scratch_rows(
+                "SELECT outcome, error_code, finished_at IS NOT NULL"
+                " FROM attempts WHERE id = %s",
+                (attempt_id,),
+            ),
+            [("failed", "agent_error", True)],
         )
-        self.assertEqual(outcome, [("failed", "agent_error", True)])
-        claimed = self.claim("run-b", 1)
+        claimed, _ = self.resume("run-b", 1)
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed[0], "sess-a")
+
+    def test_outcome_closes_only_its_own_row(self) -> None:
+        _, first = self.start("run-a", 1, session_id="sess-a")
+        _, second = self.start("run-b", 1, session_id="sess-b")
+        attempts.record_attempt_outcome(self.args, self.job, second, "succeeded")
+        self.assertEqual(
+            _scratch_rows("SELECT id, outcome FROM attempts ORDER BY id"),
+            [(first, None), (second, "succeeded")],
+        )
 
     # -- nomination filters -----------------------------------------------
 
     def test_claim_skips_wrong_fingerprint_missing_session_and_other_backend(self) -> None:
-        self.start_attempt("run-a", 1, fingerprint=OTHER_FP, session_id="sess-other-fp")
-        self.start_attempt("run-a", 2)  # session never recorded
+        self.start("run-a", 1, fingerprint=OTHER_FP, session_id="sess-other-fp")
+        self.start("run-a", 2)  # session never recorded
         codex_job = make_job(backend="codex", key=self.job.key)  # same job, other backend
-        self.start_attempt("run-a", 3, session_id="sess-codex", job=codex_job)
-        self.assertIsNone(self.claim("run-b", 1))
+        self.start("run-a", 3, session_id="sess-codex", job=codex_job)
+        claimed, _ = self.resume("run-b", 1)
+        self.assertIsNone(claimed)
         for row in self.rows():
-            self.assertIsNone(row[3], f"claim consumed a non-candidate row: {row}")
+            self.assertIsNone(row[4], f"claim consumed a non-candidate row: {row}")
 
     def test_claim_takes_the_newest_candidate(self) -> None:
-        self.start_attempt("run-a", 1, session_id="sess-old")
-        self.start_attempt("run-a", 2, session_id="sess-new")
-        claimed = self.claim("run-b", 1)
+        _, old = self.start("run-a", 1, session_id="sess-old")
+        _, new = self.start("run-a", 2, session_id="sess-new")
+        claimed, claimer = self.resume("run-b", 1)
         self.assertEqual(claimed[0], "sess-new")
-        old_row, new_row = self.rows()
-        self.assertIsNone(old_row[3])  # older candidate left for a later claim
-        self.assertEqual(new_row[3], "run-b")
+        self.assertIsNone(self.row(old)[4], "older candidate left for a later claim")
+        self.assertEqual(self.row(new)[4], claimer)
+
+    def test_claim_never_nominates_the_claiming_attempt_itself(self) -> None:
+        # The claimer's own row is inserted first now, so the nomination must
+        # exclude it. (It carries no session ref yet either — belt and braces.)
+        _, claimer = self.start("run-a", 1)
+        attempts.record_attempt_session(self.args, self.job, claimer, "sess-self")
+        self.assertIsNone(self.claim(claimer, "run-a", 1))
+        self.assertIsNone(self.row(claimer)[4])
+
+    def test_an_untracked_attempt_cannot_claim(self) -> None:
+        # record_attempt_start's insert failed: there is no row for the chain
+        # to point at, so the attempt runs fresh rather than ending a lineage.
+        self.start("run-a", 1, session_id="sess-a")
+        self.assertIsNone(self.claim(None, "run-b", 1))
+        self.assertIsNone(self.rows()[0][4], "nothing was consumed")
 
     def test_consumed_row_is_never_reclaimed(self) -> None:
-        self.start_attempt("run-a", 1, session_id="sess-a")
-        self.assertIsNotNone(self.claim("run-b", 1))
-        self.assertIsNone(self.claim("run-c", 1))
+        self.start("run-a", 1, session_id="sess-a")
+        self.assertIsNotNone(self.resume("run-b", 1)[0])
+        self.assertIsNone(self.resume("run-c", 1)[0])
 
-    # -- budget (recursive chain) -----------------------------------------
+    # -- budget (the precomputed chain depth) -------------------------------
 
     def test_budget_counts_the_session_chain_not_the_job(self) -> None:
         # s0 resumed three times through the consumption chain; the fourth
         # resume of that lineage is refused, but a brand-new session on the
         # same job claims fine (R7: a job is never permanently unresumable).
-        self.start_attempt("run-0", 1, session_id="sess-0")
+        self.start("run-0", 1, session_id="sess-0")
         for n in (1, 2, 3):
-            claimed = self.claim(f"run-{n}", 1)
+            claimed, claimer = self.resume(f"run-{n}", 1)
             self.assertIsNotNone(claimed, f"resume {n} of the chain should be allowed")
             self.assertEqual(claimed[0], f"sess-{n - 1}")
-            self.start_attempt(f"run-{n}", 1, session_id=f"sess-{n}")
+            self.assertEqual(self.row(claimer)[5], n, "depth is precomputed at claim")
+            attempts.record_attempt_session(self.args, self.job, claimer, f"sess-{n}")
         self.assertIsNone(
-            self.claim("run-4", 1), "chain of RESUME_BUDGET consumptions must stop"
+            self.resume("run-4", 1)[0], "chain of RESUME_BUDGET consumptions must stop"
         )
-        self.start_attempt("run-fresh", 1, session_id="sess-fresh")
-        claimed = self.claim("run-5", 1)
+        self.start("run-fresh", 1, session_id="sess-fresh")
+        claimed, _ = self.resume("run-5", 1)
         self.assertIsNotNone(claimed, "a fresh session starts with a full budget")
         self.assertEqual(claimed[0], "sess-fresh")
 
@@ -264,62 +334,69 @@ class ResumeClaimSqlTest(unittest.TestCase):
         # A rival consumes the nominated row between the two statements: the
         # loser's guarded UPDATE matches zero rows, returns None, writes no
         # marker — the rival's claim stands untouched.
-        directory = self.start_attempt("run-a", 1, session_id="sess-a")
+        directory, candidate = self.start("run-a", 1, session_id="sess-a")
+        _, rival = self.start("run-rival", 7)
         real_db_rows = attempts.db_rows
 
         def racing_db_rows(url, sql, params=None, **kwargs):
             rows = real_db_rows(url, sql, params, **kwargs)
-            if "WITH RECURSIVE" in sql and rows:
+            if "ORDER BY id DESC LIMIT 1" in sql and rows:
                 real_db_rows(
                     url,
-                    "UPDATE pipeline_attempts SET consumed_by_run_id = %s,"
-                    " consumed_by_attempt = %s, consumed_at = now()"
-                    " WHERE id = %s AND consumed_by_run_id IS NULL",
-                    ["run-rival", 7, rows[0][0]],
+                    "UPDATE attempts SET consumed_by_attempt_id = %s"
+                    " WHERE id = %s AND consumed_by_attempt_id IS NULL",
+                    [rival, rows[0][0]],
                 )
             return rows
 
         with mock.patch.object(attempts, "db_rows", racing_db_rows):
-            self.assertIsNone(self.claim("run-loser", 1))
-        (row,) = self.rows()
-        self.assertEqual(row[3:5], ("run-rival", 7))
+            claimed, loser = self.resume("run-loser", 1)
+        self.assertIsNone(claimed)
+        self.assertEqual(self.row(candidate)[4], rival)
+        self.assertEqual(self.row(loser)[5], 0, "the loser's depth is never stamped")
         self.assertFalse((directory / "resume_consumed.json").exists())
 
     def test_locality_guard_leaves_the_row_for_a_machine_with_the_files(self) -> None:
         # Sandbox mode (GTM_DATA_ROOT set): a missing attempt dir means the
         # transcript is elsewhere — nominate, verify, walk away unconsumed.
         with mock.patch.dict(os.environ, {"GTM_DATA_ROOT": str(self.tmp)}):
-            directory = self.start_attempt("run-a", 1, session_id="sess-a")
-            stored = _scratch_rows("SELECT attempt_dir FROM pipeline_attempts")[0][0]
+            directory, candidate = self.start("run-a", 1, session_id="sess-a")
+            stored = _scratch_rows(
+                "SELECT workspace_ref FROM attempts WHERE id = %s", (candidate,)
+            )[0][0]
             self.assertFalse(
-                stored.startswith("/"), "attempt_dir must be data-root relative"
+                stored.startswith("/"), "workspace_ref must be data-root relative"
             )
             shutil.rmtree(directory)
-            self.assertIsNone(self.claim("run-b", 1))
-            (row,) = self.rows()
-            self.assertIsNone(row[3], "locality guard must not burn the claim")
+            self.assertIsNone(self.resume("run-b", 1)[0])
+            self.assertIsNone(
+                self.row(candidate)[4], "locality guard must not burn the claim"
+            )
             directory.mkdir(parents=True)
-            claimed = self.claim("run-b", 2)
+            claimed, _ = self.resume("run-b", 2)
             self.assertIsNotNone(claimed)
             self.assertEqual(claimed[1], directory)
 
     # -- unconsume ---------------------------------------------------------
 
     def test_unconsume_is_owner_guarded_and_reopens_the_claim(self) -> None:
-        directory = self.start_attempt("run-a", 1, session_id="sess-a")
-        _, resumed_dir, candidate_id = self.claim("run-b", 2)
-        attempts.unconsume_attempt(
-            self.args, self.job, candidate_id, "run-imposter", 1, resumed_dir
+        directory, candidate = self.start("run-a", 1, session_id="sess-a")
+        claimed, owner = self.resume("run-b", 2)
+        _, resumed_dir, candidate_id = claimed
+        self.assertEqual(candidate_id, candidate)
+        _, imposter = self.start("run-imposter", 1)
+
+        attempts.unconsume_attempt(self.args, self.job, candidate_id, imposter, resumed_dir)
+        self.assertEqual(
+            self.row(candidate)[4], owner, "only the consuming owner may release"
         )
-        (row,) = self.rows()
-        self.assertEqual(row[3:5], ("run-b", 2), "only the consuming owner may release")
-        attempts.unconsume_attempt(
-            self.args, self.job, candidate_id, "run-b", 2, resumed_dir
-        )
-        (row,) = self.rows()
-        self.assertEqual(row[3:6], (None, None, None))
+
+        attempts.unconsume_attempt(self.args, self.job, candidate_id, owner, resumed_dir)
+        self.assertIsNone(self.row(candidate)[4])
+        self.assertEqual(self.row(owner)[5], 0, "release rolls the depth stamp back")
         self.assertFalse((directory / "resume_consumed.json").exists())
-        claimed = self.claim("run-c", 1)
+
+        claimed, _ = self.resume("run-c", 1)
         self.assertIsNotNone(claimed, "a released session is claimable again")
         self.assertEqual(claimed[0], "sess-a")
 

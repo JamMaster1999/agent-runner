@@ -5,19 +5,21 @@ only client-side history with forward value — the session-resume registry —
 so this is the only table the cutover copies; jobs/events/leases start empty
 in the runner database.
 
-The copy implements the THREE-part hazard documented on the ``attempts``
-table (db/migrations/003), which is the authority here:
+The copy implements the hazard documented on the ``attempts`` table
+(db/migrations/003, as amended by 007), which is the authority here:
 
-1. RENUMBER, never straight-insert. Old uniqueness was
-   (run_id, job_stable_id, attempt); new uniqueness drops run_id, so attempt
-   numbers that legitimately repeated across force-reruns would collide.
-   Every job's attempts are renumbered 1..n in (created_at, id) order —
-   uniform and deterministic, and unlike the dedupe rule it drops NOTHING,
-   so no resume chain can lose its consumer.
+1. RENUMBER — a CHOICE now, not a constraint. 007 dropped
+   UNIQUE (project_id, job_key, attempt) from the target, because attempt
+   numbers repeat across runs of one job and key nothing there either, so a
+   straight insert of the old numbers would now be accepted. This tool still
+   renumbers every job's attempts 1..n in (created_at, id) order: repeated
+   ordinals read as duplicates in the run view, the rule is deterministic,
+   and unlike the dedupe rule the old constraint tempted, it drops NOTHING.
 
 2. TWO-PASS CHAIN RE-LINK. The old chain is the pair
    (consumed_by_run_id, consumed_by_attempt); the new chain is the surrogate
-   self-FK consumed_by_attempt_id, and the renumber destroys exactly the
+   self-FK consumed_by_attempt_id, and surrogate ids do not exist until the
+   rows are inserted — while the renumber in (1) edits exactly the
    coordinates the pair names. Pass one inserts with the FK NULL while
    remembering each row's OLD (run_id, job_stable_id, attempt) triple; pass
    two resolves each pair through that memory, never through the new key.

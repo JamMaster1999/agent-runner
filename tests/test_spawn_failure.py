@@ -169,7 +169,10 @@ class TemplateFromSubmitDataTest(unittest.TestCase):
         claim.assert_called_once()
         fingerprint = record_start.call_args.args[4]
         self.assertEqual(fingerprint, resume_prompt_fingerprint(self.TEMPLATE))
-        self.assertEqual(fingerprint, claim.call_args.args[4])
+        # The claim's third argument is THIS attempt's row id (007), so the
+        # fingerprint moved one place left — and the row must exist first.
+        self.assertEqual(claim.call_args.args[2], record_start.return_value)
+        self.assertEqual(fingerprint, claim.call_args.args[3])
 
     def test_engine_substitutes_the_runner_variables_at_attempt_start(self) -> None:
         from agent_runner.engine import runner_variables
