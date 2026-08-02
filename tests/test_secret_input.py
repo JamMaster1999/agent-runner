@@ -60,6 +60,19 @@ class SecretInputTest(unittest.TestCase):
         self.assertNotIn(SENTINEL_URL, message)
         self.assertNotIn(SENTINEL_PASSWORD, message)
 
+    def test_explicit_empty_file_selector_never_falls_back(self) -> None:
+        with mock.patch.dict(os.environ, {"RUNNER_DSN": SENTINEL_URL}):
+            with self.assertRaises(SystemExit) as caught:
+                secret_value(
+                    label="runner database URL",
+                    file_path="",
+                    default_env="RUNNER_DSN",
+                )
+        message = str(caught.exception)
+        self.assertIn("non-empty filesystem path", message)
+        self.assertNotIn(SENTINEL_URL, message)
+        self.assertNotIn(SENTINEL_PASSWORD, message)
+
     def test_private_one_value_file_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runner.dsn"
