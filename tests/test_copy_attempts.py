@@ -314,6 +314,12 @@ class ExactSnapshotTest(unittest.TestCase):
         )
         self.assertLess(lock_index, count_index)
 
+    def test_autocommit_target_is_refused_before_source_or_target_queries(self) -> None:
+        target = types.SimpleNamespace(autocommit=True)
+        with self.assertRaises(SystemExit) as caught:
+            copy_attempts(types.SimpleNamespace(), target)
+        self.assertIn("autocommit=False", str(caught.exception))
+
 
 class CopyCliGuardTest(unittest.TestCase):
     """The argv surface carries selector names, never database secrets."""

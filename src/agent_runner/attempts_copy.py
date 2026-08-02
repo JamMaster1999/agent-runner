@@ -377,8 +377,15 @@ def copy_attempts(source_conn: Any, target_conn: Any, *, project: str = "gtm",
     """Run the copy; returns the verification summary it also prints.
 
     ``target_conn`` must already have passed assert_runner_target and must
-    have the migrations applied (the attempts table exists).
+    have the migrations applied (the attempts table exists). Autocommit must
+    be disabled: the advisory lock and exact verification protect one target
+    transaction, not a sequence of independently committed statements.
     """
+    if getattr(target_conn, "autocommit", False):
+        raise SystemExit(
+            "attempts copy requires target autocommit=False so its lock, writes,"
+            " exact verification, and rollback share one transaction."
+        )
     with source_conn.cursor() as cur:
         cur.execute(SOURCE_QUERY)
         plan = build_plan(cur.fetchall())
@@ -458,10 +465,10 @@ def copy_attempts(source_conn: Any, target_conn: Any, *, project: str = "gtm",
         summary = _verify_exact(
             target_conn, plan, expected, project, note="copied — exact match"
         )
+        target_conn.commit()
     except BaseException:
         target_conn.rollback()
         raise
-    target_conn.commit()
     _report(summary)
     return summary
 
