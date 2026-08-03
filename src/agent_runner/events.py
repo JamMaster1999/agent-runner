@@ -523,10 +523,16 @@ def run_job_event(
                 file=sys.stderr,
             )
             return
+        # Preserve the transport's transient/terminal split: a db_timeout is
+        # retryable evidence about the DATABASE, not about the job, and
+        # collapsing it to retryable=False routed healthy jobs to terminal
+        # 'blocked' on attempt 1 (2026-08-03 incident, PS-5 stall). Only a
+        # transient cause stays retryable; job_missing/db_error stay terminal.
+        transient = bool(getattr(exc, "retryable", False))
         raise RunnerError(
             "jobs event update failed.",
-            code="job_event_failed",
-            retryable=False,
-            alert=True,
+            code="job_event_transient" if transient else "job_event_failed",
+            retryable=transient,
+            alert=not transient,
             details=failure_text,
         ) from exc
