@@ -157,7 +157,19 @@ SIGNAL_BY_CATEGORY: dict[str, str] = {
     "spawn_failure": outcomes.SPAWN_FAILURE,
     "probe_timeout": outcomes.PROBE_TIMEOUT,
     "cancelled": outcomes.CANCELLED,
+    # Transient DB stalls during an attempt's bookkeeping (event append,
+    # attempt-store write) are evidence about the DATABASE, not the job —
+    # same D5 row as broken probe infrastructure: bounded free retry, no
+    # attempt or resume budget spent (2026-08-03 incident: these blocked
+    # healthy jobs terminally on attempt 1).
+    "db_timeout": outcomes.INFRASTRUCTURE_FAILURE,
+    "job_event_transient": outcomes.INFRASTRUCTURE_FAILURE,
 }
+
+# Bounded retries for a transiently stalled claim write, mirroring the
+# INFRASTRUCTURE_FAILURE retry cap (D5: infrastructure failures never spend
+# the job's own budget).
+CLAIM_STALL_RETRIES = 3
 
 
 class ProbeFailureError(RunnerError):
@@ -900,8 +912,40 @@ def run_with_retries(
     # parity).
     job_name = job.attempt_dir_name or job.key
 
+    claim_stalls = 0
     while True:
-        claim = claim_job(args.database_url, job, run_id)
+        try:
+            claim = claim_job(args.database_url, job, run_id)
+        except RunnerError as exc:
+            # A transient stall on the claim write must not abort the job:
+            # the row is still 'queued', and once this run exits NOTHING ever
+            # claims queued rows again — the 2026-08-03 strand. Bounded like
+            # the other infrastructure retries; past the cap, surface the
+            # stranding explicitly so the caller can reconcile.
+            if exc.code != "db_timeout":
+                raise
+            claim_stalls += 1
+            if claim_stalls > CLAIM_STALL_RETRIES:
+                raise RunnerError(
+                    f"{job_name}: claim timed out {claim_stalls} time(s); the row is "
+                    "likely still 'queued' and nothing picks queued rows up after "
+                    "this run exits — requeue or rerun the phase.",
+                    code="db_timeout",
+                    retryable=True,
+                    alert=True,
+                    details=exc.details,
+                ) from exc
+            delay = args.retry_backoff_seconds[
+                min(claim_stalls - 1, len(args.retry_backoff_seconds) - 1)
+            ]
+            print(
+                f"{job_name}: claim timed out "
+                f"(stall {claim_stalls}/{CLAIM_STALL_RETRIES}); retrying in {delay}s."
+            )
+            if not args.no_sleep:
+                time.sleep(delay)
+            continue
+        claim_stalls = 0
         if not claim["claimed"]:
             status = claim["status"]
             wait_seconds = claim["wait_seconds"]
@@ -1012,7 +1056,19 @@ def run_with_retries(
             )
             raise failure
 
-        run_job_event(args.database_url, "fail", job, message, attempt=attempt)
+        try:
+            run_job_event(args.database_url, "fail", job, message, attempt=attempt)
+        except RunnerError as exc:
+            # The fail record is audit; mark_retry/mark_blocked below own the
+            # row's state (they overwrite its status write). A transient
+            # stall here must not strand the row 'running' by aborting them.
+            if exc.code != "job_event_transient":
+                raise
+            print(
+                f"WARNING: fail-event append stalled for {job.key}; "
+                "continuing to the state update.",
+                file=sys.stderr,
+            )
 
         if decision.action == "block":
             mark_blocked(
