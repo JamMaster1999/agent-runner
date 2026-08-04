@@ -192,6 +192,13 @@ class ClaudeCodeAdapter(HarnessAdapter):
         disallowed = job.policy.get("disallowed_tools") or []
         if disallowed:
             command.append("--disallowedTools=" + ",".join(str(t) for t in disallowed))
+        # Setting-source isolation as submit data: e.g. ["project"] keeps the
+        # operator's user-global Claude state (plugins, skills, personal
+        # memory) out of production sessions — the claude-side counterpart of
+        # a client pinning its codex CODEX_HOME.
+        sources = job.policy.get("setting_sources")
+        if sources is not None:
+            command += ["--setting-sources", ",".join(str(s) for s in sources)]
         command += [
             "--print",
             "--verbose",

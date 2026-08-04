@@ -172,11 +172,9 @@ class RunnerConfig:
         """``args`` unchanged when it already carries every engine field;
         otherwise a RunnerConfig built from what it has, defaults filling the
         rest. ``database_url`` is the one field with no default — a caller
-        that omits it gets a loud error here rather than an AttributeError
-        deep in a poll loop."""
-        missing = [name for name in cls._FIELDS if not hasattr(args, name)]
-        if not missing:
-            return args
+        that omits it (or supplies it empty, even on an otherwise complete
+        config object) gets a loud error here rather than an opaque driver
+        failure deep in a poll loop."""
         if not getattr(args, "database_url", None):
             raise RunnerError(
                 "Runner config needs database_url (the runner store DSN).",
@@ -184,6 +182,9 @@ class RunnerConfig:
                 retryable=False,
                 alert=True,
             )
+        missing = [name for name in cls._FIELDS if not hasattr(args, name)]
+        if not missing:
+            return args
         values = {
             name: getattr(args, name)
             for name in cls._FIELDS

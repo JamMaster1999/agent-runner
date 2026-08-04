@@ -332,6 +332,9 @@ class CodexAdapter(HarnessAdapter):
         else:
             items = []
 
+        # terminal.env: codex doctor flags a non-interactive terminal
+        # environment, which is exactly what a headless engine spawn is —
+        # never evidence of a broken CLI.
         ignored_failures = {"terminal.env"}
         hard_failures = [
             {

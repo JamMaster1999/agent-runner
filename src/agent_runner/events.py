@@ -108,7 +108,7 @@ def event_rows(call: SimpleNamespace, batch: list[dict]) -> tuple[list[str], lis
     cost_usd) VALUES entries.
 
     For batches, also folds the last non-null message/current/total back into
-    ``call`` so the denormalized pipeline_jobs columns reflect the newest
+    ``call`` so the denormalized jobs columns reflect the newest
     state. The typed-usage slots come only from batch entries (migration
     031); plain lifecycle calls never carry usage, so non-batch rows bind
     five NULLs.
@@ -243,7 +243,7 @@ def append_agent_events(
 
 
 def update_guard(call: SimpleNamespace) -> tuple[str, list[object]]:
-    """(WHERE fencing, params) for the pipeline_jobs UPDATE (never the event
+    """(WHERE fencing, params) for the jobs UPDATE (never the event
     INSERT):
 
     - ``status <> 'cancelled'`` always (late writers cannot resurrect).

@@ -53,6 +53,11 @@ def ensure_job(
     fresh attempt budget per incarnation), and no force reset (a replayed
     --force-rerun must resume, not restart from zero).
     """
+    # Tenant self-registration must precede the first jobs INSERT on a fresh
+    # database (jobs.project_id FKs projects, and 001 seeds nothing): submit
+    # can legally be the first store write of a process (--prepare-only,
+    # protocol op 1), so the lease-time registration alone is not enough.
+    ensure_project(url)
     replay = bool(
         os.environ.get("RUNNER_RUN_REPLAY") or os.environ.get("GTM_RUN_REPLAY")
     )
@@ -564,7 +569,7 @@ def reap_stale_jobs(url: str, run_id: str, *, stale_seconds: int) -> None:
 
     A stranded row means an orchestrator died without writing fail/blocked —
     its heartbeat stopped advancing. Global on purpose: the stale threshold
-    protects concurrently running institutions. Rows whose claimed_by is a
+    protects concurrently running groups. Rows whose claimed_by is a
     live process on this host are exempt: they are busy, not stranded.
     """
     try:

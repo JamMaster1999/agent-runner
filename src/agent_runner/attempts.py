@@ -107,7 +107,9 @@ def record_attempt_start(
     relative to the data root (attempt_dir_for_db) so the row stays valid
     across Mac/Volume mount points.
 
-    Also drops a ``pipeline_attempt.json`` marker in the attempt dir so the
+    Also drops a ``pipeline_attempt.json`` marker in the attempt dir (the
+    historical filename is kept deliberately: markers already on disk are
+    part of the attempt-dir contract and renaming would orphan them) so the
     legacy filesystem resume matchers skip DB-tracked attempts entirely:
     resume rights for them are decided solely by claim_resumable_attempt."""
     try:

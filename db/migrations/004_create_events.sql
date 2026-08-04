@@ -82,7 +82,8 @@ $$
 The tenant this event belongs to — NOT NULL, and the only routing column an
 emitter cannot derive.
 
-DEFAULT 'gtm' matches the single project row 001 seeds, and exists because
+DEFAULT 'gtm' matched the single-tenant bridge era (dropped by 008;
+001 no longer seeds a tenant), and existed because
 of the INSERT-only grant: runner_emitter holds no SELECT anywhere, so an
 emit can never look a project up from job_key, and the emit CLI's
 attribution environment carries no project concept at all. Without the

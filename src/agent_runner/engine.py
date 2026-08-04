@@ -176,6 +176,9 @@ CLAIM_STALL_RETRIES = 3
 # Attempt timeout when the submitter set none (policy["attempt_timeout_minutes"]).
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60
 
+# Once-per-process visibility for the emit-DSN privilege fallback.
+_EMIT_DSN_FALLBACK_WARNED = False
+
 
 class ProbeFailureError(RunnerError):
     """A non-valid ProbeReport crossing into the retry machinery.
@@ -396,6 +399,13 @@ AGENT_ENV_SAFE_NAMES = (
     "TMPDIR",
     "TZ",
     "PYTHONPATH",
+    # Runner state override: hook processes must write where the engine
+    # reads, or all hook telemetry silently lands in the wrong tree.
+    "RUNNER_STATE_DIR",
+    # Container/sandbox marker some CLIs require to accept elevated
+    # permission modes when running as root (e.g. claude bypassPermissions
+    # in a Modal container). A marker, not a secret.
+    "IS_SANDBOX",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -465,6 +475,23 @@ def agent_env(
     in-agent emit would take the advisory exit-0 path and lose its row)."""
     import agent_runner
 
+    emit_dsn = os.environ.get("RUNNER_EMIT_DSN")
+    if not emit_dsn:
+        # Falling back to the engine's full-privilege store DSN keeps emits
+        # working, but hands every agent shell a DSN that can do far more
+        # than INSERT events. Warn once per process so a deployment missing
+        # the restricted emitter DSN is visible, not silent.
+        global _EMIT_DSN_FALLBACK_WARNED
+        if not _EMIT_DSN_FALLBACK_WARNED:
+            _EMIT_DSN_FALLBACK_WARNED = True
+            print(
+                "WARNING: RUNNER_EMIT_DSN is not set; agent environments "
+                "receive the engine's full store DSN. Provision the "
+                "restricted runner_emitter DSN for this deployment.",
+                file=sys.stderr,
+            )
+        emit_dsn = database_url
+
     env = agent_base_env(adapter, job)
     env.update(
         {
@@ -484,7 +511,7 @@ def agent_env(
             "RUNNER_BACKEND": job.harness,
             "RUNNER_GROUP_KEY": job.group_key,
             "RUNNER_PROJECT_ID": project_id(),
-            "RUNNER_EMIT_DSN": os.environ.get("RUNNER_EMIT_DSN") or database_url,
+            "RUNNER_EMIT_DSN": emit_dsn,
             "RUNNER_PYTHON": sys.executable,
             "AGENT_RUNNER_PROJECT_ROOT": str(util.project_root()),
         }
