@@ -76,6 +76,7 @@ EXPECTED_MIGRATIONS = [
     "005_create_leases.sql",
     "006_create_accounts.sql",
     "007_attempts_row_identity.sql",
+    "008_drop_events_project_default.sql",
 ]
 
 # db/roles is NOT part of the chain and never reaches the ledger: CREATE ROLE
@@ -241,6 +242,12 @@ class RunnerMigrationsTest(unittest.TestCase):
         _admin_exec(f"DROP DATABASE IF EXISTS {SCRATCH_DB} WITH (FORCE)")
         _admin_exec(f"CREATE DATABASE {SCRATCH_DB}")
         cls.applied = migrations.apply_pending(SCRATCH_URL)
+        # 001 seeds no tenant: register the fixture tenant the way a run
+        # start does (jobstore.ensure_project), for the raw-SQL tests below.
+        _scratch_rows(
+            "INSERT INTO projects (project_id, name)"
+            " VALUES ('gtm', 'gtm') ON CONFLICT DO NOTHING"
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -550,12 +557,24 @@ class RunnerMigrationsTest(unittest.TestCase):
                 " VALUES ('gtm', 'no-contract', 'g', 't', 'h', '{}'::jsonb)"
             )
 
-    def test_events_project_id_has_the_single_tenant_default(self) -> None:
-        # The emitter role holds no SELECT, so an emit can never derive the
-        # one NOT NULL routing column. Without a default every insert fails.
+    def test_events_project_id_has_no_default(self) -> None:
+        # 008: the tenant is never guessed. Every writer sends project_id
+        # explicitly from RUNNER_PROJECT_ID; an insert that omits it fails
+        # the NOT NULL loudly instead of being silently attributed to a
+        # defaulted tenant.
+        default = _scratch_value(
+            "SELECT column_default FROM information_schema.columns"
+            " WHERE table_schema = 'public' AND table_name = 'events'"
+            " AND column_name = 'project_id'"
+        )
+        self.assertIsNone(default)
+        with self.assertRaises(Exception):
+            _scratch_rows(
+                "INSERT INTO events (job_key, kind) VALUES ('defaulted', 'job.start')"
+            )
         (event_id,) = _scratch_rows(
-            "INSERT INTO events (job_key, kind) VALUES ('defaulted', 'job.start')"
-            " RETURNING id"
+            "INSERT INTO events (project_id, job_key, kind)"
+            " VALUES ('gtm', 'explicit', 'job.start') RETURNING id"
         )[0]
         self.assertEqual(
             _scratch_rows("SELECT project_id FROM events WHERE id = %s", (event_id,)),
@@ -777,9 +796,11 @@ class MigrationsTargetGuardTest(unittest.TestCase):
                 if "information_schema.columns" in sql:
                     return _FakeCursor([("filename",)] if self.ledger_exists else [])
                 if "information_schema.tables" in sql:
-                    wanted = set(params[0])
+                    # The allowlist inversion: the guard asks for public
+                    # tables NOT in RUNNER_TABLES.
+                    runner_tables = set(params[0])
                     return _FakeCursor(
-                        [(name,) for name in sorted(self.tables) if name in wanted]
+                        [(name,) for name in sorted(self.tables) if name not in runner_tables]
                     )
                 if "FROM schema_migrations" in sql:
                     return _FakeCursor([(row,) for row in self.ledger_rows])

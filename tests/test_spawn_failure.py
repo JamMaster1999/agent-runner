@@ -46,7 +46,11 @@ def phase5_job(prompt_ref: dict | None = None) -> RunnerJob:
             group_key="999_spawn_fixture",
             task_type="phase5",
             harness="claude",
-            labels={"institution": "Spawn Fixture U", "agent": "prod-phase5-instructor"},
+            labels={
+                "institution": "Spawn Fixture U",
+                "agent": "prod-phase5-instructor",
+                "institution_id": "00000000-0000-0000-0000-000000000999",
+            },
             max_attempts=3,
             agent_ref="prod-phase5-instructor",
             prompt_ref=prompt_ref,
@@ -57,9 +61,17 @@ def phase5_job(prompt_ref: dict | None = None) -> RunnerJob:
             },
             probe_spec={"probe": "phase_output", "repair_rounds": 0, "expensive": False},
             policy={"attempt_timeout_minutes": 90, "resume": True},
-            client_refs={"institution_id": "00000000-0000-0000-0000-000000000999"},
         )
     )
+
+
+def _materialize_test_agent(root: Path, name: str = "prod-phase5-instructor") -> None:
+    """The rendered discovery file the claude adapter preflights before
+    spawning (a missing one is a loud missing_claude_agent, not a burned
+    retry budget)."""
+    agent = root / ".claude" / "agents" / f"{name}.md"
+    agent.parent.mkdir(parents=True, exist_ok=True)
+    agent.write_text("---\nname: %s\n---\n\nfixture body\n" % name)
 
 
 class SpawnFailureTest(unittest.TestCase):
@@ -69,8 +81,12 @@ class SpawnFailureTest(unittest.TestCase):
         args = argparse.Namespace(database_url="postgres://unused", force_rerun=True)
         job = phase5_job()
         with tempfile.TemporaryDirectory() as tmp:
+            _materialize_test_agent(Path(tmp))
             with (
                 # DB writers: pipeline_attempts row and job events.
+                mock.patch.dict(
+                    engine.os.environ, {"AGENT_RUNNER_PROJECT_ROOT": tmp}, clear=False
+                ),
                 mock.patch.object(engine, "record_attempt_start"),
                 mock.patch.object(engine, "run_job_event"),
                 mock.patch.object(engine.subprocess, "Popen", side_effect=exc),
@@ -130,7 +146,7 @@ class TemplateFromSubmitDataTest(unittest.TestCase):
     TEMPLATE = (
         "Fixture template.\n"
         "Write to `{{RUNNER_OUTPUT_PATH}}/phase5_batch_001.json` "
-        "(run {{RUNNER_JOB_KEY}}, attempt {{RUNNER_ATTEMPT}}).\n"
+        "(run {{RUNNER_RUN_ID}}, job {{RUNNER_JOB_KEY}}, attempt {{RUNNER_ATTEMPT}}).\n"
     )
 
     def run_once(self, tmp: Path) -> tuple[RunnerError, mock.Mock, mock.Mock]:
@@ -139,7 +155,13 @@ class TemplateFromSubmitDataTest(unittest.TestCase):
             force_rerun=False,
         )
         job = phase5_job()
+        _materialize_test_agent(tmp)
         with (
+            mock.patch.dict(
+                engine.os.environ,
+                {"AGENT_RUNNER_PROJECT_ROOT": str(tmp)},
+                clear=False,
+            ),
             mock.patch.object(engine, "record_attempt_start") as record_start,
             mock.patch.object(engine, "run_job_event"),
             # The DB claim finds nothing: previously the engine fell back to
@@ -184,8 +206,21 @@ class TemplateFromSubmitDataTest(unittest.TestCase):
             directory = Path(tmp) / "phase5_batch_001" / "attempt-01"
             prompt = (directory / "prompt.md").read_text()
         self.assertEqual(
-            prompt, substitute(self.TEMPLATE, runner_variables("run-1", 1, directory, None))
+            prompt,
+            substitute(
+                self.TEMPLATE,
+                runner_variables(
+                    "run-1",
+                    "999_spawn_fixture__phase5_batch_001__claude",
+                    1,
+                    directory,
+                    None,
+                ),
+            ),
         )
+        # Each token substitutes exactly what its name promises.
+        self.assertIn("run run-1,", prompt)
+        self.assertIn("job 999_spawn_fixture__phase5_batch_001__claude,", prompt)
         # Fresh session (no DB claim): no RESUME preamble was prepended.
         self.assertTrue(prompt.startswith("Fixture template."))
 

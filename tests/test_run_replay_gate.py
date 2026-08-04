@@ -42,11 +42,14 @@ def job(key: str = "phase2", phase: str = "phase2") -> RunnerJob:
         task_type=phase,
         harness="codex",
         agent_ref="prod-phase2-departments",
-        labels={"institution": "test-inst", "agent": "prod-phase2-departments"},
+        labels={
+            "institution": "test-inst",
+            "agent": "prod-phase2-departments",
+            "institution_id": INSTITUTION["id"],
+        },
         attempt_dir_name=key,
         output_filename=f"{phase}.json",
         canonical_relpath=f"results/999_test/codex/{phase}.json",
-        client_refs={"institution_id": INSTITUTION["id"]},
     )
 
 

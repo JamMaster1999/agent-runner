@@ -522,8 +522,13 @@ class AgentEnvEmitDsnTest(unittest.TestCase):
 
         return SimpleNamespace(
             key="job-1", group_key="grp-1", agent_ref="someagent",
-            task_type="phase5", harness="claude",
+            task_type="phase5", harness="claude", required_env=("SOME_MCP_KEY",),
         )
+
+    def _adapter(self):
+        from agent_runner.harness import get_adapter
+
+        return get_adapter("claude")
 
     def test_restricted_dsn_wins_and_group_key_is_stamped(self) -> None:
         from agent_runner import engine
@@ -531,7 +536,9 @@ class AgentEnvEmitDsnTest(unittest.TestCase):
         with mock.patch.dict(
             _os.environ, {"RUNNER_EMIT_DSN": "postgresql://emitter"}, clear=False
         ):
-            env = engine.agent_env("run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full")
+            env = engine.agent_env(
+                self._adapter(), "run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full"
+            )
         self.assertEqual(env["RUNNER_EMIT_DSN"], "postgresql://emitter")
         self.assertEqual(env["RUNNER_GROUP_KEY"], "grp-1")
 
@@ -539,8 +546,52 @@ class AgentEnvEmitDsnTest(unittest.TestCase):
         from agent_runner import engine
 
         _os.environ.pop("RUNNER_EMIT_DSN", None)
-        env = engine.agent_env("run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full")
+        env = engine.agent_env(
+            self._adapter(), "run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full"
+        )
         self.assertEqual(env["RUNNER_EMIT_DSN"], "postgresql://full")
+
+    def test_agent_env_is_filtered_by_default(self) -> None:
+        # The engine's own secrets never reach agent shells: only the safe
+        # baseline, the job's declared required_env, the adapter's
+        # env_passthrough, and operator-listed extras survive the filter.
+        from agent_runner import engine
+
+        with mock.patch.dict(
+            _os.environ,
+            {
+                "DATABASE_URL": "postgresql://client-db-secret",
+                "SOME_MCP_KEY": "declared",
+                "SOME_OTHER_SECRET": "leak-me-not",
+                "CLAUDE_CODE_OAUTH_TOKEN": "cli-auth",
+                "RUNNER_AGENT_ENV_PASSTHROUGH": "EXTRA_ALLOWED",
+                "EXTRA_ALLOWED": "yes",
+            },
+            clear=False,
+        ):
+            _os.environ.pop("RUNNER_AGENT_ENV", None)
+            env = engine.agent_env(
+                self._adapter(), "run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full"
+            )
+        self.assertNotIn("DATABASE_URL", env)
+        self.assertNotIn("SOME_OTHER_SECRET", env)
+        self.assertEqual(env["SOME_MCP_KEY"], "declared")          # required_env
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "cli-auth")  # adapter passthrough
+        self.assertEqual(env["EXTRA_ALLOWED"], "yes")              # operator passthrough
+        self.assertEqual(env["RUNNER_PROJECT_ID"], "testproj")     # tenant stamped
+
+    def test_agent_env_inherit_escape_hatch(self) -> None:
+        from agent_runner import engine
+
+        with mock.patch.dict(
+            _os.environ,
+            {"RUNNER_AGENT_ENV": "inherit", "SOME_OTHER_SECRET": "visible"},
+            clear=False,
+        ):
+            env = engine.agent_env(
+                self._adapter(), "run-1", self._job(), 1, Path("/tmp/out"), "postgresql://full"
+            )
+        self.assertEqual(env["SOME_OTHER_SECRET"], "visible")
 
 
 class HookCliTest(unittest.TestCase):

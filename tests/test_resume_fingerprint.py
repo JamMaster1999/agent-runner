@@ -71,9 +71,9 @@ class ResumeFingerprintTest(unittest.TestCase):
         # substituted prompts they received differ.
         template = synthetic_template()
         fingerprint = attempts.resume_prompt_fingerprint(template)
-        prompt_a = substitute(template, runner_variables("run-a", 1, Path("/tmp/run-a")))
+        prompt_a = substitute(template, runner_variables("run-a", "job-1", 1, Path("/tmp/run-a")))
         prompt_b = substitute(
-            template, runner_variables("run-b", 3, Path("/tmp/run-b/attempt-03"))
+            template, runner_variables("run-b", "job-1", 3, Path("/tmp/run-b/attempt-03"))
         )
         self.assertNotEqual(prompt_a, prompt_b)
         self.assertEqual(fingerprint, attempts.resume_prompt_fingerprint(template))

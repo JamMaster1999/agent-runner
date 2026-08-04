@@ -156,6 +156,11 @@ class DbFaultInjectionTest(unittest.TestCase):
         _admin_exec(f"CREATE DATABASE {SCRATCH_DB}")
         for path in migrations.migration_paths():
             _scratch_rows(path.read_text())
+        # 001 seeds no tenant; register the test tenant like a run start does.
+        _scratch_rows(
+            "INSERT INTO projects (project_id, name)"
+            " VALUES ('testproj', 'testproj') ON CONFLICT DO NOTHING"
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
