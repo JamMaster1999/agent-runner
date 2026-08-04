@@ -335,13 +335,23 @@ LEASE_WAIT_TIMEOUT_SECONDS = int(
 )
 
 
+# Once-per-process memo for tenant self-registration: fan-out submits must
+# not pay one extra TLS connection + INSERT each (the 2026-08-03 PS-5 stall
+# was connection-pressure-shaped). Races are harmless — the INSERT is
+# idempotent ON CONFLICT DO NOTHING.
+_ENSURED_PROJECTS: set[tuple[str, str]] = set()
+
+
 def ensure_project(url: str) -> None:
-    """Register this tenant's projects row (idempotent).
+    """Register this tenant's projects row (idempotent, memoized).
 
     001 seeds nothing: the tenant is declared by RUNNER_PROJECT_ID and
     self-registers on first contact — jobs/attempts/leases FK onto projects,
-    so this must run before the first run's writes (acquire_run_lease calls
-    it)."""
+    so this runs before the first jobs INSERT (ensure_job) and at lease
+    acquisition."""
+    key = (url, project_id())
+    if key in _ENSURED_PROJECTS:
+        return
     db_rows(
         url,
         """
@@ -351,6 +361,7 @@ ON CONFLICT DO NOTHING;
 """,
         [project_id(), project_id()],
     )
+    _ENSURED_PROJECTS.add(key)
 
 
 def acquire_run_lease(
