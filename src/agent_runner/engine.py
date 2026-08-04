@@ -87,7 +87,7 @@ class PolicyDecision:
     ``consumes_attempt`` False (D5) leaves the job's remaining max_attempts
     untouched: the failure says nothing about the job. Such retries are
     bounded by ``retry_cap``, an in-process counter — no DDL tonight, the
-    pipeline_jobs columns are unchanged. ``consumes_resume_budget`` False
+    jobs columns are unchanged. ``consumes_resume_budget`` False
     means the retry must never spend a session resume; for infrastructure
     failures this is enforced structurally — the re-probe happens inside the
     still-running attempt and never re-claims a session."""
@@ -743,7 +743,7 @@ def run_agent_job_once(
 
         resume_session: tuple[str, Path] | None = None
         if not args.force_rerun and bool(job.policy.get("resume")):
-            # The pipeline_attempts store is the ONLY source of resume rights
+            # The attempts store is the ONLY source of resume rights
             # (design §7.5): the legacy filesystem matchers were deleted at
             # extraction step 4, once every session worth having was
             # DB-tracked. The claim path is pinned by

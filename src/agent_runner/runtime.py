@@ -47,7 +47,7 @@ class RunnerError(Exception):
     """A runner-module failure crossing toward the facade.
 
     ``code`` keeps the historical category VALUES byte-for-byte (event rows,
-    ``error_details.category``, ``pipeline_attempts.failure_category`` are
+    ``error_details.category``, ``attempts.error_code`` are
     unchanged); ``retryable`` False is terminal proof; ``alert`` is the
     runner's "unalerted operator-worthy fact" flag — client facades map it
     onto their own notify vocabulary.

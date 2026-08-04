@@ -6,7 +6,7 @@ step 5).
 
 The legacy filesystem resume matcher (packet-membership match over
 .local/runs) was DELETED at extraction step 4 (design §7.5), not ported:
-every resumable session is DB-tracked in pipeline_attempts, and resume
+every resumable session is DB-tracked in the attempts store, and resume
 rights belong solely to claim_resumable_attempt — pinned by
 tests/test_resume_claim_sql.py. This module imports no GTM modules.
 

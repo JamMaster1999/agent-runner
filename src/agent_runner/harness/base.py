@@ -197,7 +197,7 @@ class HarnessAdapter(ABC):
 
     # NOTE (extraction step 4, design §7.5): the consume_legacy_session hook
     # and the per-harness filesystem resume matchers are DELETED, not ported.
-    # Resume rights ride the pipeline_attempts store exclusively
+    # Resume rights ride the attempts store exclusively
     # (claim_resumable_attempt), pinned by tests/test_resume_claim_sql.py.
 
     # -- telemetry ---------------------------------------------------------

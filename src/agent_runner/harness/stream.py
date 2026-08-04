@@ -24,7 +24,7 @@ PROGRESS_LINE = re.compile(r"PROGRESS:\s*(\d+)\s*/\s*(\d+)\s*[-—:]?\s*(.*)")
 
 MESSAGE_LIMIT = 300
 
-# Defense in depth: pipeline_events is synced to the public dashboard DB, so
+# Defense in depth: events rows are served to the public dashboard, so
 # a database URL captured from an executed command line or echoed agent text
 # must never reach an event message.
 DB_URL_RE = re.compile(r"postgres(?:ql)?://\S+", re.IGNORECASE)

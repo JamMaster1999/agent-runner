@@ -1,5 +1,11 @@
 # Pipeline Event Catalog
 
+> **Post-cutover note (2026-08-04):** the live tables are the runner
+> database's `jobs`/`events` (migrations 002/004) and agent-side emit is
+> `python3 -m agent_runner emit`; historical references below to
+> `pipeline_events`/`pipeline_jobs`/`core/job_event.py` describe the
+> pre-cutover bridge era and are kept for provenance.
+
 How job progress becomes data. Established by the Task 5 probe runs
 (2026-07-05, Claude Code 2.1.201 + Codex CLI 0.142.5): two instrumented
 probe agents, one per CLI, each spawning a subagent, with every supported
@@ -8,10 +14,10 @@ production parsers.
 
 ## Unified event schema
 
-Every event is one row in the `pipeline_events` table (migration 015,
-written via `core/job_event.py` and the orchestrator lifecycle helpers),
-with this shape — the legacy `pipeline_jobs.events` jsonb array is frozen
-(backfilled into the table, dropped after the Task 9 E2E):
+Every event is one row in the runner database's `events` table (migration
+004; the pre-cutover `pipeline_events` name survives only in the history
+below), written via `agent-runner emit` and the engine lifecycle helpers,
+with this shape:
 
 ```json
 {
