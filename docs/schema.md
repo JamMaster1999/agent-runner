@@ -273,15 +273,12 @@ cap.
   ordinals `--force-rerun` produces, forcing a dedupe-or-renumber pass.
   **007 dropped that constraint** — it was wrong for live writes too, not
   just the copy — so a straight copy of the old numbers is now valid.
-  `db/copy_attempts.py` still renumbers per job because repeated ordinals
-  read as duplicates in the run view; that is now a choice.
-
-  The tool implements both parts above plus that renumber in one target
-  transaction, with `--dry-run`. Its idempotence check compares every
-  copy-owned field, resolved consumer FK, and derived resume depth against
-  the source plan; the first copy runs that same exact verification before
-  commit and rolls back on any mismatch. Use it rather than hand-rolling
-  the SQL.
+  The one-time copy tool (`db/copy_attempts.py` + `attempts_copy.py`)
+  implemented both parts above plus a per-job renumber in one target
+  transaction, with `--dry-run` and a field-level idempotence check. The
+  2026-08-02 cutover consumed it; the tool was removed after the fact
+  (retrieve from git history if a future migration of the same shape needs
+  the pattern).
 - Set `RUNNER_EMIT_DSN`'s *value* to the `runner_emitter` DSN and drop the
   jobs UPDATE from the emit path. The emit CLI already falls back to the
   full DSN, so both behaviors survive the bridge; no schema change is needed

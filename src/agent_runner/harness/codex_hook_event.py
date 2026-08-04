@@ -6,11 +6,12 @@ the GTM path keeps a bridge shim (delete at step 7) because
 .codex/config.toml invokes it by repo-relative path. Consolidating the
 claude/codex twins into one parameterized script is step-7 work.
 
-Attribution comes exclusively from the UFLO_* environment stamped by the
-orchestrator's ``agent_env()`` — Codex propagates the exec process
-environment into every hook process, including hooks fired for subagent
-activity (verified 2026-07-05). Events without UFLO_RUN_ID come from
-interactive Codex sessions in this repo and are ignored.
+Attribution comes from the RUNNER_* environment stamped by the engine's
+``agent_env()`` (the legacy UFLO_* spellings are honored as fallback for
+one release) — Codex propagates the exec process environment into every
+hook process, including hooks fired for subagent activity (verified
+2026-07-05). Events without a run id come from interactive Codex sessions
+in the repo and are ignored.
 
 Wired hook events (.codex/config.toml):
 - PreToolUse (Read-blocker, separate script)
@@ -31,15 +32,29 @@ from typing import Any
 
 
 # The project tree these events belong to comes from the configured
-# runner root (__file__-derivation is meaningless post-move): the GTM
+# runner root (__file__-derivation is meaningless post-move): the client
 # bridge shim (or the engine's inherited environment) supplies
-# AGENT_RUNNER_PROJECT_ROOT before this module imports.
-from agent_runner.util import ROOT
-EVENT_LOG = ROOT / ".local" / "codex_hooks" / "events.jsonl"
+# AGENT_RUNNER_PROJECT_ROOT / RUNNER_STATE_DIR before main() runs.
+from agent_runner import util
 
 
-def env_int(name: str) -> int | None:
-    value = os.environ.get(name)
+def event_log_path() -> Path:
+    return util.state_dir() / "codex_hooks" / "events.jsonl"
+
+
+def env_value(*names: str) -> str | None:
+    """First set value across the attribution fallback chain: the
+    runner-native RUNNER_* name first, then the legacy UFLO_* spelling
+    (co-emitted for one release)."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def env_int(*names: str) -> int | None:
+    value = env_value(*names)
     if not value:
         return None
     try:
@@ -49,8 +64,8 @@ def env_int(name: str) -> int | None:
 
 
 def main() -> None:
-    run_id = os.environ.get("UFLO_RUN_ID")
-    job_stable_id = os.environ.get("UFLO_JOB_STABLE_ID")
+    run_id = env_value("RUNNER_RUN_ID", "UFLO_RUN_ID")
+    job_stable_id = env_value("RUNNER_JOB_KEY", "UFLO_JOB_STABLE_ID")
     if not run_id or not job_stable_id:
         # Not an orchestrator-launched session; stay silent but keep the
         # contract that Subagent hooks expect JSON stdout.
@@ -86,19 +101,20 @@ def main() -> None:
         "last_assistant_message": payload.get("last_assistant_message"),
         "run_id": run_id,
         "job_stable_id": job_stable_id,
-        "attempt": env_int("UFLO_ATTEMPT"),
-        "phase": os.environ.get("UFLO_PHASE"),
-        "backend": os.environ.get("UFLO_BACKEND"),
-        "output_path": os.environ.get("UFLO_OUTPUT_PATH"),
+        "attempt": env_int("RUNNER_ATTEMPT", "UFLO_ATTEMPT"),
+        "phase": env_value("RUNNER_PHASE", "UFLO_PHASE"),
+        "backend": env_value("RUNNER_BACKEND", "UFLO_BACKEND"),
+        "output_path": env_value("RUNNER_OUTPUT_PATH", "UFLO_OUTPUT_PATH"),
     }
 
-    EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    event_log = event_log_path()
+    event_log.parent.mkdir(parents=True, exist_ok=True)
     # One O_APPEND write() per record: hook processes from parallel fan-out
     # agents share this file, and POSIX O_APPEND makes a single write atomic
     # with respect to offset, so records never interleave mid-line (a
     # buffered text-mode append can split one large record across syscalls).
     line = json.dumps(event, separators=(",", ":")) + "\n"
-    fd = os.open(EVENT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(event_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, line.encode("utf-8"))
     finally:

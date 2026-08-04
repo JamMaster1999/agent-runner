@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from agent_runner import util
 from agent_runner.runtime import RunnerError, RunnerJob
-from agent_runner.util import PROJECT_ROOT, read_tail
+from agent_runner.util import read_tail
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,7 @@ class HarnessAdapter(ABC):
         try:
             result = subprocess.run(
                 command,
-                cwd=PROJECT_ROOT,
+                cwd=util.project_root(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -174,6 +175,13 @@ class HarnessAdapter(ABC):
         """Harness-specific env quirks layered over the shared agent env."""
         return {}
 
+    def env_passthrough(self) -> tuple[str, ...]:
+        """Environment names this harness's CLI needs inherited from the
+        engine when the filtered agent environment is in effect (auth
+        tokens, CLI home overrides). Names only — the engine copies the
+        values from its own environment when present."""
+        return ()
+
     # NOTE (step-5 retype): the ``attempt_timeout_minutes``/``resume_allowed``
     # adapter slots are DELETED — both are submit data now
     # (``job.policy["attempt_timeout_minutes"]`` / ``job.policy["resume"]``,
@@ -189,7 +197,7 @@ class HarnessAdapter(ABC):
 
     # NOTE (extraction step 4, design §7.5): the consume_legacy_session hook
     # and the per-harness filesystem resume matchers are DELETED, not ported.
-    # Resume rights ride the pipeline_attempts store exclusively
+    # Resume rights ride the attempts store exclusively
     # (claim_resumable_attempt), pinned by tests/test_resume_claim_sql.py.
 
     # -- telemetry ---------------------------------------------------------

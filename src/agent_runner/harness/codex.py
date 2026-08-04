@@ -7,52 +7,52 @@ doctor/health commands — moved verbatim from the pre-adapter modules
 
 The legacy filesystem resume matcher (packet-membership match over
 .local/runs) was DELETED at extraction step 4 (design §7.5), not ported:
-every resumable thread is DB-tracked in pipeline_attempts, and resume
+every resumable thread is DB-tracked in the attempts store, and resume
 rights belong solely to claim_resumable_attempt — pinned by
-tests/test_resume_claim_sql.py. This module imports no GTM modules.
+tests/test_resume_claim_sql.py. This module imports no client modules.
 
-Step-5 retype: builders take the generic ``RunnerJob``; the phase-3 timeout
+Step-5 retype: builders take the generic ``RunnerJob``; the per-task timeout
 and never-resume branches left with the adapter policy slots (both are
-submit data, folded by the client's submit_policy). DIRECT_CODEX_AGENT_PHASES
-below is documented residual CALLER-vocabulary data retyped onto
-``job.task_type`` — it dies when ``agent_ref`` becomes a structured AgentDef
-at extraction (plan §2, gray zone 4)."""
+submit data, folded by the client's submit policy). Agent configuration is
+submit DATA too (``job.agent_config``): the adapter never gates on
+``task_type`` and never reads the client's rendered discovery files at
+spawn time — the 2026-08-04 phase-name-enumeration bug class is
+structurally gone."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
-import tomllib
 from pathlib import Path
 from typing import Any, ClassVar
 
+from agent_runner import util
 from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
 from agent_runner.runtime import RunnerError, RunnerJob
-from agent_runner.util import PROJECT_ROOT, ROOT
 from agent_runner.harness.codex_stream import CodexStreamParser
 
 
+# Standard macOS app-bundle install locations, tried after PATH; the
+# RUNNER_CODEX_CLI environment variable overrides both.
 CODEX_CLI_FALLBACKS = (
     Path("/Applications/Codex.app/Contents/Resources/codex"),
     Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
 )
-HOOK_EVENT_LOG = ROOT / ".local" / "codex_hooks" / "events.jsonl"
-DIRECT_CODEX_AGENT_PHASES = {"phase1", "phase2", "phase3_5", "phase4", "phase6"}
 
 
 def codex_command() -> str | None:
+    override = os.environ.get("RUNNER_CODEX_CLI")
+    if override and Path(override).exists():
+        return override
     if found := shutil.which("codex"):
         return found
     for fallback in CODEX_CLI_FALLBACKS:
         if fallback.exists():
             return str(fallback)
     return None
-
-
-def uses_direct_codex_agent(job: RunnerJob) -> bool:
-    return job.task_type in DIRECT_CODEX_AGENT_PHASES
 
 
 def toml_cli_value(value: Any) -> str:
@@ -82,31 +82,32 @@ def flattened_codex_config(prefix: str, value: Any) -> list[tuple[str, Any]]:
 
 
 def codex_agent_config_args(job: RunnerJob) -> list[str]:
-    if not uses_direct_codex_agent(job):
+    """The `-c dotted.key=value` overrides delivering the job's agent
+    configuration to `codex exec`.
+
+    ``job.agent_config`` is submit DATA (the whole table is delivered
+    verbatim — the client prunes its own metadata keys before submitting).
+    None with a named agent is a LOUD error, never a silent unconfigured
+    spawn: the old task_type gate dropped every override — model, tool
+    restrictions, developer_instructions — for any task name outside one
+    client's phase list, with no error (2026-08-04 incident). An explicit
+    {} means a deliberately unconfigured session (a parent session driving
+    its own subagents)."""
+    if job.agent_config is None:
+        if job.agent_ref:
+            raise RunnerError(
+                f"{job.key}: codex job names agent {job.agent_ref!r} but the "
+                "submit carried no agent_config. Submit the agent's config "
+                "table (SubmitRequest.agent_config), or an explicit {} for a "
+                "deliberately unconfigured session.",
+                code="missing_codex_agent_config",
+                retryable=False,
+                alert=True,
+            )
         return []
-    path = ROOT / ".codex" / "agents" / f"{job.agent_ref}.toml"
-    try:
-        config = tomllib.loads(path.read_text())
-    except FileNotFoundError as exc:
-        raise RunnerError(
-            f"Rendered Codex agent config not found: {path}",
-            code="missing_codex_agent_config",
-            retryable=False,
-            alert=True,
-        ) from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise RunnerError(
-            f"Rendered Codex agent config is invalid TOML: {path}",
-            code="invalid_codex_agent_config",
-            retryable=False,
-            alert=True,
-            details=str(exc),
-        ) from exc
 
     args: list[str] = []
-    for key, value in config.items():
-        if key in {"name", "description", "nickname_candidates"}:
-            continue
+    for key, value in job.agent_config.items():
         for dotted_key, dotted_value in flattened_codex_config(key, value):
             args.extend(["-c", f"{dotted_key}={toml_cli_value(dotted_value)}"])
     return args
@@ -149,7 +150,7 @@ def codex_exec_command(final_message_path: Path, job: RunnerJob) -> list[str]:
         "exec",
         "--json",
         "--cd",
-        str(PROJECT_ROOT),
+        str(util.project_root()),
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
         "--output-last-message",
@@ -296,7 +297,7 @@ class CodexAdapter(HarnessAdapter):
         try:
             result = subprocess.run(
                 [command, "doctor", "--json"],
-                cwd=PROJECT_ROOT,
+                cwd=util.project_root(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -331,6 +332,9 @@ class CodexAdapter(HarnessAdapter):
         else:
             items = []
 
+        # terminal.env: codex doctor flags a non-interactive terminal
+        # environment, which is exactly what a headless engine spawn is —
+        # never evidence of a broken CLI.
         ignored_failures = {"terminal.env"}
         hard_failures = [
             {
@@ -412,6 +416,10 @@ class CodexAdapter(HarnessAdapter):
             stderr_path=directory / "codex.repair.stderr.log",
         )
 
+    def env_passthrough(self) -> tuple[str, ...]:
+        # CLI auth/home names the filtered agent env must inherit.
+        return ("CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "RUNNER_CODEX_CLI")
+
     def session_ref_from_log(self, stdout_path: Path) -> str | None:
         return codex_thread_id(stdout_path)
 
@@ -419,7 +427,7 @@ class CodexAdapter(HarnessAdapter):
         return CodexStreamParser()
 
     def hook_event_log(self) -> Path:
-        return HOOK_EVENT_LOG
+        return util.state_dir() / "codex_hooks" / "events.jsonl"
 
     def normalize_hook_event(
         self, event: dict[str, Any], agent_name: str

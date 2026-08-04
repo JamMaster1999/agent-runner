@@ -22,6 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 # then put src/ on sys.path when agent_runner is not already importable (the
 # no-pip stdlib run — the same path the GTM bootstrap shim relies on).
 _os.environ.setdefault("AGENT_RUNNER_PROJECT_ROOT", str(REPO))
+_os.environ.setdefault("RUNNER_PROJECT_ID", "testproj")
 try:
     import agent_runner  # noqa: F401
 except ImportError:
@@ -69,9 +70,9 @@ class CodexStreamParserTest(unittest.TestCase):
         self.assertIsNone(events[0].tok_cache_write)
         self.assertIsNone(events[0].cost_usd)
 
-    def test_turn_completed_cache_write_never_typed(self) -> None:
-        # Real codex captures carry cache_write_input_tokens, but the message
-        # does not render it; typing it would break typed==regex parity.
+    def test_turn_completed_cache_write_is_typed(self) -> None:
+        # Typed fields are the consumer contract; the message renders no
+        # cache-write number (display only), but the typed column carries it.
         events = self.parse(
             {
                 "type": "turn.completed",
@@ -83,7 +84,8 @@ class CodexStreamParserTest(unittest.TestCase):
                 },
             }
         )
-        self.assertIsNone(events[0].tok_cache_write)
+        self.assertEqual(events[0].tok_cache_write, 999)
+        self.assertNotIn("999", events[0].message)
         self.assertEqual(events[0].tok_input, 10)
 
     def test_turn_completed_missing_usage_key_stays_untyped(self) -> None:

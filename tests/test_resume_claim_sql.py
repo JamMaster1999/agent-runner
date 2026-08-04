@@ -46,6 +46,7 @@ REPO = Path(__file__).resolve().parents[1]
 # then put src/ on sys.path when agent_runner is not already importable (the
 # no-pip stdlib run — the same path the GTM bootstrap shim relies on).
 _os.environ.setdefault("AGENT_RUNNER_PROJECT_ROOT", str(REPO))
+_os.environ.setdefault("RUNNER_PROJECT_ID", "testproj")
 try:
     import agent_runner  # noqa: F401
 except ImportError:
@@ -127,6 +128,12 @@ class ResumeClaimSqlTest(unittest.TestCase):
         # migrations and the claim SQL fails here first.
         for path in migrations.migration_paths():
             _scratch_rows(path.read_text())
+        # 001 seeds no tenant (the runner refuses to guess one); register the
+        # test tenant the way a run start does (jobstore.ensure_project).
+        _scratch_rows(
+            "INSERT INTO projects (project_id, name)"
+            " VALUES ('testproj', 'testproj') ON CONFLICT DO NOTHING"
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:

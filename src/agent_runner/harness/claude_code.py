@@ -6,7 +6,7 @@ step 5).
 
 The legacy filesystem resume matcher (packet-membership match over
 .local/runs) was DELETED at extraction step 4 (design §7.5), not ported:
-every resumable session is DB-tracked in pipeline_attempts, and resume
+every resumable session is DB-tracked in the attempts store, and resume
 rights belong solely to claim_resumable_attempt — pinned by
 tests/test_resume_claim_sql.py. This module imports no GTM modules.
 
@@ -22,13 +22,10 @@ import shutil
 from pathlib import Path
 from typing import Any, ClassVar
 
+from agent_runner import util
 from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
 from agent_runner.runtime import RunnerError, RunnerJob
-from agent_runner.util import ROOT
 from agent_runner.harness.claude_stream import ClaudeStreamParser
-
-
-CLAUDE_HOOK_EVENT_LOG = ROOT / ".local" / "claude_hooks" / "events.jsonl"
 
 
 def yaml_scalar(value: object) -> str:
@@ -167,20 +164,50 @@ class ClaudeCodeAdapter(HarnessAdapter):
         return "\n".join(lines) + "\n\n" + agent.body
 
     def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
+        # The rendered discovery file is this adapter's own materialize_agent
+        # dialect; a missing one used to surface as an opaque CLI error that
+        # burned the full retry budget — check it up front and fail loudly.
+        agent_path = util.project_root() / ".claude" / "agents" / f"{job.agent_ref}.md"
+        if not agent_path.is_file():
+            raise RunnerError(
+                f"{job.key}: rendered Claude agent not found: {agent_path}. "
+                "Materialize the agent (materialize_agent -> "
+                ".claude/agents/<name>.md under the project root) before "
+                "spawning.",
+                code="missing_claude_agent",
+                retryable=False,
+                alert=True,
+            )
+        command = [
+            "claude",
+            "--agent",
+            job.agent_ref,
+            "--permission-mode",
+            "bypassPermissions",
+        ]
+        # Tool restrictions are submit DATA (policy["disallowed_tools"]), not
+        # a business rule baked into every spawn: the old hard-coded
+        # "--disallowedTools=Read,Bash" was one client's no-local-reads
+        # policy applied silently to every client.
+        disallowed = job.policy.get("disallowed_tools") or []
+        if disallowed:
+            command.append("--disallowedTools=" + ",".join(str(t) for t in disallowed))
+        # Setting-source isolation as submit data: e.g. ["project"] keeps the
+        # operator's user-global Claude state (plugins, skills, personal
+        # memory) out of production sessions — the claude-side counterpart of
+        # a client pinning its codex CODEX_HOME.
+        sources = job.policy.get("setting_sources")
+        if sources is not None:
+            command += ["--setting-sources", ",".join(str(s) for s in sources)]
+        command += [
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-hook-events",
+        ]
         return SpawnSpec(
-            command=[
-                "claude",
-                "--agent",
-                job.agent_ref,
-                "--permission-mode",
-                "bypassPermissions",
-                "--disallowedTools=Read,Bash",
-                "--print",
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--include-hook-events",
-            ],
+            command=command,
             stdout_path=directory / "claude.stdout.log",
             stderr_path=directory / "claude.stderr.log",
         )
@@ -196,6 +223,10 @@ class ClaudeCodeAdapter(HarnessAdapter):
     def env_overrides(self) -> dict[str, str]:
         return {"CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS": "10000"}
 
+    def env_passthrough(self) -> tuple[str, ...]:
+        # CLI auth + config-home names the filtered agent env must inherit.
+        return ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR")
+
     def session_ref_from_log(self, stdout_path: Path) -> str | None:
         return claude_session_id(stdout_path)
 
@@ -203,7 +234,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
         return ClaudeStreamParser()
 
     def hook_event_log(self) -> Path:
-        return CLAUDE_HOOK_EVENT_LOG
+        return util.state_dir() / "claude_hooks" / "events.jsonl"
 
     def normalize_hook_event(
         self, event: dict[str, Any], agent_name: str

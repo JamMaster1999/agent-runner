@@ -22,9 +22,12 @@ job_event script died at step 7.
 
 ``ROOT``/``PROJECT_ROOT`` are no longer ``__file__``-derived (meaningless
 post-move): they come from the ``AGENT_RUNNER_PROJECT_ROOT`` environment
-variable — set by the GTM bootstrap shim (``core/_runner_path.py``), the
-engine's agent environment, or a test header — and point at the client
-project tree (attempt dirs and the ``.local/*_hooks`` logs).
+variable — set by the client's bootstrap shim, the engine's agent
+environment, or a test header — and point at the client project workspace
+(attempt dirs and the runner state directory). Resolution is LAZY (PEP 562
+module __getattr__ + the ``project_root()``/``state_dir()`` accessors): the
+package imports fine without the variable, and only the first actual path
+use raises when it is unset.
 """
 
 from __future__ import annotations
@@ -36,18 +39,41 @@ from typing import Any, Callable
 
 from agent_runner.runtime import RunnerError
 
-_root_env = os.environ.get("AGENT_RUNNER_PROJECT_ROOT")
-if not _root_env:
-    raise RuntimeError(
-        "AGENT_RUNNER_PROJECT_ROOT is not set. Since extraction step 6 the "
-        "runner resolves the client project tree (attempt dirs, .local "
-        "logs) through this variable instead of __file__. Set it to the "
-        "project root before importing agent_runner modules, or import "
-        "through the GTM bootstrap (from core import _runner_path), which "
-        "sets it automatically."
-    )
-ROOT = Path(_root_env).resolve()
-PROJECT_ROOT = ROOT
+
+def project_root() -> Path:
+    """The client project workspace root, from AGENT_RUNNER_PROJECT_ROOT.
+
+    Read at call time: importing the package never requires the variable —
+    only spawning agents, resolving attempt dirs, or writing runner state
+    does. Raises loudly when unset."""
+    root_env = os.environ.get("AGENT_RUNNER_PROJECT_ROOT")
+    if not root_env:
+        raise RuntimeError(
+            "AGENT_RUNNER_PROJECT_ROOT is not set. The runner resolves the "
+            "client project workspace (attempt dirs, runner state logs) "
+            "through this variable. Set it to the workspace root before "
+            "using path-dependent runner operations."
+        )
+    return Path(root_env).resolve()
+
+
+def state_dir() -> Path:
+    """Where the runner keeps its local state (hook logs, notification log,
+    debug artifacts): RUNNER_STATE_DIR when set, else ``<project_root>/.local``
+    (the historical layout)."""
+    override = os.environ.get("RUNNER_STATE_DIR")
+    if override:
+        return Path(override).resolve()
+    return project_root() / ".local"
+
+
+def __getattr__(name: str):
+    # Back-compat lazy module attributes: `from agent_runner.util import ROOT`
+    # resolves at the importing module's import time, so modules that need
+    # import-without-env must call project_root() at use time instead.
+    if name in ("ROOT", "PROJECT_ROOT"):
+        return project_root()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _psycopg():

@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parents[1]
 # then put src/ on sys.path when agent_runner is not already importable (the
 # no-pip stdlib run — the same path the GTM bootstrap shim relies on).
 _os.environ.setdefault("AGENT_RUNNER_PROJECT_ROOT", str(REPO))
+_os.environ.setdefault("RUNNER_PROJECT_ID", "testproj")
 try:
     import agent_runner  # noqa: F401
 except ImportError:
@@ -70,9 +71,9 @@ class ResumeFingerprintTest(unittest.TestCase):
         # substituted prompts they received differ.
         template = synthetic_template()
         fingerprint = attempts.resume_prompt_fingerprint(template)
-        prompt_a = substitute(template, runner_variables("run-a", 1, Path("/tmp/run-a")))
+        prompt_a = substitute(template, runner_variables("run-a", "job-1", 1, Path("/tmp/run-a")))
         prompt_b = substitute(
-            template, runner_variables("run-b", 3, Path("/tmp/run-b/attempt-03"))
+            template, runner_variables("run-b", "job-1", 3, Path("/tmp/run-b/attempt-03"))
         )
         self.assertNotEqual(prompt_a, prompt_b)
         self.assertEqual(fingerprint, attempts.resume_prompt_fingerprint(template))

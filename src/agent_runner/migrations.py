@@ -75,25 +75,21 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 """
 
-# Tables that prove the target database belongs to a CLIENT. Any one of them
-# means this is the GTM/CRM database, not the runner's: the pipeline_* four
-# are the compat-bridge tables the runner itself wrote until step 8, the rest
-# are GTM business tables. Nothing here is a runner table, so the list can
-# never reject a correct target.
-CLIENT_TABLES = (
-    "pipeline_jobs",
-    "pipeline_events",
-    "pipeline_runs",
-    "pipeline_attempts",
-    "pipeline_manager_events",
-    "run_requests",
-    "enrichment_runs",
-    "institutions",
-    "instructors",
-    "departments",
-    "sections",
-    "courses",
-    "teaching_assignments",
+# The complete set of public-schema tables a runner database legitimately
+# contains. The client-database guard inverts the old blocklist: instead of
+# recognizing ONE client's table names (useless against any other client's
+# production database), any public table outside this set marks the target
+# as somebody else's database. Extend this tuple when a migration adds a
+# table.
+RUNNER_TABLES = (
+    "schema_migrations",
+    "projects",
+    "jobs",
+    "attempts",
+    "events",
+    "leases",
+    "accounts",
+    "account_usage",
 )
 
 # The one file in db/roles that touches the CLUSTER (CREATE ROLE, COMMENT ON
@@ -231,13 +227,18 @@ def _ledger_columns(conn: Any) -> set[str]:
     return {row[0] for row in rows}
 
 
-def client_tables_present(conn: Any) -> list[str]:
-    """CLIENT_TABLES that exist in the target's public schema."""
+def foreign_tables_present(conn: Any) -> list[str]:
+    """Public-schema tables in the target that are NOT runner tables.
+
+    Any such table means the target already belongs to somebody — a client
+    production database, a different service — and the runner schema must
+    not land in it. An empty (or runner-only) database passes."""
     rows = conn.execute(
         "SELECT table_name FROM information_schema.tables"
-        " WHERE table_schema = 'public' AND table_name = ANY(%s)"
+        " WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+        " AND NOT (table_name = ANY(%s))"
         " ORDER BY table_name",
-        (list(CLIENT_TABLES),),
+        (list(RUNNER_TABLES),),
     ).fetchall()
     return [row[0] for row in rows]
 
@@ -263,22 +264,23 @@ def foreign_ledger_prefixes(conn: Any) -> list[str]:
 def assert_runner_target(conn: Any, *, allow_foreign: bool = False) -> None:
     """Refuse to write the runner schema into somebody else's database.
 
-    docs/schema.md promises the migrations never touch the GTM database;
+    docs/schema.md promises the migrations never touch a client database;
     this function is what makes that a property of the code rather than a
     sentence in a doc. Two independent tells, either one fatal:
 
-    - a CLIENT_TABLES table in the target (GTM business tables, or the
-      pipeline_* bridge tables the runner itself wrote until step 8);
-    - a ledger row under a foreign prefix (the GTM/CRM shared ledger).
+    - any public-schema table that is not a runner table (the allowlist
+      inversion: a guard that recognizes only one client's table names is
+      no guard at all against a second client's database);
+    - a ledger row under a foreign prefix (a shared client-owned ledger).
 
     Both are cheap, both are read-only, and neither can fire on a correct
-    target: a runner database has none of those tables and no ledger rows
+    target: a runner database has no foreign tables and no ledger rows
     but its own. ``allow_foreign`` (``--i-know-this-is-the-runner-db``) is
     the deliberate override, and it warns rather than going quiet — a
     one-database deployment that really does co-host both schemas has to say
     so on every apply.
     """
-    tables = client_tables_present(conn)
+    tables = foreign_tables_present(conn)
     prefixes = foreign_ledger_prefixes(conn)
     if not tables and not prefixes:
         return
@@ -286,7 +288,8 @@ def assert_runner_target(conn: Any, *, allow_foreign: bool = False) -> None:
     database = conn.execute("SELECT current_database()").fetchone()[0]
     tells = []
     if tables:
-        tells.append("client tables present (" + ", ".join(tables) + ")")
+        shown = ", ".join(tables[:12]) + (" …" if len(tables) > 12 else "")
+        tells.append("non-runner tables present (" + shown + ")")
     if prefixes:
         tells.append("foreign ledger rows under " + ", ".join(prefixes))
     detail = f"Target database {database!r}: " + "; ".join(tells) + "."
