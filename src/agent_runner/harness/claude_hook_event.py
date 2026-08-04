@@ -17,15 +17,18 @@ from typing import Any
 
 
 # The project tree these events belong to comes from the configured
-# runner root (__file__-derivation is meaningless post-move): the GTM
+# runner root (__file__-derivation is meaningless post-move): the client
 # bridge shim (or the engine's inherited environment) supplies
-# AGENT_RUNNER_PROJECT_ROOT before this module imports.
-from agent_runner.util import ROOT
-EVENT_LOG = ROOT / ".local" / "claude_hooks" / "events.jsonl"
+# AGENT_RUNNER_PROJECT_ROOT / RUNNER_STATE_DIR before main() runs.
+from agent_runner import util
 
 
-def env_int(name: str) -> int | None:
-    value = os.environ.get(name)
+def event_log_path() -> Path:
+    return util.state_dir() / "claude_hooks" / "events.jsonl"
+
+
+def env_int(*names: str) -> int | None:
+    value = env_value(*names)
     if not value:
         return None
     try:
@@ -34,9 +37,20 @@ def env_int(name: str) -> int | None:
         return None
 
 
+def env_value(*names: str) -> str | None:
+    """First set value across the attribution fallback chain: the
+    runner-native RUNNER_* name first, then the legacy UFLO_* spelling
+    (co-emitted for one release)."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 def main() -> None:
-    run_id = os.environ.get("UFLO_RUN_ID")
-    job_stable_id = os.environ.get("UFLO_JOB_STABLE_ID")
+    run_id = env_value("RUNNER_RUN_ID", "UFLO_RUN_ID")
+    job_stable_id = env_value("RUNNER_JOB_KEY", "UFLO_JOB_STABLE_ID")
     if not run_id or not job_stable_id:
         return
 
@@ -50,7 +64,8 @@ def main() -> None:
         "at": datetime.now(timezone.utc).isoformat(),
         "hook_event_name": payload.get("hook_event_name"),
         "provider": "claude",
-        "agent_type": payload.get("agent_type") or os.environ.get("UFLO_AGENT_NAME"),
+        "agent_type": payload.get("agent_type")
+        or env_value("RUNNER_AGENT_NAME", "UFLO_AGENT_NAME"),
         "agent_id": payload.get("agent_id"),
         "session_id": payload.get("session_id"),
         "transcript_path": payload.get("transcript_path"),
@@ -65,19 +80,20 @@ def main() -> None:
         "reason": payload.get("reason"),
         "run_id": run_id,
         "job_stable_id": job_stable_id,
-        "phase": os.environ.get("UFLO_PHASE"),
-        "backend": os.environ.get("UFLO_BACKEND"),
-        "attempt": env_int("UFLO_ATTEMPT"),
-        "output_path": os.environ.get("UFLO_OUTPUT_PATH"),
+        "phase": env_value("RUNNER_PHASE", "UFLO_PHASE"),
+        "backend": env_value("RUNNER_BACKEND", "UFLO_BACKEND"),
+        "attempt": env_int("RUNNER_ATTEMPT", "UFLO_ATTEMPT"),
+        "output_path": env_value("RUNNER_OUTPUT_PATH", "UFLO_OUTPUT_PATH"),
     }
 
-    EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    event_log = event_log_path()
+    event_log.parent.mkdir(parents=True, exist_ok=True)
     # One O_APPEND write() per record: hook processes from parallel fan-out
     # agents share this file, and POSIX O_APPEND makes a single write atomic
     # with respect to offset, so records never interleave mid-line (a
     # buffered text-mode append can split one large record across syscalls).
     line = json.dumps(event, separators=(",", ":")) + "\n"
-    fd = os.open(EVENT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(event_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, line.encode("utf-8"))
     finally:

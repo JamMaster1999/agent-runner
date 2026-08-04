@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 # then put src/ on sys.path when agent_runner is not already importable (the
 # no-pip stdlib run — the same path the GTM bootstrap shim relies on).
 _os.environ.setdefault("AGENT_RUNNER_PROJECT_ROOT", str(REPO))
+_os.environ.setdefault("RUNNER_PROJECT_ID", "testproj")
 try:
     import agent_runner  # noqa: F401
 except ImportError:
@@ -103,6 +104,12 @@ class TypedUsageParityMixin:
             return
         scraped = regex_usage(event.message)
         for field in TOKEN_FIELDS:
+            # Typed fields are the consumer contract; the message is display
+            # only. A regex scrape of the message, WHERE IT FINDS a value,
+            # must agree with typed — but typed may carry values the message
+            # never renders (codex tok_cache_write).
+            if scraped[field] is None:
+                continue
             self.assertEqual(
                 getattr(event, field),
                 scraped[field],
@@ -126,7 +133,13 @@ class TypedUsageParityMixin:
         usage_events = [e for e in events if e.event in USAGE_EVENT_KINDS]
         scraped = [regex_usage(e.message) for e in usage_events]
         for field in TOKEN_FIELDS:
-            typed_sum = sum(getattr(e, field) or 0 for e in usage_events)
+            # Column-wise form of the same contract: sum only where the
+            # scrape found a value, so typed-only fields never trip it.
+            typed_sum = sum(
+                getattr(e, field) or 0
+                for e, s in zip(usage_events, scraped)
+                if s[field] is not None
+            )
             regex_sum = sum(s[field] or 0 for s in scraped)
             self.assertEqual(typed_sum, regex_sum, f"{context}: SUM({field}) mismatch")
         typed_cost = sum(e.cost_usd or 0.0 for e in usage_events)
@@ -157,10 +170,15 @@ class FixtureParityTest(TypedUsageParityMixin, unittest.TestCase):
         for event in events:
             self.assert_event_parity(event, "codex fixture")
         self.assert_sum_parity(events, "codex fixture")
-        # Codex never types cache write or cost, even when the raw payload
-        # carries cache_write_input_tokens (the message renders neither).
+        # Codex types cache write when the raw payload carries
+        # cache_write_input_tokens (typed is authoritative; the message
+        # renders neither cache write nor cost). Cost stays None: the codex
+        # stream carries no dollars.
+        self.assertTrue(
+            any(event.tok_cache_write is not None for event in completed),
+            "fixture carries cache_write_input_tokens; typed field must land",
+        )
         for event in completed:
-            self.assertIsNone(event.tok_cache_write)
             self.assertIsNone(event.cost_usd)
 
     def test_claude_fixture_parity(self) -> None:

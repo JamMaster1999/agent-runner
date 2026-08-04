@@ -1,9 +1,13 @@
 """Codex stream dialect: ``codex exec --json`` JSONL -> StreamEvents.
 
 Lands beside its adapter (extraction step 6, plan §1); pure line-in/
-events-out so captured ``codex.stdout.jsonl`` files replay offline. The
-usage message strings are load-bearing: the dashboard parses token numbers
-back out of them (typed==regex parity, pinned by tests/test_usage_parity.py).
+events-out so captured ``codex.stdout.jsonl`` files replay offline.
+
+Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
+consumer API — event messages are display-only. Message wording stays
+stable because old consumers may still regex-scrape pre-typed rows, and
+tests/test_usage_parity.py pins that a message-scrape never DISAGREES with
+the typed fields (typed may know more than the message renders).
 """
 
 from __future__ import annotations
@@ -55,14 +59,17 @@ class CodexStreamParser:
                     f"cached {usage.get('cached_input_tokens')}, "
                     f"output {usage.get('output_tokens')} tokens)"
                 )
-            # tok_cache_write stays None: the message never renders codex's
-            # cache_write_input_tokens, so typing it would break typed==regex
-            # parity. cost_usd stays None: the codex stream carries no dollars.
+            # Typed fields are authoritative: tok_cache_write is populated
+            # even though the display message never renders it (a scrape of
+            # the message yields nothing for it, which never DISAGREES with
+            # typed — the parity contract). cost_usd stays None: the codex
+            # stream carries no dollars.
             return [
                 StreamEvent(
                     "turn_completed",
                     f"Codex turn completed{detail}",
                     tok_input=typed_token(usage.get("input_tokens")),
+                    tok_cache_write=typed_token(usage.get("cache_write_input_tokens")),
                     tok_cache_read=typed_token(usage.get("cached_input_tokens")),
                     tok_output=typed_token(usage.get("output_tokens")),
                 )

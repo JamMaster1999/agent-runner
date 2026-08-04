@@ -65,11 +65,16 @@ class SubmitRequest:
     request instead of a bind registry. ``prompt_ref['sha256']`` MUST equal
     the resume fingerprint digest of the pre-substitution template
     (attempts.resume_prompt_fingerprint), or existing sessions silently stop
-    matching. A submit may omit ``prompt_ref`` (late binding: phase2/
-    synthesis templates depend on earlier outputs); a second upsert submit
-    carrying the template must land before await_outcome. ``client_refs``
-    is TRANSITIONAL: {'institution_id': uuid} for the legacy business
-    columns and lease resolution — it dies at cutover (plan §3)."""
+    matching. A submit may omit ``prompt_ref`` (late binding: templates may
+    depend on earlier outputs); a second upsert submit carrying the template
+    must land before await_outcome.
+
+    ``agent_config`` is the named agent's per-harness config table as DATA:
+    the runner delivers exactly this table to the harness CLI and never
+    reads the client's source tree for it. None means "unspecified" — a
+    loud submit-time error when ``agent_ref`` is set — and {} means a
+    deliberately unconfigured session (e.g. a parent session that drives
+    its own subagents)."""
 
     job_key: str
     group_key: str
@@ -81,6 +86,7 @@ class SubmitRequest:
     request_identity: str | None = None
     # step-4 growth (§2): the job as data.
     agent_ref: str = ""
+    agent_config: dict[str, Any] | None = None  # per-harness config table; {} = deliberately none
     prompt_ref: dict[str, str] | None = None  # {"template": raw text, "sha256": hex digest}
     artifact_contract: dict[str, Any] | None = None
     # {"attempt_dir_name": spec key, "output_filename": phase output name,
@@ -91,9 +97,10 @@ class SubmitRequest:
     # e.g. [{"kind": "cdp_browser", "resumable": False}]
     required_env: list[str] = field(default_factory=list)
     policy: dict[str, Any] | None = None
-    # {"attempt_timeout_minutes": int, "resume": bool} — success stays a
-    # caller act via finish_task (R1); no success_message here.
-    client_refs: dict[str, str] = field(default_factory=dict)
+    # {"attempt_timeout_minutes": int, "resume": bool, and optional harness
+    # keys: "disallowed_tools": [tool, ...], "resume_preamble": str} —
+    # success stays a caller act via finish_task (R1); no success_message
+    # here.
 
 
 @dataclass(frozen=True)

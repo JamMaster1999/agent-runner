@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 # then put src/ on sys.path when agent_runner is not already importable (the
 # no-pip stdlib run — the same path the GTM bootstrap shim relies on).
 _os.environ.setdefault("AGENT_RUNNER_PROJECT_ROOT", str(REPO))
+_os.environ.setdefault("RUNNER_PROJECT_ID", "testproj")
 try:
     import agent_runner  # noqa: F401
 except ImportError:

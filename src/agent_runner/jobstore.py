@@ -4,10 +4,9 @@ Step-9 retype: every statement targets the runner database's own schema
 (db/migrations — ``jobs``/``events``/``leases``), scoped by
 ``runtime.project_id()``. The caller-facing surface is unchanged: entry
 points take the generic ``RunnerJob`` (or plain scalars) and raise
-``RunnerError``. What used to be GTM columns rides as data now —
-``agent_ref``/``artifact_contract``/``policy`` jsonb, ``unit_type``/
-``unit_key`` inside ``labels`` — and the transitional
-``client_refs['institution_id']`` business ref dies here (plan §3).
+``RunnerError``. What used to be client columns rides as data now —
+``agent_ref``/``artifact_contract``/``policy`` jsonb, display keys inside
+``labels`` (opaque, caller-owned).
 """
 
 from __future__ import annotations
@@ -46,17 +45,17 @@ def ensure_job(
 
     ``force`` (--force-rerun) restores the old full reset.
 
-    GTM_RUN_REPLAY (set by the Modal run Function on incarnations after the
-    first) means this start is an auto-replay of the same intended run, not
-    a manual intervention: the upsert is metadata-only — no requeue, no
-    attempt reset (a replayed run would otherwise grant every terminally
-    failed job a fresh attempt budget per incarnation), and no force reset
-    (a replayed --force-rerun must resume, not restart from zero).
+    RUNNER_RUN_REPLAY (set by a supervisor on incarnations after the first;
+    the legacy GTM_RUN_REPLAY spelling is honored for one release) means
+    this start is an auto-replay of the same intended run, not a manual
+    intervention: the upsert is metadata-only — no requeue, no attempt reset
+    (a replayed run would otherwise grant every terminally failed job a
+    fresh attempt budget per incarnation), and no force reset (a replayed
+    --force-rerun must resume, not restart from zero).
     """
-    # Deferred (step 7): GTM_RUN_REPLAY stays the env gate verbatim; the
-    # generalization to a submit-level 'replay' flag is a behavior change
-    # that ships with the facade hardening, not with this relocation.
-    replay = bool(os.environ.get("GTM_RUN_REPLAY"))
+    replay = bool(
+        os.environ.get("RUNNER_RUN_REPLAY") or os.environ.get("GTM_RUN_REPLAY")
+    )
     assignments = [
         "task_type = EXCLUDED.task_type",
         "harness = EXCLUDED.harness",
@@ -147,10 +146,11 @@ ON CONFLICT (project_id, job_key) DO UPDATE SET
             # AgentDef as data (002): name now, per-harness config and the
             # prompt body ref as the submit surface grows into them.
             json.dumps({"name": job.agent_ref}),
-            # unit_type/unit_key were caller-vocabulary columns; they ride in
-            # labels now (display only — the dashboard reads
-            # labels->>'unit_key').
-            json.dumps({**job.labels, "unit_type": "institution", "unit_key": job.group_key}),
+            # Labels are the caller's opaque vocabulary and always win;
+            # unit_key defaults to the group key for display consumers but a
+            # caller-supplied value is never overwritten (the runner invents
+            # no caller vocabulary of its own).
+            json.dumps({"unit_key": job.group_key, **job.labels}),
             json.dumps({"canonical_path": job.canonical_relpath}),
             json.dumps({"max_attempts": max_attempts}),
             max_attempts,
@@ -323,7 +323,29 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
 LEASE_POLL_SECONDS = 5
-LEASE_WAIT_TIMEOUT_SECONDS = 3 * 3600  # a queued run waits out a full run ahead of it (~2h)
+# A queued run waits out a full run ahead of it. The default is sized for
+# multi-hour agent runs; RUNNER_LEASE_WAIT_SECONDS overrides per deployment.
+LEASE_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("RUNNER_LEASE_WAIT_SECONDS") or 3 * 3600
+)
+
+
+def ensure_project(url: str) -> None:
+    """Register this tenant's projects row (idempotent).
+
+    001 seeds nothing: the tenant is declared by RUNNER_PROJECT_ID and
+    self-registers on first contact — jobs/attempts/leases FK onto projects,
+    so this must run before the first run's writes (acquire_run_lease calls
+    it)."""
+    db_rows(
+        url,
+        """
+INSERT INTO projects (project_id, name)
+VALUES (%s, %s)
+ON CONFLICT DO NOTHING;
+""",
+        [project_id(), project_id()],
+    )
 
 
 def acquire_run_lease(
@@ -337,10 +359,12 @@ def acquire_run_lease(
 ) -> None:
     """Take the run lease for ``lease_key``, reaping a stale holder first.
 
-    ``lease_key`` is the caller's opaque exclusivity name (today the
-    institution stable_id) — with the step-9 schema it IS the key the
-    partial unique index locks on; the old transitional ``institution_id``
-    business column died with the cutover (plan §3).
+    ``lease_key`` is the caller's opaque exclusivity name — with the step-9
+    schema it IS the key the partial unique index locks on.
+
+    Also self-registers the tenant's projects row (``ensure_project``): this
+    is the first store write of every run, and jobs/attempts/leases FK onto
+    projects.
 
     Lease, not advisory lock: DB access is short-lived one-shot connections,
     so a session-scoped lock cannot be held. The partial unique index
@@ -350,12 +374,13 @@ def acquire_run_lease(
 
     A held lease queues rather than fails: the acquire is retried every
     ``poll_seconds`` until ``timeout_seconds`` expires, so a concurrent run
-    for the same institution waits out the one ahead of it (a full run can
-    take ~2h, hence the generous default). Each retry re-runs the stale-holder
-    reap above, so a holder that dies mid-wait is taken over once its
-    heartbeat crosses ``stale_seconds``. The uncontended path is unchanged:
-    the first attempt acquires immediately, no sleep.
+    for the same lease key waits out the one ahead of it (a full run can
+    take hours, hence the generous default). Each retry re-runs the
+    stale-holder reap above, so a holder that dies mid-wait is taken over
+    once its heartbeat crosses ``stale_seconds``. The uncontended path is
+    unchanged: the first attempt acquires immediately, no sleep.
     """
+    ensure_project(url)
     reap_sql = """
 UPDATE leases
 SET status = 'expired', finished_at = now()
@@ -402,7 +427,7 @@ WHERE project_id = %s AND lease_key = %s AND status = 'held';
         if now >= deadline:
             holder = current_holder()
             raise RunnerError(
-                f"Another orchestrator run still holds the lease for this institution "
+                f"Another run still holds the lease for {lease_key!r} "
                 f"after a {int(timeout_seconds)}s wait: {holder or 'unknown'}. The wait "
                 f"loop reaps stale holders (heartbeat > {stale_seconds}s), so the holder "
                 f"is live and heartbeating; retry after it finishes.",
@@ -426,22 +451,29 @@ def release_run_lease(url: str, run_id: str, outcome: str) -> None:
     """Release the run lease (the leases UPDATE).
 
     This is the LEASE half of what used to be finalize_run. Release is
-    release however the work went (005's status mapping: succeeded /
-    succeeded_with_failures / failed / cancelled all land 'released'); the
-    run SUMMARY — the pipeline manager's judgment, including ``outcome`` —
-    is GTM's and lives in enrichment_runs. ``outcome`` stays in the
-    signature for the callers that pass it, and an exclusive lease leaves
-    the leases outcome columns NULL by design (005: nobody judges a lock).
+    release however the work went (005's status mapping: every caller
+    outcome lands 'released'); the run SUMMARY — the pipeline manager's
+    judgment — stays a client concern. ``outcome`` is the caller's opaque
+    run-outcome vocabulary and is RECORDED, not discarded: it lands on the
+    audit trail as a 'lease_released' event fenced to the release actually
+    happening (same statement), since the leases outcome column carries a
+    CHECK the caller's vocabulary must not be forced through.
     """
-    del outcome  # recorded GTM-side (enrichment_runs); a lock has no verdict
     db_rows(
         url,
         """
-UPDATE leases
-SET status = 'released', finished_at = now()
-WHERE project_id = %s AND lease_ref = %s AND status = 'held';
+WITH released AS (
+  UPDATE leases
+  SET status = 'released', finished_at = now()
+  WHERE project_id = %s AND lease_ref = %s AND status = 'held'
+  RETURNING lease_key
+)
+INSERT INTO events (project_id, lease_ref, kind, message)
+SELECT %s, %s, 'lease_released',
+       'Run lease released for ' || lease_key || ' (caller outcome: ' || %s || ')'
+FROM released;
 """,
-        [project_id(), run_id],
+        [project_id(), run_id, project_id(), run_id, outcome or "unspecified"],
     )
 
 
@@ -589,7 +621,7 @@ RETURNING job_key || ' -> reaped';
             pattern for adapter in adapters for pattern in adapter.orphan_patterns()
         )
         print(
-            "Reaper note: if the previous orchestrator was hard-killed, check for orphan "
+            "Reaper note: if the previous runner process was hard-killed, check for orphan "
             f"{names} processes still writing attempt dirs (pgrep -fl '{patterns}')."
         )
 

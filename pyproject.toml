@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runner"
-version = "0.2.1"   # 0.2.1: transient-DB-stall resilience (PR #6); 0.2.0: step-10.5 append-only agent emit
-description = "Generic agent-CLI job runner extracted from the Uflo GTM pipeline (extraction plan step 6)."
+version = "0.3.0"   # 0.3.0: client-agnostic hardening (agent_config as submit data, strict tenant, filtered agent env); 0.2.1: transient-DB-stall resilience (PR #6)
+description = "Generic agent-CLI job runner: jobs, attempts, leases, and events over Postgres for any client pipeline."
 requires-python = ">=3.13"        # matches Mac system python3 (3.13.3), venv-modal, GTM CI
 dependencies = ["psycopg[binary]==3.3.4"]   # reviewed cutover transport; lazy import preserves stdlib contract
 

@@ -58,6 +58,7 @@ from agent_runner.jobstore import (
 )
 from agent_runner.runtime import (
     AttemptResult,
+    RunnerConfig,
     RunnerError,
     RunnerJob,
     attempt_dir,
@@ -65,7 +66,8 @@ from agent_runner.runtime import (
     project_id,
 )
 from agent_runner.templates import substitute
-from agent_runner.util import PROJECT_ROOT, db_rows, write_text
+from agent_runner import util
+from agent_runner.util import db_rows, write_text
 from agent_runner.harness.stream import JsonlTail, StreamEvent
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,9 @@ SIGNAL_BY_CATEGORY: dict[str, str] = {
 # INFRASTRUCTURE_FAILURE retry cap (D5: infrastructure failures never spend
 # the job's own budget).
 CLAIM_STALL_RETRIES = 3
+
+# Attempt timeout when the submitter set none (policy["attempt_timeout_minutes"]).
+DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60
 
 
 class ProbeFailureError(RunnerError):
@@ -375,8 +380,72 @@ def maybe_validate_attempt(
     return AttemptResult(path=output_path, data=report.data or {}, attempt=attempt)
 
 
+# Environment names an agent process may inherit from the engine regardless
+# of harness: baseline shell/OS plumbing plus TLS/proxy configuration. Names
+# holding secrets (DSNs, API keys) are NOT here — a job that needs one
+# declares it in required_env, an adapter that needs one lists it in
+# env_passthrough(), and the operator can extend via
+# RUNNER_AGENT_ENV_PASSTHROUGH (comma-separated names).
+AGENT_ENV_SAFE_NAMES = (
+    "PATH",
+    "HOME",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "PYTHONPATH",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+AGENT_ENV_SAFE_PREFIXES = (
+    "LANG",
+    "LC_",
+    "XDG_",
+    "SSL_CERT",
+    "REQUESTS_CA",
+    "CURL_CA",
+    "NODE_EXTRA_CA",
+)
+
+
+def agent_base_env(adapter: HarnessAdapter, job: RunnerJob) -> dict[str, str]:
+    """The inherited half of the agent environment.
+
+    Filtered by default: the engine's own environment carries operator
+    secrets (database DSNs, provider keys, unrelated project variables) that
+    agents with shell access could read — so agents get a safe baseline plus
+    exactly what the job declared (``required_env``), what the adapter needs
+    for its CLI's auth (``env_passthrough``), and any operator-listed extras
+    (RUNNER_AGENT_ENV_PASSTHROUGH). RUNNER_AGENT_ENV=inherit restores the
+    historical full-copy behavior."""
+    if os.environ.get("RUNNER_AGENT_ENV") == "inherit":
+        return os.environ.copy()
+    allowed = set(AGENT_ENV_SAFE_NAMES)
+    allowed.update(job.required_env)
+    allowed.update(adapter.env_passthrough())
+    extra = os.environ.get("RUNNER_AGENT_ENV_PASSTHROUGH", "")
+    allowed.update(name.strip() for name in extra.split(",") if name.strip())
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in allowed or name.startswith(AGENT_ENV_SAFE_PREFIXES)
+    }
+
+
 def agent_env(
-    run_id: str, job: RunnerJob, attempt: int, output_path: Path, database_url: str
+    adapter: HarnessAdapter,
+    run_id: str,
+    job: RunnerJob,
+    attempt: int,
+    output_path: Path,
+    database_url: str,
 ) -> dict[str, str]:
     """The environment stamped onto agent CLI (and hook) processes.
 
@@ -396,7 +465,7 @@ def agent_env(
     in-agent emit would take the advisory exit-0 path and lose its row)."""
     import agent_runner
 
-    env = os.environ.copy()
+    env = agent_base_env(adapter, job)
     env.update(
         {
             "UFLO_RUN_ID": run_id,
@@ -414,9 +483,10 @@ def agent_env(
             "RUNNER_PHASE": job.task_type,
             "RUNNER_BACKEND": job.harness,
             "RUNNER_GROUP_KEY": job.group_key,
+            "RUNNER_PROJECT_ID": project_id(),
             "RUNNER_EMIT_DSN": os.environ.get("RUNNER_EMIT_DSN") or database_url,
             "RUNNER_PYTHON": sys.executable,
-            "AGENT_RUNNER_PROJECT_ROOT": str(PROJECT_ROOT),
+            "AGENT_RUNNER_PROJECT_ROOT": str(util.project_root()),
         }
     )
     package_src = str(Path(agent_runner.__file__).resolve().parents[1])
@@ -451,22 +521,25 @@ def template_from_submit_spec(job: Any) -> str | None:
 
 def runner_variables(
     run_id: str,
+    job_key: str,
     attempt: int,
     directory: Path,
     resource_variables: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Substitution values for the D2 closed variable set, bound at attempt
-    start. RUNNER_JOB_KEY carries the run id — it fills _meta.run_id and the
-    embedded `agent-runner emit` progress command until the runner's own job key
-    replaces run ids at extraction. RUNNER_OUTPUT_PATH is the attempt's
-    output directory; templates append their own artifact filenames.
-    ``resource_variables`` is the provisioned-resource overlay the attempt
-    loop computes: every registered provider's null variables, overlaid by
-    the live resources' values — so resource tokens are always supplied
-    (null when nothing was launched), exactly as before the retype."""
+    start. RUNNER_RUN_ID carries the run id and RUNNER_JOB_KEY the job's own
+    key — each token now substitutes exactly what its name promises (the
+    historical RUNNER_JOB_KEY-carries-the-run-id aliasing is gone).
+    RUNNER_OUTPUT_PATH is the attempt's output directory; templates append
+    their own artifact filenames. ``resource_variables`` is the
+    provisioned-resource overlay the attempt loop computes: every registered
+    provider's null variables, overlaid by the live resources' values — so
+    resource tokens are always supplied (null when nothing was launched),
+    exactly as before the retype."""
     variables = {
         "RUNNER_ATTEMPT": str(attempt),
-        "RUNNER_JOB_KEY": run_id,
+        "RUNNER_RUN_ID": run_id,
+        "RUNNER_JOB_KEY": job_key,
         "RUNNER_OUTPUT_PATH": str(directory),
     }
     variables.update(resource_variables or {})
@@ -512,8 +585,8 @@ def repair_attempt(
         with followup.stdout_path.open("w") as stdout, followup.stderr_path.open("w") as stderr:
             process = subprocess.Popen(
                 followup.command,
-                cwd=PROJECT_ROOT,
-                env=agent_env(run_id, job, attempt, out_path, args.database_url),
+                cwd=util.project_root(),
+                env=agent_env(adapter, run_id, job, attempt, out_path, args.database_url),
                 stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=stderr,
@@ -629,7 +702,10 @@ def run_agent_job_once(
         # values are still {{RUNNER_*}}/{{RESOURCE:*}} tokens there, so resume
         # identity is invariant across runs/attempts by construction (D2).
         fingerprint = resume_prompt_fingerprint(template)
-        prompt = substitute(template, runner_variables(run_id, attempt, directory, resource_variables))
+        prompt = substitute(
+            template,
+            runner_variables(run_id, job.key, attempt, directory, resource_variables),
+        )
 
         # Recorded BEFORE the claim: the resume chain is a self-FK, so the
         # consuming statement needs this attempt's row to exist (007). The
@@ -656,7 +732,10 @@ def run_agent_job_once(
                 resume_state["directory"] = claimed_dir
         if resume_session:
             session_ref, resumed_dir = resume_session
-            prompt = RESUME_PREAMBLE + prompt
+            # The preamble is client-overridable submit data: the default
+            # text is vocabulary-neutral, and a client whose output contract
+            # has its own naming can supply policy["resume_preamble"].
+            prompt = str(job.policy.get("resume_preamble") or RESUME_PREAMBLE) + prompt
             run_job_event(
                 args.database_url,
                 "progress",
@@ -682,7 +761,7 @@ def run_agent_job_once(
             spawn = adapter.build_resume(job, directory, resume_session[0])
         else:
             spawn = adapter.build_spawn(job, directory)
-        env = agent_env(run_id, job, attempt, out_path, args.database_url)
+        env = agent_env(adapter, run_id, job, attempt, out_path, args.database_url)
         env.update(adapter.bind_credentials())
         env.update(adapter.env_overrides())
         seen_hooks: set[str] = set()
@@ -692,7 +771,7 @@ def run_agent_job_once(
             try:
                 process = subprocess.Popen(
                     spawn.command,
-                    cwd=PROJECT_ROOT,
+                    cwd=util.project_root(),
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=stdout,
@@ -726,9 +805,14 @@ def run_agent_job_once(
                         retryable=True,
                     ) from exc
 
-                deadline = (
-                    time.monotonic() + int(job.policy["attempt_timeout_minutes"]) * 60
+                # Timeout is submit data; a submitter that never set one gets
+                # the documented default instead of a bare KeyError blocking
+                # the job as 'unhandled_exception'.
+                timeout_minutes = int(
+                    job.policy.get("attempt_timeout_minutes")
+                    or DEFAULT_ATTEMPT_TIMEOUT_MINUTES
                 )
+                deadline = time.monotonic() + timeout_minutes * 60
                 valid_output_reported = False
                 session_recorded = False
                 review_watch = probes.get("review_watch")
@@ -902,7 +986,12 @@ def run_with_retries(
 ) -> AttemptResult:
     """The engine entry point (called by the facade's await_outcome): claim,
     run, judge through POLICY, retry/block/halt. Success promotion is the
-    client's act and happens facade-side after this returns (design §3)."""
+    client's act and happens facade-side after this returns (design §3).
+
+    ``args`` is anything carrying the RunnerConfig fields; missing optional
+    fields are filled with the documented defaults (the old implicit
+    argparse.Namespace attribute contract, made explicit)."""
+    args = RunnerConfig.coerce(args)
     adapter = get_adapter(job.harness)
     # D5 counters are in-process state (no DDL tonight): bounded free retries
     # per signal, outside the job's max_attempts budget.

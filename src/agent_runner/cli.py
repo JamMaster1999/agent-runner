@@ -268,8 +268,10 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument(
         "--group-key", help="group attribution; falls back to RUNNER_GROUP_KEY"
     )
-    emit.add_argument("--phase")
-    emit.add_argument("--backend")
+    # --task-type/--harness are the store-native spellings; --phase/--backend
+    # are historical client aliases kept for committed agent prompts.
+    emit.add_argument("--phase", "--task-type", dest="phase")
+    emit.add_argument("--backend", "--harness", dest="backend")
     emit.add_argument("--attempt", type=int)
     emit.add_argument(
         "--event-name", help="Event kind override; defaults to the lifecycle"

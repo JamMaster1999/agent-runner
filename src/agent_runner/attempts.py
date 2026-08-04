@@ -26,22 +26,26 @@ import json
 import os
 from pathlib import Path
 
+from agent_runner import util
 from agent_runner.runtime import RunnerError, RunnerJob, project_id
-from agent_runner.util import ROOT, db_rows, write_text
+from agent_runner.util import db_rows, write_text
 
 # ---------------------------------------------------------------------------
 # Attempt STORE half (runner vocabulary — moves at step 6).
 # ---------------------------------------------------------------------------
 
 
+# Default resume preamble, vocabulary-neutral: it names no client output
+# convention. A client whose contract has its own naming supplies
+# policy["resume_preamble"] at submit (the engine prefers it).
 RESUME_PREAMBLE = (
     "RESUME: You are resuming your own earlier session for this exact job; "
     "it was interrupted before the output file was written. Reuse the "
     "research already in this conversation — do not redo items you fully "
     "finished — and complete the remaining ones. Evidence you fetched "
-    "earlier in this conversation counts as seen this run. The packet below "
-    "is identical to the one you were given; the _meta object and output "
-    "path are NEW and replace the old ones.\n\n"
+    "earlier in this conversation counts as seen this run. The work packet "
+    "below is identical to the one you were given; any run identifiers and "
+    "the output path in it are NEW and replace the old ones.\n\n"
 )
 
 
@@ -59,11 +63,12 @@ def resume_prompt_fingerprint(template: str) -> str:
 
 
 def data_root() -> Path:
-    """The root attempt paths are stored relative to: GTM_DATA_ROOT when set
-    (the Volume mount inside a Sandbox), else the repo root — so the same
-    rows work unchanged on the Mac."""
-    override = os.environ.get("GTM_DATA_ROOT")
-    return Path(override).resolve() if override else ROOT
+    """The root attempt paths are stored relative to: RUNNER_DATA_ROOT when
+    set (a Volume mount inside a sandboxed deployment; the legacy
+    GTM_DATA_ROOT spelling is honored for one release), else the project
+    root — so the same rows work unchanged on a workstation."""
+    override = os.environ.get("RUNNER_DATA_ROOT") or os.environ.get("GTM_DATA_ROOT")
+    return Path(override).resolve() if override else util.project_root()
 
 
 def attempt_dir_for_db(directory: Path) -> str:
@@ -301,12 +306,15 @@ def claim_resumable_attempt(
         return None
     candidate_id, session_id, directory = rows[0]
     resumed_dir = resolve_attempt_dir(directory)
-    if os.environ.get("GTM_DATA_ROOT") and not resumed_dir.is_dir():
-        # Locality guard, Sandbox only (GTM_DATA_ROOT set): attempt dirs and
-        # CLI homes share one Volume, so a missing dir means the session
-        # transcript is not on this machine either. Do not burn the claim.
-        # On the Mac transcripts live under the provider CLI's home
-        # directory and survive a pruned .local/runs, so the claim
+    data_root_set = bool(
+        os.environ.get("RUNNER_DATA_ROOT") or os.environ.get("GTM_DATA_ROOT")
+    )
+    if data_root_set and not resumed_dir.is_dir():
+        # Locality guard, sandboxed deployments only (data root set): attempt
+        # dirs and CLI homes share one Volume, so a missing dir means the
+        # session transcript is not on this machine either. Do not burn the
+        # claim. On a workstation transcripts live under the provider CLI's
+        # home directory and survive a pruned runs dir, so the claim
         # proceeds regardless.
         return None
     try:

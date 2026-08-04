@@ -30,19 +30,20 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- The single tenant of the bridge era. Re-running is a no-op.
-INSERT INTO projects (project_id, name)
-VALUES ('gtm', 'Uflo GTM pipeline')
-ON CONFLICT DO NOTHING;
+-- No tenant is seeded here (the original bridge-era 'gtm' seed was a client
+-- name baked into the schema): the tenant is declared by RUNNER_PROJECT_ID
+-- and self-registers via jobstore.ensure_project on first contact.
 
 COMMENT ON TABLE projects IS
 $$
 One row per client tenant. Every runner-owned table is keyed by project_id,
 so a second client is a row here rather than a schema change.
 
+Rows are self-registered: the client declares RUNNER_PROJECT_ID and
+jobstore.ensure_project inserts the row idempotently at run start.
+
 Multi-tenancy is structural, not yet enforced: the runner has no HTTP
-binding today, so callers reach the store in-process with the full DSN and
-there is exactly one project row ('gtm').
+binding today, so callers reach the store in-process with the full DSN.
 $$;
 
 COMMENT ON COLUMN projects.token_hash IS

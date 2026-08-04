@@ -10,17 +10,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-# The notification log lands in the client project tree, resolved through
-# the configured runner root (AGENT_RUNNER_PROJECT_ROOT), not __file__.
-from agent_runner.util import ROOT
+# The notification log lands in the runner state directory, resolved through
+# the configured runner root (AGENT_RUNNER_PROJECT_ROOT / RUNNER_STATE_DIR),
+# not __file__ — and lazily, so importing this module needs no environment.
+from agent_runner import util
 
-DEFAULT_LOG = ROOT / ".local" / "notifications.jsonl"
+
+def default_log() -> Path:
+    return util.state_dir() / "notifications.jsonl"
 
 
 def append_log(path: Path, title: str, message: str, severity: str) -> None:
@@ -64,16 +68,20 @@ def macos_notify(title: str, message: str) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("message")
-    parser.add_argument("--title", default="Uflo production pipeline")
+    # Neutral default: the runner brands nothing — callers pass their own
+    # product title (RUNNER_NOTIFY_TITLE works for a whole deployment).
+    parser.add_argument(
+        "--title", default=os.environ.get("RUNNER_NOTIFY_TITLE") or "agent-runner"
+    )
     parser.add_argument("--severity", choices=("info", "warning", "error"), default="warning")
     parser.add_argument("--method", choices=("macos", "stdout", "none"), default="macos")
-    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
+    parser.add_argument("--log", type=Path, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    append_log(args.log, args.title, args.message, args.severity)
+    append_log(args.log or default_log(), args.title, args.message, args.severity)
 
     if args.method == "stdout":
         print(f"[{args.severity}] {args.title}: {args.message}")
