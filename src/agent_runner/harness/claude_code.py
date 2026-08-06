@@ -199,6 +199,14 @@ class ClaudeCodeAdapter(HarnessAdapter):
         sources = job.policy.get("setting_sources")
         if sources is not None:
             command += ["--setting-sources", ",".join(str(s) for s in sources)]
+        # Reasoning effort as submit data: the CLI accepts effort only as the
+        # session-level --effort flag (low|medium|high|xhigh|max); agent
+        # frontmatter has no effort key, so without this every claude job
+        # runs at the CLI's default effort. Unknown values are warn-and-
+        # ignored by the CLI, so passthrough is safe.
+        effort = job.policy.get("effort")
+        if effort:
+            command += ["--effort", str(effort)]
         command += [
             "--print",
             "--verbose",
