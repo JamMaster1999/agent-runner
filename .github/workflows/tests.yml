@@ -1,169 +1,127 @@
-# Mirrors the GTM tests.yml two-job shape (extraction step 6). Two jobs pin
-# the suite's two contracts:
+# Two jobs pin the suite's two contracts (stage-3 carve-out):
 #
-#   stdlib — bare Python 3.13, no third-party packages, no database, NO pip
-#            install: the tests' own header puts src/ on sys.path, which
-#            also proves the no-pip path the GTM bootstrap shim relies on.
-#            The psycopg-gated tests MUST skip cleanly here; that skip path
-#            is itself part of the contract.
-#   full   — Python 3.13 + psycopg[binary] + the editable install + a
-#            Postgres 16 service. No migrations step: the resume-claim test
-#            self-provisions its scratch database from
-#            tests/fixtures/pipeline_attempts.sql, and the schema test
-#            applies db/migrations + db/roles to a scratch database of its
-#            own (the service role is a superuser, so CREATE DATABASE and
-#            CREATE ROLE both work). That superuser is also the reason
-#            db/roles has never run here as a role WITHOUT createrole —
-#            RoleProvisioningPrivilegeTest covers that path with fake
-#            privilege answers, because a real unprivileged login would need
-#            a password and an hba rule this service does not have. Zero
-#            unexpected skips: a skip here means the environment recipe
-#            silently broke, so the job greps for it and fails loudly.
+#   core     — the package installed with NO extras and temporalio proven
+#              absent: core must import and pass Temporal-less, so an
+#              import leak from the optional layers fails the build
+#              (agent_runner.md). The temporal suite MUST skip cleanly
+#              here; that skip path is itself part of the contract.
+#   temporal — the package with the [temporal] extra: the activity-wrapper
+#              suite runs for real. Exactly 4 sanctioned skips (see the
+#              grep below); any other count means the environment recipe
+#              silently broke.
+#
+# No database service and no psycopg anywhere: the platform half (jobs /
+# attempts / events / leases over Postgres) was deleted at stage 3.
 name: tests
 
 on: [push, pull_request]
 
 jobs:
-  stdlib:
+  core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Run suite (psycopg tests must skip cleanly)
-        run: |
-          set -o pipefail  # tee must not mask the unittest exit code
-          python -m unittest discover tests 2>&1 | tee stdlib_output.txt
-          # The DB-gated tests must have SKIPPED, not silently run or erred.
-          grep -E 'OK \(skipped=[0-9]+\)$' stdlib_output.txt
-
-  full:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: gtm
-          POSTGRES_PASSWORD: gtm
-          POSTGRES_DB: uflo_gtm_production
-        ports:
-          - 55432:5432
-        options: >-
-          --health-cmd "pg_isready -U gtm -d uflo_gtm_production"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      GTM_TEST_DATABASE_URL: postgres://gtm:gtm@127.0.0.1:55432/uflo_gtm_production
-      DATABASE_URL: postgres://gtm:gtm@127.0.0.1:55432/uflo_gtm_production
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Install psycopg
-        run: pip install 'psycopg[binary]==3.3.4'
-      - name: Install the package (editable)
+      - name: Install the package (core only, no extras)
         run: pip install -e .
-      - name: Run suite (exactly the 2 sanctioned skips)
+      - name: Prove Temporal is absent
+        run: |
+          if pip show temporalio >/dev/null 2>&1; then
+            echo '::error::temporalio is installed in the core job - the Temporal-less contract cannot be proven'
+            exit 1
+          fi
+      - name: Run suite Temporal-less (temporal tests must skip cleanly)
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
-          python -m unittest discover tests 2>&1 | tee full_output.txt
-          # The ONLY sanctioned skips are test_usage_parity's two live-capture
-          # sweeps (they scan .local/runs transcripts, which never exist in CI).
-          # Every psycopg-gated DB test must RUN here - a skip count other
-          # than exactly 2 means the DB test environment recipe broke.
-          grep -qxE 'OK \(skipped=2\)' full_output.txt || {
-            echo '::error::expected exactly OK (skipped=2) - the DB test environment recipe broke'
+          python -m unittest discover tests 2>&1 | tee core_output.txt
+          # The temporal suite (and the usage-parity live sweeps) must have
+          # SKIPPED, not silently run or erred.
+          grep -E 'OK \(skipped=[0-9]+\)$' core_output.txt
+
+  temporal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the package with the temporal extra
+        run: pip install -e '.[temporal]'
+      - name: Run suite (exactly the 4 sanctioned skips)
+        run: |
+          set -o pipefail  # tee must not mask the unittest exit code
+          python -m unittest discover tests 2>&1 | tee temporal_output.txt
+          # The ONLY sanctioned skips with the extra installed:
+          #   2x test_usage_parity live-capture sweeps (.local/runs never exists in CI)
+          #   1x the core import sweep (meaningful only Temporal-less; runs in the core job)
+          #   1x the missing-extra guidance path (needs temporalio absent)
+          grep -qxE 'OK \(skipped=4\)' temporal_output.txt || {
+            echo '::error::expected exactly OK (skipped=4) - the temporal test environment recipe broke'
             exit 1
           }
 
-  # Extraction-plan step 7 (facade hardening): grep gates pinning the runner
-  # side of the runner/GTM boundary. Plain bash, no Python, no services. All
-  # gates scan ONLY src/ — tests/ are exempt (they may spell provider names
-  # and GTM history). Each step says what it forbids, why, and its
-  # allowlist; on a hit the step prints the offending lines and exits 1.
-  # A gate must fail loudly, never pass as "no hits", when the scan itself
-  # breaks: each step first checks its scan directory exists (a renamed/
-  # removed dir — deterministic on every grep flavor), and every grep's
-  # status is captured explicitly so exit 2 (an unreadable file, a broken
-  # pattern) also fails the step.
+  # Boundary gates: plain bash, scanning ONLY src/ — tests/ are exempt
+  # (they may spell provider names and platform history). Each step says
+  # what it forbids and why; on a hit it prints the offending lines and
+  # exits 1. A gate must fail loudly, never pass as "no hits", when the
+  # scan itself breaks: each step checks its scan directory exists and
+  # captures every grep's status so exit 2 also fails the step.
   boundaries:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # WHAT: any `import core...` / `from core...` in the shipped package.
-      # WHY:  the dependency arrow points one way — GTM imports agent_runner
-      #       (extraction step 6); the runner must never import GTM code.
-      # Allowlist: none.
-      - name: No GTM imports in src/
+      # WHAT: any temporalio import/reference outside src/agent_runner/temporal/.
+      # WHY:  core is Temporal-free by ruling; the optional layer must never
+      #       leak down. (The core CI job proves it dynamically; this gate
+      #       catches it even in temporal-extra runs.)
+      # Allowlist: src/agent_runner/temporal/ only.
+      - name: Temporal wall (temporalio only in agent_runner/temporal/)
         run: |
-          if [ ! -d src ]; then
-            echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
+          if [ ! -d src/agent_runner ]; then
+            echo '::error::scan directory src/agent_runner is missing - the gate cannot vouch for a tree it did not scan'
             exit 2
           fi
           status=0
-          grep -rnE '^[[:space:]]*(from|import)[[:space:]]+core([.[:space:]]|$)' src > gtm_import_hits.txt || status=$?
+          grep -rn 'temporalio' src/agent_runner --include='*.py' > temporal_hits.txt || status=$?
           if [ "$status" -ge 2 ]; then
-            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
+            echo "::error::gate grep errored (exit $status) instead of scanning"
             exit "$status"
           fi
-          if [ -s gtm_import_hits.txt ]; then
-            cat gtm_import_hits.txt
-            echo '::error::runner src/ imports GTM core.* - the step-7 boundary forbids any GTM dependency'
+          status=0
+          grep -vE '^src/agent_runner/temporal/' temporal_hits.txt > temporal_offenders.txt || status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::gate grep errored (exit $status) while applying the temporal/ exemption"
+            exit "$status"
+          fi
+          if [ -s temporal_offenders.txt ]; then
+            cat temporal_offenders.txt
+            echo '::error::temporalio referenced outside src/agent_runner/temporal/ - core must run with Temporal absent'
             exit 1
           fi
 
-      # WHAT: any reference to GTM's core/job_event.py (path or module form).
-      # WHY:  the core/job_event.py subprocess hop dies in the step-7 shims
-      #       work — this gate lands with/after that packet and keeps the hop
-      #       from creeping back afterwards.
+      # WHAT: any database driver or SQL in the shipped package.
+      # WHY:  the platform half (jobs/attempts/events/leases over Postgres)
+      #       was deleted at stage 3; the runner owns no store and must not
+      #       grow one back.
       # Allowlist: none.
-      - name: No core/job_event references in src/
+      - name: No database code in src/
         run: |
           if [ ! -d src ]; then
             echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
             exit 2
           fi
           status=0
-          grep -rnE 'core/job_event|core\.job_event' src > job_event_hits.txt || status=$?
+          grep -rnE 'psycopg|INSERT INTO|UPDATE [a-z_]+ SET|DELETE FROM' src --include='*.py' > db_hits.txt || status=$?
           if [ "$status" -ge 2 ]; then
-            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
+            echo "::error::gate grep errored (exit $status) instead of scanning"
             exit "$status"
           fi
-          if [ -s job_event_hits.txt ]; then
-            cat job_event_hits.txt
-            echo '::error::runner src/ references core/job_event - the subprocess hop died at extraction step 7 and must not return'
-            exit 1
-          fi
-
-      # WHAT: SQL against GTM business tables. The pattern is case-sensitive
-      #       (uppercase SQL keywords) ON PURPOSE so prose comments like
-      #       jobstore.py's "concurrently running institutions" don't trip.
-      # WHY:  the runner owns job orchestration, never GTM domain data.
-      #       NOTE: pipeline_jobs / pipeline_events / pipeline_runs /
-      #       pipeline_attempts are deliberately NOT in this list — until
-      #       extraction step 9 those are the runner's OWN tables (compat
-      #       store against the GTM DB); step 9 renames them to
-      #       jobs/events/leases/attempts.
-      # Allowlist: none.
-      - name: No GTM business-table SQL in src/
-        run: |
-          if [ ! -d src ]; then
-            echo '::error::scan directory src is missing - the gate cannot vouch for a tree it did not scan'
-            exit 2
-          fi
-          status=0
-          grep -rnE '(FROM|JOIN|INTO|UPDATE)[[:space:]]+(institutions|instructors|sections|teaching_assignments|departments|courses|run_requests|enrichment_runs|pipeline_manager_events)\b' src > gtm_sql_hits.txt || status=$?
-          if [ "$status" -ge 2 ]; then
-            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/ path"
-            exit "$status"
-          fi
-          if [ -s gtm_sql_hits.txt ]; then
-            cat gtm_sql_hits.txt
-            echo '::error::runner src/ contains SQL against GTM business tables - GTM data stays behind GTM importers'
+          if [ -s db_hits.txt ]; then
+            cat db_hits.txt
+            echo '::error::database code in src/ - the platform half died at stage 3 and must not return'
             exit 1
           fi
 
@@ -172,10 +130,7 @@ jobs:
       # WHY:  pluggability — every claude/codex-specific behavior lives in
       #       harness/ (the registry in harness/__init__.py is inside the
       #       allowed dir). A code literal outside harness/ is a design
-      #       regression to fix, never to allowlist. The exemption is
-      #       anchored to the PATH PREFIX of grep's file:line output — a
-      #       mere mention of the harness/ path elsewhere must not exempt
-      #       its own line.
+      #       regression to fix, never to allowlist.
       # Allowlist: src/agent_runner/harness/ only.
       - name: Provider-name wall (claude/codex only in harness/)
         run: |
@@ -186,7 +141,7 @@ jobs:
           status=0
           grep -rniE '\b(claude|codex)\b' src/agent_runner --include='*.py' > provider_hits.txt || status=$?
           if [ "$status" -ge 2 ]; then
-            echo "::error::gate grep errored (exit $status) instead of scanning - check the src/agent_runner path"
+            echo "::error::gate grep errored (exit $status) instead of scanning"
             exit "$status"
           fi
           status=0

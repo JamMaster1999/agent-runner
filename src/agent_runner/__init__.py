@@ -1,21 +1,24 @@
-"""agent_runner: a generic agent-CLI job runner.
+"""agent_runner: the hands that run agents.
 
-The runner speaks only its own vocabulary (``RunnerJob``/``RunnerError``,
-the wire protocol in ``agent_runner.protocol``); everything client-shaped —
-agent configuration, prompt templates, artifact contracts, probe/resource
-specs, policy — arrives as submit DATA or facade-built closures. The store
-is the runner's own schema (db/migrations: projects/jobs/attempts/events/
-leases), scoped by the client-declared RUNNER_PROJECT_ID tenant. Path
-constants resolve lazily through the ``AGENT_RUNNER_PROJECT_ROOT``
-environment variable (see ``agent_runner.util``).
+Everything involved in running an agent CLI process and telling
+the truth about what happened — spawn, stream, classify, repair, sessions,
+auth, workdirs, hygiene, isolation. A library shared across projects; each
+consumer is one caller. It knows nothing about pipelines, prompts,
+contracts, receipts, or business data — it runs agents.
 
-Historical note: the package was extracted from a production enrichment
-pipeline (2026-07/08); client-specific behavior found leaking after the
-split was removed in 0.3.0.
+Core (`agent_runner.attempt.run_attempt` and friends) is stdlib-only and
+imports zero Temporal. The optional layers install on demand:
+
+- ``agent_runner.temporal`` (``pip install agent-runner[temporal]``) — the
+  ready-made Temporal activity wrapper: heartbeat pump, session_ref in
+  heartbeat details, the ruled outcome-to-retry mapping, checkpoint
+  term-stamp verification, resume budget with fresh-session fallback.
+- ``agent_runner.resources`` — provisioning for declared resources
+  (``cdp_browser`` spawns Chrome and hands its endpoint in as a template
+  value). Projects that declare nothing carry no browser dependencies.
 
 This init stays import-light on purpose: no submodule imports here, so
-``import agent_runner`` is side-effect free, driver-free, and needs no
-environment.
+``import agent_runner`` is side-effect free and needs no environment.
 """
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"

@@ -1,36 +1,41 @@
 """Claude Code harness adapter: every claude-CLI-specific behavior in one
-module (design doc §2). Spawn/resume command shapes, session extraction, the
-5-hook map, the error-report dialect, terminal markers, env quirks, and
-health commands — moved verbatim from the pre-adapter modules (phase-2
-step 5).
+module. Spawn/resume command shapes, session extraction, the 5-hook map,
+the error-report dialect, terminal markers, env quirks, and the
+volume-backed credential model — the runner core never spells this CLI's
+name.
 
-The legacy filesystem resume matcher (packet-membership match over
-.local/runs) was DELETED at extraction step 4 (design §7.5), not ported:
-every resumable session is DB-tracked in the attempts store, and resume
-rights belong solely to claim_resumable_attempt — pinned by
-tests/test_resume_claim_sql.py. This module imports no GTM modules.
-
-Step-5 retype: spawn builders take the generic ``RunnerJob`` (agent name =
-``job.agent_ref``); the attempt-timeout/resume-eligibility slots left the
-adapter contract — both are submit data (``job.policy``)."""
+The Claude dialect is file-based: agents spawn by name from a rendered
+discovery file under ``<project_root>/.claude/agents/``. ``prepare_agent``
+writes that file from an ``AgentDef``, so spawn still takes an agent
+definition and a task message with nothing authored on disk by the caller."""
 
 from __future__ import annotations
 
-import argparse
 import json
+import os
 import shutil
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
-from agent_runner import util
+from agent_runner import outcomes, util
+from agent_runner.auth import normalize_token, seed_credential_file
 from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.harness.claude_stream import ClaudeStreamParser
+from agent_runner.util import write_text
+
+
+def claude_command() -> str | None:
+    """PATH lookup with the RUNNER_CLAUDE_CLI environment override (the
+    override is also what points the fake-CLI test rig at a stub)."""
+    override = os.environ.get("RUNNER_CLAUDE_CLI")
+    if override and Path(override).exists():
+        return override
+    return shutil.which("claude")
 
 
 def yaml_scalar(value: object) -> str:
-    """One frontmatter value as a YAML scalar (moved verbatim from the
-    client's sync_agents at extraction step 7)."""
+    """One frontmatter value as a YAML scalar."""
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)  # JSON strings are valid YAML double-quoted scalars
     if not isinstance(value, (int, float, bool)):
@@ -70,9 +75,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
     session_noun: ClassVar[str] = "session"
     # resume: `claude --resume <session>`. followup=False: no in-session
     # repair today — validation failure goes straight to retry (the central
-    # degradation). doctor=False: `claude doctor` exists but is unstructured
-    # and optional (--run-claude-doctor); the health path is auth status plus
-    # a capped live probe, i.e. the no-doctor degradation.
+    # degradation). doctor=False: `claude doctor` exists but is unstructured.
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
         followup=False,
@@ -80,13 +83,24 @@ class ClaudeCodeAdapter(HarnessAdapter):
         doctor=False,
         final_message_artifact=False,
     )
-    # Identical to the codex table on purpose: the pre-adapter code matched
-    # one shared list for both CLIs, and splitting it per dialect would be a
-    # behavior change, not a move. Prune per dialect deliberately.
+    # Marker codes ARE outcome words. Identical to the codex table on
+    # purpose: the pre-adapter code matched one shared list for both CLIs;
+    # prune per dialect deliberately, never as a side effect. Order matters —
+    # first match wins, and a subscription CLI's "usage limit" text must
+    # classify rate_limited before the auth/billing sweep sees it.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
-        ("health_budget_too_low", ("error_max_budget_usd", "reached maximum budget")),
         (
-            "auth",
+            outcomes.RATE_LIMITED,
+            (
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "overloaded_error",
+                "usage limit",
+            ),
+        ),
+        (
+            outcomes.AUTH,
             (
                 "authentication_error",
                 "oauth token has expired",
@@ -96,11 +110,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 "login required",
                 "invalid api key",
                 "api key not found",
-            ),
-        ),
-        (
-            "billing_or_credits",
-            (
                 "billing_error",
                 "credit balance is too low",
                 "insufficient_quota",
@@ -109,7 +118,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
             ),
         ),
         (
-            "invalid_invocation",
+            outcomes.SPAWN_FAILURE,
             (
                 "unknown option",
                 "unknown argument",
@@ -122,35 +131,37 @@ class ClaudeCodeAdapter(HarnessAdapter):
     )
 
     def resolve_binary(self) -> str | None:
-        return shutil.which("claude")
+        return claude_command()
 
-    def health_checks(self, args: argparse.Namespace) -> None:
-        """Auth status, the optional doctor pass, and a capped live probe."""
-        self.run_health_command(["claude", "auth", "status"], args.health_timeout_seconds)
-        if args.run_claude_doctor:
-            self.run_health_command(["claude", "doctor"], args.health_timeout_seconds)
-        self.run_health_command(
-            [
-                "claude",
-                "--print",
-                "--output-format",
-                "json",
-                "--tools",
-                "",
-                "--max-budget-usd",
-                str(args.claude_health_budget_usd),
-                "--model",
-                args.claude_health_model,
-                "Healthcheck only. Reply with OK.",
-            ],
-            args.health_timeout_seconds,
-        )
+    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """CLAUDE_CONFIG_DIR on the volume (config, credentials, and session
+        transcripts live under it); the credentials file seeded once from
+        the CLAUDE_CREDENTIALS_JSON environment value when supplied. A
+        CLAUDE_CODE_OAUTH_TOKEN riding the environment is re-exported
+        normalized so a wrapped paste never reaches the CLI."""
+        home = Path(volume_root) / "claude-home"
+        home.mkdir(parents=True, exist_ok=True)
+        seed = env.get("CLAUDE_CREDENTIALS_JSON")
+        if seed:
+            seed_credential_file(home / ".credentials.json", seed)
+        overrides = {"CLAUDE_CONFIG_DIR": str(home)}
+        token = env.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            overrides["CLAUDE_CODE_OAUTH_TOKEN"] = normalize_token(token)
+        return overrides
+
+    def bind_credentials(self) -> dict[str, str]:
+        """Token normalization on read (ruling D1): whatever token rides the
+        engine environment reaches the CLI whitespace-free."""
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            return {"CLAUDE_CODE_OAUTH_TOKEN": normalize_token(token)}
+        return {}
 
     def materialize_agent(self, agent: AgentDef, header: str) -> str:
         """The `.claude/agents/<name>.md` dialect: YAML frontmatter between
         `---` lines (header comment first, then name + description, then the
-        config keys in dict order), a blank line, then the verbatim body
-        (moved verbatim from the client's sync_agents at extraction step 7)."""
+        config keys in dict order), a blank line, then the verbatim body."""
         lines = ["---", f"# {header}"]
         lines.append(f"name: {yaml_scalar(agent.name)}")
         lines.append(f"description: {yaml_scalar(agent.description)}")
@@ -163,48 +174,61 @@ class ClaudeCodeAdapter(HarnessAdapter):
         lines.append("---")
         return "\n".join(lines) + "\n\n" + agent.body
 
-    def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
+    def prepare_agent(self, agent: AgentDef) -> dict[str, Any] | None:
+        """Write the discovery file the CLI resolves ``--agent <name>``
+        from; config rides the file, so the returned agent_config is None."""
+        text = self.materialize_agent(agent, "GENERATED by agent-runner — do not edit")
+        write_text(
+            util.project_root() / ".claude" / "agents" / f"{agent.name}.md", text
+        )
+        return None
+
+    def build_spawn(self, spec: RunSpec, directory: Path) -> SpawnSpec:
+        command_path = claude_command()
+        if not command_path:
+            raise RunnerError(
+                "Required command not found: claude",
+                code="missing_command",
+                retryable=False,
+                alert=True,
+            )
         # The rendered discovery file is this adapter's own materialize_agent
         # dialect; a missing one used to surface as an opaque CLI error that
         # burned the full retry budget — check it up front and fail loudly.
-        agent_path = util.project_root() / ".claude" / "agents" / f"{job.agent_ref}.md"
+        agent_path = util.project_root() / ".claude" / "agents" / f"{spec.agent_ref}.md"
         if not agent_path.is_file():
             raise RunnerError(
-                f"{job.key}: rendered Claude agent not found: {agent_path}. "
-                "Materialize the agent (materialize_agent -> "
-                ".claude/agents/<name>.md under the project root) before "
-                "spawning.",
+                f"{spec.key}: rendered Claude agent not found: {agent_path}. "
+                "Pass the agent definition (run_attempt(agent=...)) or "
+                "materialize it (prepare_agent) before spawning.",
                 code="missing_claude_agent",
                 retryable=False,
                 alert=True,
             )
         command = [
-            "claude",
+            command_path,
             "--agent",
-            job.agent_ref,
+            spec.agent_ref,
             "--permission-mode",
             "bypassPermissions",
         ]
-        # Tool restrictions are submit DATA (policy["disallowed_tools"]), not
-        # a business rule baked into every spawn: the old hard-coded
-        # "--disallowedTools=Read,Bash" was one client's no-local-reads
-        # policy applied silently to every client.
-        disallowed = job.policy.get("disallowed_tools") or []
+        # Tool restrictions are caller DATA (policy["disallowed_tools"]), not
+        # a business rule baked into every spawn.
+        disallowed = spec.policy.get("disallowed_tools") or []
         if disallowed:
             command.append("--disallowedTools=" + ",".join(str(t) for t in disallowed))
-        # Setting-source isolation as submit data: e.g. ["project"] keeps the
+        # Setting-source isolation as caller data: e.g. ["project"] keeps the
         # operator's user-global Claude state (plugins, skills, personal
         # memory) out of production sessions — the claude-side counterpart of
-        # a client pinning its codex CODEX_HOME.
-        sources = job.policy.get("setting_sources")
+        # pinning CODEX_HOME.
+        sources = spec.policy.get("setting_sources")
         if sources is not None:
             command += ["--setting-sources", ",".join(str(s) for s in sources)]
-        # Reasoning effort as submit data: the CLI accepts effort only as the
-        # session-level --effort flag (low|medium|high|xhigh|max); agent
-        # frontmatter has no effort key, so without this every claude job
-        # runs at the CLI's default effort. Unknown values are warn-and-
-        # ignored by the CLI, so passthrough is safe.
-        effort = job.policy.get("effort")
+        # Reasoning effort as caller data: the CLI accepts effort only as the
+        # session-level --effort flag; agent frontmatter has no effort key.
+        # Unknown values are warn-and-ignored by the CLI, so passthrough is
+        # safe.
+        effort = spec.policy.get("effort")
         if effort:
             command += ["--effort", str(effort)]
         command += [
@@ -220,8 +244,8 @@ class ClaudeCodeAdapter(HarnessAdapter):
             stderr_path=directory / "claude.stderr.log",
         )
 
-    def build_resume(self, job: RunnerJob, directory: Path, session_ref: str) -> SpawnSpec:
-        spawn = self.build_spawn(job, directory)
+    def build_resume(self, spec: RunSpec, directory: Path, session_ref: str) -> SpawnSpec:
+        spawn = self.build_spawn(spec, directory)
         return SpawnSpec(
             command=spawn.command + ["--resume", session_ref],
             stdout_path=spawn.stdout_path,
@@ -233,7 +257,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
 
     def env_passthrough(self) -> tuple[str, ...]:
         # CLI auth + config-home names the filtered agent env must inherit.
-        return ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR")
+        return (
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "RUNNER_CLAUDE_CLI",
+        )
 
     def session_ref_from_log(self, stdout_path: Path) -> str | None:
         return claude_session_id(stdout_path)

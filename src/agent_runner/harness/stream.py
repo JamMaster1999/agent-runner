@@ -1,15 +1,14 @@
 """Shared stream-telemetry machinery for the harness adapters.
 
-Split out of the GTM ``core/stream_events.py`` at extraction step 6 (each
-dialect parser landed beside its adapter: ``claude_stream``/``codex_stream``
-in this package). The pieces here are dialect-neutral: the PROGRESS line
-convention agents print on every harness, the ``StreamEvent`` record the
-engine forwards to the events store, and ``JsonlTail`` for incrementally
-reading a live CLI stdout capture.
+The pieces here are dialect-neutral: the PROGRESS line convention agents
+print on every harness, the ``StreamEvent`` record the attempt loop hands
+to ``on_event``, and ``JsonlTail`` for incrementally reading a live CLI
+stdout capture.
 
-Redaction rides with ``StreamEvent`` on purpose: event rows are synced to a
-public dashboard database, so a database URL captured from an executed
-command line or echoed agent text must never reach an event message.
+Redaction rides with ``StreamEvent`` on purpose: callers forward event
+messages to logs and dashboards, so a database URL captured from an
+executed command line or echoed agent text must never reach an event
+message.
 """
 
 from __future__ import annotations

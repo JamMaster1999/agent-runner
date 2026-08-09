@@ -100,13 +100,10 @@ class StubAdapter(HarnessAdapter):
     def resolve_binary(self):
         raise NotImplementedError
 
-    def health_checks(self, args):
+    def build_spawn(self, spec, directory):
         raise NotImplementedError
 
-    def build_spawn(self, job, directory):
-        raise NotImplementedError
-
-    def build_resume(self, job, directory, session_ref):
+    def build_resume(self, spec, directory, session_ref):
         raise NotImplementedError
 
     def materialize_agent(self, agent, header):
@@ -135,12 +132,12 @@ class StubPluggabilityTest(unittest.TestCase):
         self.assertIsInstance(adapter, StubAdapter)
         self.assertIn(adapter, registered_adapters())
         # Central degradation defaults, no per-harness code required:
-        # no marker data -> no terminal proof, everything retries 'unknown';
-        # no followup -> the engine falls back to a plain retry;
-        # 'local-login' -> no credential env.
+        # no marker data -> no terminal proof, everything classifies 'infra';
+        # no followup -> the attempt loop falls back to a plain retry;
+        # no credential model -> empty env.
         self.assertIsNone(adapter.classify("token expired?? who knows"))
         failure = adapter.classify_failure("mystery output")
-        self.assertEqual(failure.code, "unknown")
+        self.assertEqual(failure.code, "infra")
         self.assertTrue(failure.retryable)
         self.assertEqual(str(failure), "stub-harness attempt failed")
         self.assertIsNone(adapter.build_followup(None, Path("/nonexistent"), "ref"))

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Capture Claude Code hook events for the runner's engine poll loop.
+"""Capture Claude Code hook events for the attempt loop to drain.
 
-Moved verbatim from GTM core/claude_hook_event.py at extraction step 6;
-the GTM path keeps a bridge shim (delete at step 7) because
-.claude/settings.json invokes it by repo-relative path. Consolidating
-the claude/codex twins into one parameterized script is step-7 work."""
+Invoked by committed hook configs as ``agent-runner hook claude`` (or
+``python3 -m agent_runner hook claude``); appends one JSONL record per
+event to the harness's local event log."""
 
 from __future__ import annotations
 
@@ -38,9 +37,7 @@ def env_int(*names: str) -> int | None:
 
 
 def env_value(*names: str) -> str | None:
-    """First set value across the attribution fallback chain: the
-    runner-native RUNNER_* name first, then the legacy UFLO_* spelling
-    (co-emitted for one release)."""
+    """First set value across the given attribution names."""
     for name in names:
         value = os.environ.get(name)
         if value:
@@ -49,8 +46,8 @@ def env_value(*names: str) -> str | None:
 
 
 def main() -> None:
-    run_id = env_value("RUNNER_RUN_ID", "UFLO_RUN_ID")
-    job_stable_id = env_value("RUNNER_JOB_KEY", "UFLO_JOB_STABLE_ID")
+    run_id = env_value("RUNNER_RUN_ID")
+    job_stable_id = env_value("RUNNER_JOB_KEY")
     if not run_id or not job_stable_id:
         return
 
@@ -65,7 +62,7 @@ def main() -> None:
         "hook_event_name": payload.get("hook_event_name"),
         "provider": "claude",
         "agent_type": payload.get("agent_type")
-        or env_value("RUNNER_AGENT_NAME", "UFLO_AGENT_NAME"),
+        or env_value("RUNNER_AGENT_NAME"),
         "agent_id": payload.get("agent_id"),
         "session_id": payload.get("session_id"),
         "transcript_path": payload.get("transcript_path"),
@@ -80,10 +77,10 @@ def main() -> None:
         "reason": payload.get("reason"),
         "run_id": run_id,
         "job_stable_id": job_stable_id,
-        "phase": env_value("RUNNER_PHASE", "UFLO_PHASE"),
-        "backend": env_value("RUNNER_BACKEND", "UFLO_BACKEND"),
-        "attempt": env_int("RUNNER_ATTEMPT", "UFLO_ATTEMPT"),
-        "output_path": env_value("RUNNER_OUTPUT_PATH", "UFLO_OUTPUT_PATH"),
+        "phase": env_value("RUNNER_PHASE"),
+        "backend": env_value("RUNNER_BACKEND"),
+        "attempt": env_int("RUNNER_ATTEMPT"),
+        "output_path": env_value("RUNNER_OUTPUT_PATH"),
     }
 
     event_log = event_log_path()
