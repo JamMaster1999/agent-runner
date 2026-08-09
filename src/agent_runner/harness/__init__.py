@@ -1,10 +1,10 @@
-"""Name-keyed harness adapter registry (design doc §2).
+"""Name-keyed harness adapter registry.
 
-The registry key is an adapter's ``name`` and equals the job's backend
-column value. Runner core dispatches through ``get_adapter`` and never
-branches on a harness name; every provider difference lives in one adapter
-module. A new harness is one adapter class plus one ``register`` call —
-zero core edits (§12 gate 2).
+The registry key is an adapter's ``name`` and equals the spec's harness
+value. Runner core dispatches through ``get_adapter`` and never branches on
+a harness name; every provider difference lives in one adapter module. A
+new harness is one adapter class plus one ``register`` call — zero core
+edits.
 """
 
 from __future__ import annotations

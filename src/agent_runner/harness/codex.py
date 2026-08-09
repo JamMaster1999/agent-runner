@@ -1,37 +1,28 @@
-"""Codex harness adapter: every codex-CLI-specific behavior in one module
-(design doc §2). Binary fallbacks, the `-c dotted.key=value` agent-config
-flattening, exec/resume/followup command shapes, thread extraction, the
-exec-v1 subagent hook quirk, the error-report dialect, terminal markers, and
-doctor/health commands — moved verbatim from the pre-adapter modules
-(phase-2 step 5).
+"""Codex harness adapter: every codex-CLI-specific behavior in one module.
+Binary fallbacks, the `-c dotted.key=value` agent-config flattening,
+exec/resume/followup command shapes, thread extraction, the exec-v1
+subagent hook quirk, the error-report dialect, terminal markers, and the
+volume-backed credential model — the runner core never spells this CLI's
+name.
 
-The legacy filesystem resume matcher (packet-membership match over
-.local/runs) was DELETED at extraction step 4 (design §7.5), not ported:
-every resumable thread is DB-tracked in the attempts store, and resume
-rights belong solely to claim_resumable_attempt — pinned by
-tests/test_resume_claim_sql.py. This module imports no client modules.
-
-Step-5 retype: builders take the generic ``RunnerJob``; the per-task timeout
-and never-resume branches left with the adapter policy slots (both are
-submit data, folded by the client's submit policy). Agent configuration is
-submit DATA too (``job.agent_config``): the adapter never gates on
-``task_type`` and never reads the client's rendered discovery files at
-spawn time — the 2026-08-04 phase-name-enumeration bug class is
-structurally gone."""
+Agent configuration is DATA (``spec.agent_config``): the adapter never
+gates on ``task_type`` and never reads the caller's rendered discovery
+files at spawn time. ``prepare_agent`` folds an ``AgentDef`` into the same
+data shape, so spawn takes an agent definition and a task message with
+nothing read from disk."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
-import subprocess
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
-from agent_runner import util
+from agent_runner import outcomes, util
+from agent_runner.auth import seed_credential_file
 from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.harness.codex_stream import CodexStreamParser
 
 
@@ -81,25 +72,23 @@ def flattened_codex_config(prefix: str, value: Any) -> list[tuple[str, Any]]:
     return [(prefix, value)]
 
 
-def codex_agent_config_args(job: RunnerJob) -> list[str]:
-    """The `-c dotted.key=value` overrides delivering the job's agent
+def codex_agent_config_args(spec: RunSpec) -> list[str]:
+    """The `-c dotted.key=value` overrides delivering the spec's agent
     configuration to `codex exec`.
 
-    ``job.agent_config`` is submit DATA (the whole table is delivered
-    verbatim — the client prunes its own metadata keys before submitting).
-    None with a named agent is a LOUD error, never a silent unconfigured
-    spawn: the old task_type gate dropped every override — model, tool
-    restrictions, developer_instructions — for any task name outside one
-    client's phase list, with no error (2026-08-04 incident). An explicit
-    {} means a deliberately unconfigured session (a parent session driving
-    its own subagents)."""
-    if job.agent_config is None:
-        if job.agent_ref:
+    ``spec.agent_config`` is DATA (the whole table is delivered verbatim —
+    the caller prunes its own metadata keys before handing it over). None
+    with a named agent is a LOUD error, never a silent unconfigured spawn
+    (the 2026-08-04 incident: a task-name gate silently dropped every
+    override). An explicit {} means a deliberately unconfigured session (a
+    parent session driving its own subagents)."""
+    if spec.agent_config is None:
+        if spec.agent_ref:
             raise RunnerError(
-                f"{job.key}: codex job names agent {job.agent_ref!r} but the "
-                "submit carried no agent_config. Submit the agent's config "
-                "table (SubmitRequest.agent_config), or an explicit {} for a "
-                "deliberately unconfigured session.",
+                f"{spec.key}: codex run names agent {spec.agent_ref!r} but "
+                "carries no agent_config. Supply the agent's config table "
+                "(RunSpec.agent_config or the agent= definition), or an "
+                "explicit {} for a deliberately unconfigured session.",
                 code="missing_codex_agent_config",
                 retryable=False,
                 alert=True,
@@ -107,15 +96,14 @@ def codex_agent_config_args(job: RunnerJob) -> list[str]:
         return []
 
     args: list[str] = []
-    for key, value in job.agent_config.items():
+    for key, value in spec.agent_config.items():
         for dotted_key, dotted_value in flattened_codex_config(key, value):
             args.extend(["-c", f"{dotted_key}={toml_cli_value(dotted_value)}"])
     return args
 
 
 def toml_file_value(value: Any) -> str:
-    """One config value in the rendered agent-FILE dialect (moved verbatim
-    from the client's sync_agents at extraction step 7). Distinct from
+    """One config value in the rendered agent-FILE dialect. Distinct from
     ``toml_cli_value``, the `-c` override dialect: this one escapes strings
     by hand and supports inline tables."""
     if isinstance(value, bool):
@@ -136,7 +124,7 @@ def toml_file_value(value: Any) -> str:
     )
 
 
-def codex_exec_command(final_message_path: Path, job: RunnerJob) -> list[str]:
+def codex_exec_command(final_message_path: Path, spec: RunSpec) -> list[str]:
     command = codex_command()
     if not command:
         raise RunnerError(
@@ -155,16 +143,16 @@ def codex_exec_command(final_message_path: Path, job: RunnerJob) -> list[str]:
         "--dangerously-bypass-hook-trust",
         "--output-last-message",
         str(final_message_path),
-        *codex_agent_config_args(job),
+        *codex_agent_config_args(spec),
         "-",
     ]
 
 
 def codex_exec_resume_command(
-    final_message_path: Path, job: RunnerJob, thread_id: str
+    final_message_path: Path, spec: RunSpec, thread_id: str
 ) -> list[str]:
     """`codex exec resume` variant of codex_exec_command. `resume` has no
-    --cd; the working directory comes from the process cwd (PROJECT_ROOT)."""
+    --cd; the working directory comes from the process cwd (project root)."""
     command = codex_command()
     if not command:
         raise RunnerError(
@@ -182,7 +170,7 @@ def codex_exec_resume_command(
         "--dangerously-bypass-hook-trust",
         "--output-last-message",
         str(final_message_path),
-        *codex_agent_config_args(job),
+        *codex_agent_config_args(spec),
         thread_id,
         "-",
     ]
@@ -213,10 +201,9 @@ class CodexAdapter(HarnessAdapter):
     start_label: ClassVar[str] = "Codex CLI"
     session_noun: ClassVar[str] = "thread"
     # resume/followup: `codex exec resume <thread>` (session resume and the
-    # phase 3.5/6 repair path). hooks: PostToolUse etc. fire under `codex
-    # exec`; dedicated Subagent hooks do not (see normalize_hook_event).
-    # doctor: `codex doctor --json` is structured. final_message_artifact:
-    # --output-last-message.
+    # repair path). hooks: PostToolUse etc. fire under `codex exec`;
+    # dedicated Subagent hooks do not (see normalize_hook_event).
+    # final_message_artifact: --output-last-message.
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
         followup=True,
@@ -224,13 +211,24 @@ class CodexAdapter(HarnessAdapter):
         doctor=True,
         final_message_artifact=True,
     )
-    # Identical to the claude_code table on purpose: the pre-adapter code
-    # matched one shared list for both CLIs, and splitting it per dialect
-    # would be a behavior change, not a move. Prune per dialect deliberately.
+    # Marker codes ARE outcome words. Identical to the claude_code table on
+    # purpose: the pre-adapter code matched one shared list for both CLIs;
+    # prune per dialect deliberately, never as a side effect. Order matters —
+    # first match wins, and a subscription CLI's "usage limit" text must
+    # classify rate_limited before the auth/billing sweep sees it.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
-        ("health_budget_too_low", ("error_max_budget_usd", "reached maximum budget")),
         (
-            "auth",
+            outcomes.RATE_LIMITED,
+            (
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "overloaded_error",
+                "usage limit",
+            ),
+        ),
+        (
+            outcomes.AUTH,
             (
                 "authentication_error",
                 "oauth token has expired",
@@ -240,11 +238,6 @@ class CodexAdapter(HarnessAdapter):
                 "login required",
                 "invalid api key",
                 "api key not found",
-            ),
-        ),
-        (
-            "billing_or_credits",
-            (
                 "billing_error",
                 "credit balance is too low",
                 "insufficient_quota",
@@ -253,7 +246,7 @@ class CodexAdapter(HarnessAdapter):
             ),
         ),
         (
-            "invalid_invocation",
+            outcomes.SPAWN_FAILURE,
             (
                 "unknown option",
                 "unknown argument",
@@ -268,100 +261,21 @@ class CodexAdapter(HarnessAdapter):
     def resolve_binary(self) -> str | None:
         return codex_command()
 
-    def health_checks(self, args: argparse.Namespace) -> None:
-        """`codex doctor --json` plus a capped live exec probe."""
-        self.run_doctor(args.health_timeout_seconds)
-        health_command = [
-            codex_command() or "codex",
-            "exec",
-            "--json",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-        ]
-        if args.codex_health_model:
-            health_command += ["--model", args.codex_health_model]
-        health_command.append("Healthcheck only. Reply with OK.")
-        self.run_health_command(health_command, args.health_timeout_seconds)
-
-    def run_doctor(self, timeout: int) -> None:
-        command = codex_command()
-        if not command:
-            raise RunnerError(
-                "Required command not found: codex",
-                code="missing_command",
-                retryable=False,
-                alert=True,
-            )
-        try:
-            result = subprocess.run(
-                [command, "doctor", "--json"],
-                cwd=util.project_root(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + "\n" + (
-                (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-            )
-            raise RunnerError(
-                "codex doctor timed out",
-                code="health_timeout",
-                retryable=True,
-                details=output,
-            ) from exc
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-        try:
-            data = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            if result.returncode != 0:
-                failure = self.classify_failure(output)
-                failure.details = output
-                raise failure
-            return
-
-        checks = data.get("checks", data)
-        if isinstance(checks, dict):
-            items = [item for item in checks.values() if isinstance(item, dict)]
-        elif isinstance(checks, list):
-            items = [item for item in checks if isinstance(item, dict)]
-        else:
-            items = []
-
-        # terminal.env: codex doctor flags a non-interactive terminal
-        # environment, which is exactly what a headless engine spawn is —
-        # never evidence of a broken CLI.
-        ignored_failures = {"terminal.env"}
-        hard_failures = [
-            {
-                "id": item.get("id"),
-                "category": item.get("category"),
-                "status": item.get("status"),
-                "summary": item.get("summary"),
-                "issues": item.get("issues"),
-            }
-            for item in items
-            if str(item.get("status") or "").lower() in {"fail", "error"}
-            and item.get("id") not in ignored_failures
-        ]
-        if hard_failures:
-            raise RunnerError(
-                "codex doctor reported failures",
-                code="codex_doctor",
-                retryable=False,
-                alert=True,
-                details=json.dumps(hard_failures, indent=2, sort_keys=True),
-            )
+    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """CODEX_HOME on the volume; auth.json seeded once from the
+        CODEX_AUTH_JSON environment value (a Modal-style secret), mode 0600.
+        Refreshed tokens the CLI writes back land on the volume."""
+        home = Path(volume_root) / "codex-home"
+        home.mkdir(parents=True, exist_ok=True)
+        seed = env.get("CODEX_AUTH_JSON")
+        if seed:
+            seed_credential_file(home / "auth.json", seed)
+        return {"CODEX_HOME": str(home)}
 
     def materialize_agent(self, agent: AgentDef, header: str) -> str:
         """The `.codex/agents/<name>.toml` dialect: `# header` first line,
         name/description, the config keys in dict order, then the body as a
-        `developer_instructions` TOML literal string (moved verbatim from
-        the client's sync_agents at extraction step 7)."""
+        `developer_instructions` TOML literal string."""
         if "'''" in agent.body:
             raise RunnerError(
                 f"codex agent {agent.name}: body contains ''' which breaks "
@@ -377,22 +291,30 @@ class CodexAdapter(HarnessAdapter):
         lines.append("developer_instructions = '''")
         return "\n".join(lines) + "\n" + agent.body + "'''\n"
 
-    def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
+    def prepare_agent(self, agent: AgentDef) -> dict[str, Any] | None:
+        """Codex agents spawn from config alone: the definition's table plus
+        the body as developer_instructions, all delivered as `-c` overrides —
+        nothing is read from (or written to) disk."""
+        config = dict(agent.config)
+        config.setdefault("developer_instructions", agent.body)
+        return config
+
+    def build_spawn(self, spec: RunSpec, directory: Path) -> SpawnSpec:
         return SpawnSpec(
-            command=codex_exec_command(directory / "codex.final.txt", job),
+            command=codex_exec_command(directory / "codex.final.txt", spec),
             stdout_path=directory / "codex.stdout.jsonl",
             stderr_path=directory / "codex.stderr.log",
         )
 
-    def build_resume(self, job: RunnerJob, directory: Path, session_ref: str) -> SpawnSpec:
+    def build_resume(self, spec: RunSpec, directory: Path, session_ref: str) -> SpawnSpec:
         return SpawnSpec(
-            command=codex_exec_resume_command(directory / "codex.final.txt", job, session_ref),
+            command=codex_exec_resume_command(directory / "codex.final.txt", spec, session_ref),
             stdout_path=directory / "codex.stdout.jsonl",
             stderr_path=directory / "codex.stderr.log",
         )
 
     def build_followup(
-        self, job: RunnerJob, directory: Path, session_ref: str
+        self, spec: RunSpec, directory: Path, session_ref: str
     ) -> SpawnSpec | None:
         command = codex_command()
         if not command:
@@ -408,7 +330,7 @@ class CodexAdapter(HarnessAdapter):
                 "--dangerously-bypass-hook-trust",
                 "--output-last-message",
                 str(directory / "codex.repair.final.txt"),
-                *codex_agent_config_args(job),
+                *codex_agent_config_args(spec),
                 session_ref,
                 "-",
             ],

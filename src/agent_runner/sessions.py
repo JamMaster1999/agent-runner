@@ -1,0 +1,55 @@
+"""Sessions: volume-backed CLI session state, and the resume preamble
+(agent_runner.md — core's sessions duty).
+
+Two things depend on a session surviving its worker: a retry resumes the
+CLI session instead of restarting, and the transcript is the post-run
+record of exactly what the model was sent. Both live wherever the CLI's
+home directory points — so this module's job is pointing every adapter's
+home at one durable root (the worker volume), via the adapters'
+``prepare_home`` hooks. Extracting a live session ref from a captured
+stream is the adapters' ``session_ref_from_log``; carrying that ref between
+attempts is the caller's (the Temporal layer rides it in heartbeat
+details).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from agent_runner.harness import registered_adapters
+
+# Default resume preamble, vocabulary-neutral: it names no project output
+# convention. A caller whose contract has its own naming supplies
+# policy["resume_preamble"] on the RunSpec (run_attempt prefers it).
+RESUME_PREAMBLE = (
+    "RESUME: You are resuming your own earlier session for this exact job; "
+    "it was interrupted before the output file was written. Reuse the "
+    "research already in this conversation — do not redo items you fully "
+    "finished — and complete the remaining ones. Evidence you fetched "
+    "earlier in this conversation counts as seen this run. The work packet "
+    "below is identical to the one you were given; any run identifiers and "
+    "the output path in it are NEW and replace the old ones.\n\n"
+)
+
+
+def prepare_session_homes(volume_root: Path, *, apply: bool = True) -> dict[str, str]:
+    """Point every registered adapter's CLI home at ``volume_root`` and seed
+    credentials there (the Modal model, ruling D1): each adapter creates its
+    home directory under the volume, seeds its credential file once from the
+    environment when absent, and normalizes tokens on read. Refreshed tokens
+    the CLI writes back land on the volume and persist across workers.
+
+    Returns the environment overrides (CLI home + auth variables); with
+    ``apply`` True (the default, meant for worker startup) they are also
+    written into ``os.environ`` so the adapters' ``env_passthrough`` carries
+    them into every agent process.
+    """
+    volume_root = Path(volume_root)
+    volume_root.mkdir(parents=True, exist_ok=True)
+    overrides: dict[str, str] = {}
+    for adapter in registered_adapters():
+        overrides.update(adapter.prepare_home(volume_root, os.environ))
+    if apply:
+        os.environ.update(overrides)
+    return overrides

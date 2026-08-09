@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Capture Codex hook events for the runner's engine poll loop.
+"""Capture Codex hook events for the attempt loop to drain.
 
-Moved verbatim from GTM core/codex_hook_event.py at extraction step 6;
-the GTM path keeps a bridge shim (delete at step 7) because
-.codex/config.toml invokes it by repo-relative path. Consolidating the
-claude/codex twins into one parameterized script is step-7 work.
+Invoked by committed hook configs as ``agent-runner hook codex`` (or
+``python3 -m agent_runner hook codex``); appends one JSONL record per
+event to the harness's local event log.
 
-Attribution comes from the RUNNER_* environment stamped by the engine's
-``agent_env()`` (the legacy UFLO_* spellings are honored as fallback for
-one release) — Codex propagates the exec process environment into every
+Attribution comes from the RUNNER_* environment stamped by the attempt
+loop's ``agent_env()`` — Codex propagates the exec process environment into every
 hook process, including hooks fired for subagent activity (verified
 2026-07-05). Events without a run id come from interactive Codex sessions
 in the repo and are ignored.
@@ -43,9 +41,7 @@ def event_log_path() -> Path:
 
 
 def env_value(*names: str) -> str | None:
-    """First set value across the attribution fallback chain: the
-    runner-native RUNNER_* name first, then the legacy UFLO_* spelling
-    (co-emitted for one release)."""
+    """First set value across the given attribution names."""
     for name in names:
         value = os.environ.get(name)
         if value:
@@ -64,8 +60,8 @@ def env_int(*names: str) -> int | None:
 
 
 def main() -> None:
-    run_id = env_value("RUNNER_RUN_ID", "UFLO_RUN_ID")
-    job_stable_id = env_value("RUNNER_JOB_KEY", "UFLO_JOB_STABLE_ID")
+    run_id = env_value("RUNNER_RUN_ID")
+    job_stable_id = env_value("RUNNER_JOB_KEY")
     if not run_id or not job_stable_id:
         # Not an orchestrator-launched session; stay silent but keep the
         # contract that Subagent hooks expect JSON stdout.
@@ -101,10 +97,10 @@ def main() -> None:
         "last_assistant_message": payload.get("last_assistant_message"),
         "run_id": run_id,
         "job_stable_id": job_stable_id,
-        "attempt": env_int("RUNNER_ATTEMPT", "UFLO_ATTEMPT"),
-        "phase": env_value("RUNNER_PHASE", "UFLO_PHASE"),
-        "backend": env_value("RUNNER_BACKEND", "UFLO_BACKEND"),
-        "output_path": env_value("RUNNER_OUTPUT_PATH", "UFLO_OUTPUT_PATH"),
+        "attempt": env_int("RUNNER_ATTEMPT"),
+        "phase": env_value("RUNNER_PHASE"),
+        "backend": env_value("RUNNER_BACKEND"),
+        "output_path": env_value("RUNNER_OUTPUT_PATH"),
     }
 
     event_log = event_log_path()

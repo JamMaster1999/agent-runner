@@ -1,40 +1,36 @@
-"""Harness adapter contract: Capabilities, SpawnSpec, and HarnessAdapter
-(design doc §2).
+"""Harness adapter contract: Capabilities, SpawnSpec, AgentDef, and
+HarnessAdapter.
 
-The adapter is the load-bearing wall: runner core contains zero harness-name
-branches, and every provider difference — binary discovery, spawn/resume/
-followup command shapes, stream and hook dialects, terminal-failure marker
-data, env quirks, health commands — lives in one adapter module registered
-under the job's harness name. The base class carries the judgment-free
-shared machinery (marker scan, error-report shell, health-command runner);
-adapters supply evidence and dialects only. Policy — what a failure means
-for the job — stays in the engine; attempt timeout and resume eligibility
-arrive as submit DATA (``job.policy``), so the adapter no longer carries
-those slots (step-5 retype).
+The adapter is the load-bearing wall: runner core contains zero
+harness-name branches, and every provider difference — binary discovery,
+spawn/resume/followup command shapes, stream and hook dialects,
+terminal-failure marker data, env quirks, credential-file models — lives in
+one adapter module registered under the spec's harness name. The base class
+carries the judgment-free shared machinery (marker scan, error-report
+shell); adapters supply evidence and dialects only. Policy — what a failure
+means for the run — stays with the caller (the Temporal layer ships the
+ruled mapping).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
-from agent_runner import util
-from agent_runner.runtime import RunnerError, RunnerJob
+from agent_runner import outcomes
+from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.util import read_tail
 
 
 @dataclass(frozen=True)
 class Capabilities:
-    """Proven degradation flags, not speculation (design doc §2.1): every
-    False path already runs in production. No ``resume`` -> every attempt is
-    fresh; no ``followup`` -> validation failure goes straight to retry; no
-    ``hooks`` -> stream telemetry only; no ``doctor`` -> binary presence
-    plus a capped live probe."""
+    """Proven degradation flags, not speculation: every False path already
+    ran in production. No ``resume`` -> every attempt is fresh; no
+    ``followup`` -> validation failure goes straight to retry; no ``hooks``
+    -> stream telemetry only."""
 
     resume: bool = False             # can reopen a session and continue
     followup: bool = False           # can inject a message into an existing session (repair)
@@ -55,11 +51,10 @@ class SpawnSpec:
 
 @dataclass(frozen=True)
 class AgentDef:
-    """One agent definition crossing the adapter boundary as DATA
-    (extraction plan §2, gray zone 4): the runner never reads the client's
-    source tree. ``config`` is the agent's per-harness frontmatter table
-    (the [claude] / [codex] contents); ``body`` is the verbatim prompt —
-    the caller guarantees the trailing newline."""
+    """One agent definition crossing the adapter boundary as DATA: the
+    runner never reads the caller's source tree. ``config`` is the agent's
+    per-harness frontmatter table; ``body`` is the verbatim prompt — the
+    caller guarantees the trailing newline."""
 
     name: str
     description: str
@@ -68,76 +63,48 @@ class AgentDef:
 
 
 class HarnessAdapter(ABC):
-    """One agent CLI's contract with the engine (design doc §2.2).
+    """One agent CLI's contract with the attempt loop.
 
-    ``name`` is the registry key and equals the job's harness value. The
+    ``name`` is the registry key and equals the spec's harness value. The
     display strings feed operator-facing event messages only; nothing ever
-    parses them. Hook wiring is repo-static in phase 2 (the capture scripts
-    under .claude/.codex); ``hook_event_log`` is where that wiring lands its
-    events.
+    parses them.
     """
 
     name: ClassVar[str]
     capabilities: ClassVar[Capabilities]
     display_name: ClassVar[str]      # "<display_name> wrote valid output; ..."
-    start_label: ClassVar[str]       # "Started <start_label> phase5 attempt 2"
+    start_label: ClassVar[str]       # "Started <start_label> attempt 2"
     session_noun: ClassVar[str]      # what this CLI calls a resumable session
 
-    # Failure classification (2026-07-28 policy): markers are matched ONLY
-    # against CLI-owned error text — typed stream error events (error_report),
-    # CLI stderr, or the output of CLI health commands — never agent transcript
-    # tails, whose web-research content can contain tokens like '403' or 'api
-    # key' incidentally. Terminal only when the CLI itself reports auth expiry,
-    # billing/quota exhaustion, or an invalid invocation; everything else,
-    # including unparseable/ambiguous output, retries as code 'unknown'.
+    # Failure classification (2026-07-28 policy, restated in the stage-3
+    # vocabulary): markers are matched ONLY against CLI-owned error text —
+    # typed stream error events (error_report) or CLI stderr — never agent
+    # transcript tails, whose web-research content can contain tokens like
+    # '403' or 'api key' incidentally. Marker codes ARE outcome words
+    # (agent_runner.outcomes); anything unmatched classifies ``infra``.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = ()
 
-    # -- discovery & health ------------------------------------------------
+    # -- discovery ---------------------------------------------------------
 
     @abstractmethod
     def resolve_binary(self) -> str | None:
-        """Path to the CLI binary (PATH plus any app-bundle fallbacks);
-        None when not installed."""
+        """Path to the CLI binary (PATH plus any fallbacks, plus the
+        RUNNER_<NAME>_CLI environment override); None when not installed."""
 
-    @abstractmethod
-    def health_checks(self, args: argparse.Namespace) -> None:
-        """Run this CLI's preflight health checks; raise RunnerError on a
-        hard failure."""
+    # -- credentials & homes (the Modal model, ruling D1) ------------------
 
-    def run_health_command(self, command: list[str], timeout: int) -> str:
-        try:
-            result = subprocess.run(
-                command,
-                cwd=util.project_root(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + "\n" + (
-                (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-            )
-            raise RunnerError(
-                f"{self.name} health command timed out: {' '.join(command[:3])}",
-                code="health_timeout",
-                retryable=True,
-                details=output,
-            ) from exc
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-        if result.returncode != 0:
-            failure = self.classify_failure(output)
-            failure.details = output
-            raise failure
-        return output
-
-    # -- credentials — the account-rotation hook ---------------------------
+    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """Point this CLI's home at a directory under ``volume_root`` and
+        seed its credential file there once from ``env`` when absent —
+        refreshed tokens the CLI writes back then persist to the volume.
+        Returns environment overrides (home + auth names). Default: no
+        credential-file model."""
+        return {}
 
     def bind_credentials(self) -> dict[str, str]:
-        """Env for the attempt's credentials. Phase 2 has exactly one
-        secret_ref, 'local-login' — the Mac's logged-in CLI state — which
-        binds to nothing (D6); a real store arrives with account rotation."""
+        """Env for the attempt's credentials, normalized on read (token
+        normalization is here so a corrupted operator paste never reaches
+        the CLI)."""
         return {}
 
     # -- agent materialization ---------------------------------------------
@@ -145,30 +112,35 @@ class HarnessAdapter(ABC):
     @abstractmethod
     def materialize_agent(self, agent: AgentDef, header: str) -> str:
         """The complete discovery-file text for ``agent`` in this harness's
-        dialect (extraction step 7: rendering moved behind the adapter API;
-        authoring rules, validation, naming, and pruning stay with the
-        client). ``header`` is a caller-supplied comment STRING with no
-        comment syntax — the adapter wraps it in its own dialect — so the
-        GENERATED-marker convention stays the client's. Render constraints
-        raise RunnerError (code='agent_render', retryable=False) naming the
-        harness."""
+        dialect. ``header`` is a caller-supplied comment STRING with no
+        comment syntax — the adapter wraps it in its own dialect. Render
+        constraints raise RunnerError (code='agent_render', retryable=False)
+        naming the harness."""
+
+    def prepare_agent(self, agent: AgentDef) -> dict[str, Any] | None:
+        """Make ``agent`` spawnable in this harness's dialect and return the
+        effective ``agent_config`` for the spawn (None keeps the spec's).
+        File-based dialects write their discovery file here; config-based
+        dialects fold the body into the returned table. Default: the
+        agent's config table, untouched."""
+        return dict(agent.config)
 
     # -- spawn / resume / followup -----------------------------------------
 
     @abstractmethod
-    def build_spawn(self, job: RunnerJob, directory: Path) -> SpawnSpec:
+    def build_spawn(self, spec: RunSpec, directory: Path) -> SpawnSpec:
         """Fresh-attempt invocation."""
 
     @abstractmethod
-    def build_resume(self, job: RunnerJob, directory: Path, session_ref: str) -> SpawnSpec:
-        """Reopen ``session_ref`` and continue the same job."""
+    def build_resume(self, spec: RunSpec, directory: Path, session_ref: str) -> SpawnSpec:
+        """Reopen ``session_ref`` and continue the same task."""
 
     def build_followup(
-        self, job: RunnerJob, directory: Path, session_ref: str
+        self, spec: RunSpec, directory: Path, session_ref: str
     ) -> SpawnSpec | None:
         """Message injection into an existing session (the repair path);
         None when unsupported (``capabilities.followup`` is False) or the
-        binary is missing — the engine falls back to a plain retry."""
+        binary is missing — the attempt loop falls back to a plain retry."""
         return None
 
     def env_overrides(self) -> dict[str, str]:
@@ -178,27 +150,16 @@ class HarnessAdapter(ABC):
     def env_passthrough(self) -> tuple[str, ...]:
         """Environment names this harness's CLI needs inherited from the
         engine when the filtered agent environment is in effect (auth
-        tokens, CLI home overrides). Names only — the engine copies the
-        values from its own environment when present."""
+        tokens, CLI home overrides). Names only — the attempt loop copies
+        the values from its own environment when present."""
         return ()
-
-    # NOTE (step-5 retype): the ``attempt_timeout_minutes``/``resume_allowed``
-    # adapter slots are DELETED — both are submit data now
-    # (``job.policy["attempt_timeout_minutes"]`` / ``job.policy["resume"]``,
-    # folded from the same args/phase logic by the client's submit_policy).
 
     # -- session resume ----------------------------------------------------
 
     @abstractmethod
     def session_ref_from_log(self, stdout_path: Path) -> str | None:
         """The opaque session ref from a captured stdout stream, for resume
-        follow-ups; None until the CLI has emitted it (design doc §2.2
-        session_ref_from, phase-2 shape: read from the attempt log)."""
-
-    # NOTE (extraction step 4, design §7.5): the consume_legacy_session hook
-    # and the per-harness filesystem resume matchers are DELETED, not ported.
-    # Resume rights ride the attempts store exclusively
-    # (claim_resumable_attempt), pinned by tests/test_resume_claim_sql.py.
+        follow-ups; None until the CLI has emitted it."""
 
     # -- telemetry ---------------------------------------------------------
 
@@ -218,7 +179,7 @@ class HarnessAdapter(ABC):
         """Convert one raw captured hook event to ``(event_name, message)``;
         None drops it."""
 
-    # -- failure: the adapter supplies EVIDENCE, the engine supplies JUDGMENT
+    # -- failure: the adapter supplies EVIDENCE, the caller supplies JUDGMENT
 
     @abstractmethod
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:
@@ -256,30 +217,31 @@ class HarnessAdapter(ABC):
 
     def classify(self, text: str) -> RunnerError | None:
         """Terminal-failure evidence from this harness's marker data; None
-        means no terminal proof and the core default applies. Callers must
-        never pass agent transcript tails; use ``error_report`` for attempt
-        logs."""
+        means no proof and the core default (``infra``) applies. Callers
+        must never pass agent transcript tails; use ``error_report`` for
+        attempt logs."""
         lower = (text or "").lower()
         for code, markers in self.terminal_markers:
             if any(marker in lower for marker in markers):
+                terminal = code in outcomes.TERMINAL
                 return RunnerError(
-                    f"{self.name} terminal failure: {code}",
+                    f"{self.name} {code} failure reported by the CLI",
                     code=code,
-                    retryable=False,
-                    alert=True,
+                    retryable=not terminal,
+                    alert=terminal,
                     details=text,
                 )
         return None
 
     def classify_failure(self, text: str) -> RunnerError:
-        """``classify`` plus the core default: no terminal proof from the
-        CLI's own text means retryable, code 'unknown'."""
+        """``classify`` plus the core default: no proof from the CLI's own
+        text means ``infra`` — retryable, says nothing about the job."""
         classified = self.classify(text)
         if classified is not None:
             return classified
         return RunnerError(
             f"{self.name} attempt failed",
-            code="unknown",
+            code=outcomes.INFRA,
             retryable=True,
             alert=False,
             details=text,
@@ -289,5 +251,5 @@ class HarnessAdapter(ABC):
 
     def orphan_patterns(self) -> list[str]:
         """``pgrep -fl`` patterns matching this harness's agent processes,
-        for the reaper's orphan-process hint."""
+        for a worker's orphan-process sweep."""
         return [self.name]

@@ -20,7 +20,6 @@ except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
 from agent_runner.secret_input import secret_value  # noqa: E402
-import db.apply_migrations as migration_script  # noqa: E402
 
 
 SENTINEL_URL = "postgresql://cutover:NEVER_PRINT_THIS@sentinel.invalid/runner"
@@ -125,62 +124,6 @@ class SecretInputTest(unittest.TestCase):
         self.assertNotIn(SENTINEL_URL, message)
         self.assertNotIn(SENTINEL_PASSWORD, message)
         self.assertIn("Cannot read", message)
-
-
-class MigrationScriptDryRunTest(unittest.TestCase):
-    def test_repo_entrypoint_dry_run_needs_no_dsn_and_lists_roles(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {}, clear=False),
-            mock.patch.object(
-                sys, "argv", ["apply_migrations.py", "--dry-run"]
-            ),
-        ):
-            os.environ.pop("RUNNER_DSN", None)
-            os.environ.pop("DATABASE_URL", None)
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                migration_script.main()
-        rendered = output.getvalue()
-        self.assertIn("001_create_projects.sql", rendered)
-        self.assertIn("010_create_runner_emitter_role.sql (roles", rendered)
-
-    def test_valid_explicit_selector_is_checked_but_not_resolved(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {}, clear=False),
-            mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "apply_migrations.py",
-                    "--dry-run",
-                    "--database-url-env",
-                    "UNSET_BUT_SYNTACTICALLY_VALID",
-                ],
-            ),
-        ):
-            os.environ.pop("UNSET_BUT_SYNTACTICALLY_VALID", None)
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                migration_script.main()
-        self.assertIn("001_create_projects.sql", output.getvalue())
-
-    def test_dry_run_rejects_uri_in_either_selector_without_echo(self) -> None:
-        selectors = ("--database-url-env", "--database-url-file")
-        for selector in selectors:
-            with (
-                self.subTest(selector=selector),
-                mock.patch.object(
-                    sys,
-                    "argv",
-                    ["apply_migrations.py", "--dry-run", selector, SENTINEL_URL],
-                ),
-                self.assertRaises(SystemExit) as caught,
-            ):
-                migration_script.main()
-            message = str(caught.exception)
-            self.assertNotIn(SENTINEL_URL, message)
-            self.assertNotIn(SENTINEL_PASSWORD, message)
-            self.assertIn("not a value", message)
 
 
 if __name__ == "__main__":
