@@ -1,0 +1,35 @@
+# Daily drift detector: run the credential-free half of the live tier against
+# the LATEST published CLIs, on purpose unpinned. The CLIs' failure surfaces
+# (auth retry behavior, rate-limit and usage-cap error wording) change without
+# notice; this run going red is how we hear about it before production does.
+#
+# Only the credential-free tests run here: broken-home auth probes and the
+# stub-endpoint rate-limit probes spend zero tokens and need no login. The
+# token half of the live tier (resume, repair) stays operator-run — a public
+# repo's CI is no place for subscription credentials.
+name: live-probes
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  failure-surfaces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the LATEST CLIs (unpinned — that is the point)
+        run: npm install -g @anthropic-ai/claude-code @openai/codex
+      - name: Install package + pytest
+        run: pip install -e . pytest
+      - name: Probe the failure surfaces with real binaries
+        env:
+          RUN_LIVE: "1"
+        run: pytest tests/live/live_failures.py -q
