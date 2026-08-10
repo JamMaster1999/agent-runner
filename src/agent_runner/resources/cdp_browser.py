@@ -182,6 +182,7 @@ class CdpBrowserProvider:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait()
             raise
         return CdpBrowser(
             process=process,

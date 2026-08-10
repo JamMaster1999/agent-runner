@@ -19,11 +19,18 @@ import shutil
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
-from agent_runner import outcomes, util
+from agent_runner import util
 from agent_runner.auth import seed_credential_file
-from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
+from agent_runner.harness.base import (
+    COMMON_TERMINAL_MARKERS,
+    AgentDef,
+    Capabilities,
+    HarnessAdapter,
+    SpawnSpec,
+)
 from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.harness.codex_stream import CodexStreamParser
+from agent_runner.harness.stream import iter_jsonl
 
 
 # Standard macOS app-bundle install locations, tried after PATH; the
@@ -104,14 +111,17 @@ def codex_agent_config_args(spec: RunSpec) -> list[str]:
 
 def toml_file_value(value: Any) -> str:
     """One config value in the rendered agent-FILE dialect. Distinct from
-    ``toml_cli_value``, the `-c` override dialect: this one escapes strings
-    by hand and supports inline tables."""
+    ``toml_cli_value``, the `-c` override dialect: this one supports inline
+    tables. Strings go through json.dumps — JSON string escaping is valid
+    TOML basic-string escaping, including the control characters
+    (newlines, tabs) a hand-rolled quote-and-backslash escape would leave
+    raw and render the file unparsable."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(toml_file_value(item) for item in value) + "]"
     if isinstance(value, dict):
@@ -124,35 +134,12 @@ def toml_file_value(value: Any) -> str:
     )
 
 
-def codex_exec_command(final_message_path: Path, spec: RunSpec) -> list[str]:
-    command = codex_command()
-    if not command:
-        raise RunnerError(
-            "Required command not found: codex",
-            code="missing_command",
-            retryable=False,
-            alert=True,
-        )
-    return [
-        command,
-        "exec",
-        "--json",
-        "--cd",
-        str(util.project_root()),
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--dangerously-bypass-hook-trust",
-        "--output-last-message",
-        str(final_message_path),
-        *codex_agent_config_args(spec),
-        "-",
-    ]
-
-
-def codex_exec_resume_command(
-    final_message_path: Path, spec: RunSpec, thread_id: str
+def codex_exec_command(
+    final_message_path: Path, spec: RunSpec, thread_id: str | None = None
 ) -> list[str]:
-    """`codex exec resume` variant of codex_exec_command. `resume` has no
-    --cd; the working directory comes from the process cwd (project root)."""
+    """The one `codex exec` invocation shape: fresh when ``thread_id`` is
+    None, `codex exec resume <thread>` otherwise. `resume` has no --cd; the
+    working directory comes from the process cwd (project root)."""
     command = codex_command()
     if not command:
         raise RunnerError(
@@ -161,36 +148,23 @@ def codex_exec_resume_command(
             retryable=False,
             alert=True,
         )
-    return [
-        command,
-        "exec",
-        "resume",
-        "--json",
+    parts = [command, "exec"]
+    if thread_id:
+        parts.append("resume")
+    parts.append("--json")
+    if not thread_id:
+        parts += ["--cd", str(util.project_root())]
+    parts += [
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
         "--output-last-message",
         str(final_message_path),
         *codex_agent_config_args(spec),
-        thread_id,
-        "-",
     ]
-
-
-def codex_thread_id(stdout_path: Path) -> str | None:
-    """The session id from the attempt's JSON event stream, for `codex exec
-    resume` follow-ups."""
-    try:
-        with stdout_path.open() as fh:
-            for line in fh:
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("type") == "thread.started":
-                    return payload.get("thread_id") or None
-    except OSError:
-        return None
-    return None
+    if thread_id:
+        parts.append(thread_id)
+    parts.append("-")
+    return parts
 
 
 class CodexAdapter(HarnessAdapter):
@@ -211,58 +185,9 @@ class CodexAdapter(HarnessAdapter):
         doctor=True,
         final_message_artifact=True,
     )
-    # Marker codes ARE outcome words. Identical to the claude_code table on
-    # purpose: the pre-adapter code matched one shared list for both CLIs;
-    # prune per dialect deliberately, never as a side effect. Order matters —
-    # first match wins, and a subscription CLI's "usage limit" text must
-    # classify rate_limited before the auth/billing sweep sees it.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
-        (
-            outcomes.RATE_LIMITED,
-            (
-                "rate limit",
-                "rate_limit",
-                "too many requests",
-                "overloaded_error",
-                "usage limit",
-            ),
-        ),
-        (
-            outcomes.AUTH,
-            (
-                "authentication_error",
-                "authentication_failed",
-                "401 unauthorized",
-                "missing bearer",
-                "oauth token has expired",
-                "token expired",
-                "please run /login",
-                "not logged in",
-                "login required",
-                "invalid api key",
-                "api key not found",
-                "billing_error",
-                "credit balance is too low",
-                "insufficient_quota",
-                "payment required",
-                "out of credit",
-            ),
-        ),
-        (
-            outcomes.SPAWN_FAILURE,
-            (
-                "unknown option",
-                "unknown argument",
-                "unexpected argument",
-                "unrecognized argument",
-                "invalid value for",
-                "no such subcommand",
-            ),
-        ),
+        COMMON_TERMINAL_MARKERS
     )
-
-    def resolve_binary(self) -> str | None:
-        return codex_command()
 
     def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
         """CODEX_HOME on the volume; auth.json seeded once from the
@@ -311,7 +236,7 @@ class CodexAdapter(HarnessAdapter):
 
     def build_resume(self, spec: RunSpec, directory: Path, session_ref: str) -> SpawnSpec:
         return SpawnSpec(
-            command=codex_exec_resume_command(directory / "codex.final.txt", spec, session_ref),
+            command=codex_exec_command(directory / "codex.final.txt", spec, session_ref),
             stdout_path=directory / "codex.stdout.jsonl",
             stderr_path=directory / "codex.stderr.log",
         )
@@ -319,24 +244,12 @@ class CodexAdapter(HarnessAdapter):
     def build_followup(
         self, spec: RunSpec, directory: Path, session_ref: str
     ) -> SpawnSpec | None:
-        command = codex_command()
-        if not command:
+        if not codex_command():
             return None
-        # `resume` has no --cd; the working directory comes from the process cwd.
         return SpawnSpec(
-            command=[
-                command,
-                "exec",
-                "resume",
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--dangerously-bypass-hook-trust",
-                "--output-last-message",
-                str(directory / "codex.repair.final.txt"),
-                *codex_agent_config_args(spec),
-                session_ref,
-                "-",
-            ],
+            command=codex_exec_command(
+                directory / "codex.repair.final.txt", spec, session_ref
+            ),
             stdout_path=directory / "codex.repair.stdout.jsonl",
             stderr_path=directory / "codex.repair.stderr.log",
         )
@@ -345,14 +258,13 @@ class CodexAdapter(HarnessAdapter):
         # CLI auth/home names the filtered agent env must inherit.
         return ("CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "RUNNER_CODEX_CLI")
 
-    def session_ref_from_log(self, stdout_path: Path) -> str | None:
-        return codex_thread_id(stdout_path)
+    def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
+        if payload.get("type") == "thread.started":
+            return payload.get("thread_id") or None
+        return None
 
     def stream_parser(self) -> CodexStreamParser:
         return CodexStreamParser()
-
-    def hook_event_log(self) -> Path:
-        return util.state_dir() / "codex_hooks" / "events.jsonl"
 
     def normalize_hook_event(
         self, event: dict[str, Any], agent_name: str
@@ -383,25 +295,14 @@ class CodexAdapter(HarnessAdapter):
         2026-08-09): the final turn.failed event on the stream is the truth
         the exit code hides. A later turn.completed clears earlier failures."""
         last: str | None = None
-        try:
-            with stdout_path.open() as fh:
-                for line in fh:
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-                    kind = payload.get("type") or ""
-                    if kind == "turn.completed":
-                        last = None
-                    elif kind == "turn.failed":
-                        last = str(
-                            (payload.get("error") or {}).get("message")
-                            or "codex turn failed"
-                        )
-        except OSError:
-            return None
+        for payload in iter_jsonl(stdout_path):
+            kind = payload.get("type") or ""
+            if kind == "turn.completed":
+                last = None
+            elif kind == "turn.failed":
+                last = str(
+                    (payload.get("error") or {}).get("message") or "codex turn failed"
+                )
         return last
 
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:

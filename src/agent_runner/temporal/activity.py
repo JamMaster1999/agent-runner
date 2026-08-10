@@ -62,18 +62,25 @@ class CheckpointSpec:
 
 @dataclass
 class _HeartbeatState:
-    """What rides heartbeat details: one dict, keys stable."""
+    """What rides heartbeat details: one dict, keys stable.
+
+    Written from the attempt's worker thread (the on_event/on_session
+    callbacks), read from the event loop (the heartbeat pump): the lock keeps
+    each payload a consistent snapshot — never a stale session_ref beside a
+    reset resume_count."""
 
     session_ref: str | None = None
     resume_count: int = 0
     progress: dict[str, Any] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
-        return {
-            "session_ref": self.session_ref,
-            "resume_count": self.resume_count,
-            "progress": dict(self.progress),
-        }
+        with self.lock:
+            return {
+                "session_ref": self.session_ref,
+                "resume_count": self.resume_count,
+                "progress": dict(self.progress),
+            }
 
 
 def prior_heartbeat_details() -> dict[str, Any] | None:
@@ -145,21 +152,23 @@ async def run_agent_attempt(
     state = _HeartbeatState(session_ref=session_ref, resume_count=resume_count)
 
     def on_event(event: StreamEvent) -> None:
-        if event.current is not None or event.total is not None:
-            state.progress = {
-                "current": event.current,
-                "total": event.total,
-                "message": event.message,
-            }
-        else:
-            state.progress = {**state.progress, "message": event.message}
+        with state.lock:
+            if event.current is not None or event.total is not None:
+                state.progress = {
+                    "current": event.current,
+                    "total": event.total,
+                    "message": event.message,
+                }
+            else:
+                state.progress = {**state.progress, "message": event.message}
 
     def on_session(ref: str) -> None:
-        if ref != session_ref:
-            # A fresh session opened: the budget is the session's, so the
-            # count restarts with it.
-            state.resume_count = 0
-        state.session_ref = ref
+        with state.lock:
+            if ref != session_ref:
+                # A fresh session opened: the budget is the session's, so the
+                # count restarts with it.
+                state.resume_count = 0
+            state.session_ref = ref
 
     async def pump() -> None:
         while True:

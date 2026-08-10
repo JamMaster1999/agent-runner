@@ -12,13 +12,13 @@ the typed fields (typed may know more than the message renders).
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from agent_runner.harness.stream import (
     PROGRESS_LINE,
     StreamEvent,
     clip,
+    parse_json_dict,
     progress_events,
     typed_token,
 )
@@ -32,17 +32,11 @@ class CodexStreamParser:
     """
 
     def __init__(self) -> None:
-        self._seen: set[tuple[str, str]] = set()
+        self._seen: set[tuple[str, str, str]] = set()
 
     def parse_line(self, line: str) -> list[StreamEvent]:
-        line = line.strip()
-        if not line:
-            return []
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(payload, dict):
+        payload = parse_json_dict(line)
+        if payload is None:
             return []
         kind = payload.get("type") or ""
 
@@ -85,7 +79,7 @@ class CodexStreamParser:
         item = payload.get("item") or {}
         item_id = str(item.get("id") or "")
         status = "started" if kind == "item.started" else str(item.get("status") or kind)
-        dedupe_key = (f"{item_id}:{item.get('type')}", status)
+        dedupe_key = (item_id, str(item.get("type") or ""), status)
         if item_id and dedupe_key in self._seen:
             return []
         self._seen.add(dedupe_key)

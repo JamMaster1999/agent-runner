@@ -234,12 +234,12 @@ On your laptop the CLIs are logged in already. On a server fleet, seed the login
 
 ```python
 from pathlib import Path
-from agent_runner.auth import prepare_auth
+from agent_runner.sessions import prepare_session_homes
 
 # Reads CODEX_AUTH_JSON and CLAUDE_CREDENTIALS_JSON from the environment,
 # writes them to the volume the first time, and returns the environment
 # settings that point each CLI at that home.
-env = prepare_auth(Path("/data"))
+env = prepare_session_homes(Path("/data"))
 ```
 
 

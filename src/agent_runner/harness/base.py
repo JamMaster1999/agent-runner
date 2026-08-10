@@ -14,15 +14,65 @@ ruled mapping).
 
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
 from agent_runner import outcomes
+from agent_runner.harness.stream import iter_jsonl
 from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.util import read_tail
+
+# Terminal-failure markers shared by every CLI dialect so far: the codes ARE
+# outcome words, matched only against CLI-owned error text. Order matters —
+# first match wins, and a subscription CLI's "usage limit" text must classify
+# rate_limited before the auth/billing sweep sees it. An adapter whose CLI
+# genuinely diverges overrides its ``terminal_markers`` class variable.
+COMMON_TERMINAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        outcomes.RATE_LIMITED,
+        (
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "overloaded_error",
+            "usage limit",
+        ),
+    ),
+    (
+        outcomes.AUTH,
+        (
+            "authentication_error",
+            "authentication_failed",
+            "401 unauthorized",
+            "missing bearer",
+            "oauth token has expired",
+            "token expired",
+            "please run /login",
+            "not logged in",
+            "login required",
+            "invalid api key",
+            "api key not found",
+            "billing_error",
+            "credit balance is too low",
+            "insufficient_quota",
+            "payment required",
+            "out of credit",
+        ),
+    ),
+    (
+        outcomes.SPAWN_FAILURE,
+        (
+            "unknown option",
+            "unknown argument",
+            "unexpected argument",
+            "unrecognized argument",
+            "invalid value for",
+            "no such subcommand",
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +111,19 @@ class AgentDef:
     config: dict[str, Any]
     body: str
 
+    def __post_init__(self) -> None:
+        # The name becomes a discovery-file path component (prepare_agent
+        # writes <root>/.claude/agents/<name>.md): a separator or ".." would
+        # escape that directory, so reject it at the boundary.
+        if not self.name or any(seq in self.name for seq in ("/", "\\", "..")):
+            raise RunnerError(
+                f"invalid agent name {self.name!r}: names must be non-empty "
+                "and contain no path separators or '..'",
+                code="agent_render",
+                retryable=False,
+                alert=True,
+            )
+
 
 class HarnessAdapter(ABC):
     """One agent CLI's contract with the attempt loop.
@@ -83,13 +146,6 @@ class HarnessAdapter(ABC):
     # '403' or 'api key' incidentally. Marker codes ARE outcome words
     # (agent_runner.outcomes); anything unmatched classifies ``infra``.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = ()
-
-    # -- discovery ---------------------------------------------------------
-
-    @abstractmethod
-    def resolve_binary(self) -> str | None:
-        """Path to the CLI binary (PATH plus any fallbacks, plus the
-        RUNNER_<NAME>_CLI environment override); None when not installed."""
 
     # -- credentials & homes (the Modal model, ruling D1) ------------------
 
@@ -157,9 +213,19 @@ class HarnessAdapter(ABC):
     # -- session resume ----------------------------------------------------
 
     @abstractmethod
+    def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
+        """The opaque session ref carried by one parsed stream event; None
+        when this event does not name one. The attempt loop calls this on
+        the lines it is already tailing, so no log rescan is ever needed."""
+
     def session_ref_from_log(self, stdout_path: Path) -> str | None:
-        """The opaque session ref from a captured stdout stream, for resume
-        follow-ups; None until the CLI has emitted it."""
+        """The first session ref in a captured stdout stream, for one-shot
+        callers (the repair path); None until the CLI has emitted it."""
+        for payload in iter_jsonl(stdout_path):
+            ref = self.session_ref_from_event(payload)
+            if ref:
+                return ref
+        return None
 
     # -- telemetry ---------------------------------------------------------
 
@@ -168,9 +234,12 @@ class HarnessAdapter(ABC):
         """A fresh per-attempt stdout parser (``parse_line(line)`` ->
         StreamEvent list)."""
 
-    @abstractmethod
     def hook_event_log(self) -> Path:
-        """Where this harness's hook-capture wiring appends events."""
+        """Where this harness's hook-capture wiring appends events — one
+        shared convention: ``<state_dir>/<name>_hooks/events.jsonl``."""
+        from agent_runner.harness.hook_capture import event_log_path
+
+        return event_log_path(self.name)
 
     @abstractmethod
     def normalize_hook_event(
@@ -196,30 +265,22 @@ class HarnessAdapter(ABC):
         transcript tail is deliberately never used: it holds web-research
         tool output where auth/billing-looking tokens appear incidentally.
         """
-        errors: list[str] = []
-        try:
-            with stdout_path.open() as fh:
-                for line in fh:
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-                    error = self.stream_error_line(payload)
-                    if error is not None:
-                        errors.append(error)
-        except OSError:
-            pass
+        errors = [
+            error
+            for payload in iter_jsonl(stdout_path)
+            if (error := self.stream_error_line(payload)) is not None
+        ]
         if errors:
             return "\n".join(errors[-5:])
         return read_tail(stderr_path, 4000).strip()
 
-    def stream_fatal(self, payload: dict[str, Any]) -> str | None:
+    def stream_fatal(self, payload: dict[str, Any]) -> RunnerError | None:
         """CLI-owned evidence from one LIVE stream event that the attempt can
         no longer succeed (an auth-dead retry loop, say): the loop terminates
-        the CLI and classifies with this text instead of waiting out the
-        CLI's own backoff ladder. Default: no such evidence."""
+        the CLI and classifies with the returned error instead of waiting out
+        the CLI's own backoff ladder. Typed evidence beats marker text — the
+        event's own status code decides the outcome word, so a CLI wording
+        change can never misroute it. Default: no such evidence."""
         return None
 
     def terminal_failure(self, stdout_path: Path) -> str | None:

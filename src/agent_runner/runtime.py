@@ -45,6 +45,21 @@ class RunnerError(Exception):
 
 
 @dataclass(frozen=True)
+class Policy:
+    """The per-run knobs the attempt loop and adapters honor. A typed field
+    set instead of a string-keyed dict: a typo'd knob is a construction-time
+    error, never a silently ignored setting. None everywhere means "the
+    caller never said" — the runner's default applies; an explicitly falsy
+    value (timeout 0, empty preamble) is honored as given."""
+
+    attempt_timeout_minutes: float | None = None
+    disallowed_tools: tuple[str, ...] = ()
+    setting_sources: tuple[str, ...] | None = None
+    effort: str | None = None
+    resume_preamble: str | None = None
+
+
+@dataclass(frozen=True)
 class RunSpec:
     """One agent run as the runner sees it: nothing here the caller did not
     say. ``task_type``/``labels`` are opaque caller vocabulary (display and
@@ -53,9 +68,7 @@ class RunSpec:
     when an ``agent_ref`` is named), {} means a deliberately unconfigured
     session — the runner never reads the caller's source tree to find out.
 
-    ``policy`` carries the per-run knobs the adapters honor:
-    ``attempt_timeout_minutes``, ``disallowed_tools``, ``setting_sources``,
-    ``effort``, ``resume_preamble``.
+    ``policy`` is a ``Policy`` — the typed per-run knob set.
     """
 
     key: str                          # attribution key (env stamps, event labels)
@@ -64,7 +77,7 @@ class RunSpec:
     agent_config: dict[str, Any] | None = None
     task_type: str = ""               # opaque caller vocabulary
     labels: dict[str, Any] = field(default_factory=dict)
-    policy: dict[str, Any] = field(default_factory=dict)
+    policy: Policy = field(default_factory=Policy)
     repair_rounds: int = 0
     resource_specs: tuple[dict[str, Any], ...] = ()
     required_env: tuple[str, ...] = ()

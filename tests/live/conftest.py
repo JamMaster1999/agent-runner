@@ -26,7 +26,7 @@ import pytest
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.claude_code import claude_command
 from agent_runner.harness.codex import codex_command
-from agent_runner.runtime import RunSpec, Verdict
+from agent_runner.runtime import Policy, RunSpec, Verdict
 
 LIVE = os.environ.get("RUN_LIVE") == "1"
 
@@ -69,16 +69,16 @@ def workdir(project_root: Path) -> Path:
 
 
 def claude_spec(**policy_overrides) -> RunSpec:
-    # setting_sources=["project"] keeps the operator's user-global Claude
+    # setting_sources=("project",) keeps the operator's user-global Claude
     # state out, exactly as production spawns do.
-    policy = {"setting_sources": ["project"], **policy_overrides}
+    policy = {"setting_sources": ("project",), **policy_overrides}
     required_env = tuple(policy.pop("required_env", ()))
     repair_rounds = int(policy.pop("repair_rounds", 0))
     return RunSpec(
         key="live-claude",
         harness="claude",
         agent_ref=CLAUDE_AGENT.name,
-        policy=policy,
+        policy=Policy(**policy),
         required_env=required_env,
         repair_rounds=repair_rounds,
     )
@@ -92,7 +92,7 @@ def codex_spec(**policy_overrides) -> RunSpec:
         key="live-codex",
         harness="codex",
         agent_ref=CODEX_AGENT.name,
-        policy=policy,
+        policy=Policy(**policy),
         required_env=required_env,
         repair_rounds=repair_rounds,
     )
