@@ -438,8 +438,8 @@ def run_attempt(
 
         verdict = validate(workdir) if validate is not None else None
 
-        # A zero exit is not proof of success for every CLI: codex exec
-        # exits 0 on a failed turn, so ask the adapter for terminal stream
+        # A zero exit is not proof of success for every CLI: some exit 0
+        # with a failed final turn, so ask the adapter for terminal stream
         # evidence before believing the exit code.
         zero_exit_failure: str | None = None
         if process.returncode == 0:

@@ -20,3 +20,10 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 agent_runner = ["py.typed"]
+
+[tool.pytest.ini_options]
+# live_*.py is the operator-run live tier (tests/live, RUN_LIVE=1): pytest
+# collects it, while CI's `python -m unittest discover` (pattern test*.py)
+# never sees it — the live tier is pytest-native and CI has no pytest.
+python_files = ["test_*.py", "live_*.py"]
+asyncio_mode = "auto"
