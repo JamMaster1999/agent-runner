@@ -9,13 +9,11 @@ numbers back out of them (typed==regex parity, tests/test_usage_parity.py).
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from agent_runner.harness.stream import (
     PROGRESS_LINE,
     StreamEvent,
     clip,
+    parse_json_dict,
     progress_events,
     typed_token,
 )
@@ -30,14 +28,8 @@ class ClaudeStreamParser:
         self._tool_names: dict[str, str] = {}
 
     def parse_line(self, line: str) -> list[StreamEvent]:
-        line = line.strip()
-        if not line:
-            return []
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(payload, dict):
+        payload = parse_json_dict(line)
+        if payload is None:
             return []
         kind = payload.get("type") or ""
         subagent = "[subagent] " if payload.get("parent_tool_use_id") else ""

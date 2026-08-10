@@ -4,7 +4,7 @@
 Seeded once (a refreshed credential the CLI wrote is never clobbered),
 private file modes, token normalization on read (the 2026-07-30 wrapped
 paste that 401'd a valid token), and the per-adapter home/credential
-models behind the provider-neutral ``prepare_auth`` surface.
+models behind ``sessions.prepare_session_homes``.
 """
 
 from __future__ import annotations
@@ -24,12 +24,9 @@ try:
 except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
-from agent_runner.auth import (  # noqa: E402
-    normalize_token,
-    prepare_auth,
-    seed_credential_file,
-)
+from agent_runner.auth import normalize_token, seed_credential_file  # noqa: E402
 from agent_runner.harness import get_adapter  # noqa: E402
+from agent_runner.sessions import prepare_session_homes  # noqa: E402
 
 
 class NormalizeTokenTest(unittest.TestCase):
@@ -100,17 +97,17 @@ class AdapterHomeTest(unittest.TestCase):
         self.assertEqual(bound, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-abcd"})
 
 
-class PrepareAuthTest(unittest.TestCase):
-    def test_prepare_auth_collects_every_adapter_and_can_apply(self) -> None:
+class PrepareSessionHomesTest(unittest.TestCase):
+    def test_collects_every_adapter_and_can_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(_os.environ, {}, clear=False):
                 _os.environ.pop("CODEX_HOME", None)
-                overrides = prepare_auth(Path(tmp), apply=False)
+                overrides = prepare_session_homes(Path(tmp), apply=False)
                 self.assertIn("CODEX_HOME", overrides)
                 self.assertIn("CLAUDE_CONFIG_DIR", overrides)
                 # apply=False left the process environment alone.
                 self.assertNotIn("CODEX_HOME", _os.environ)
-                applied = prepare_auth(Path(tmp))
+                applied = prepare_session_homes(Path(tmp))
                 self.assertEqual(_os.environ["CODEX_HOME"], applied["CODEX_HOME"])
 
 

@@ -97,9 +97,6 @@ class StubAdapter(HarnessAdapter):
     session_noun = "session"
     capabilities = Capabilities()
 
-    def resolve_binary(self):
-        raise NotImplementedError
-
     def build_spawn(self, spec, directory):
         raise NotImplementedError
 
@@ -109,13 +106,10 @@ class StubAdapter(HarnessAdapter):
     def materialize_agent(self, agent, header):
         raise NotImplementedError
 
-    def session_ref_from_log(self, stdout_path):
+    def session_ref_from_event(self, payload):
         raise NotImplementedError
 
     def stream_parser(self):
-        raise NotImplementedError
-
-    def hook_event_log(self):
         raise NotImplementedError
 
     def normalize_hook_event(self, event, agent_name):

@@ -13,10 +13,11 @@ message.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 PROGRESS_LINE = re.compile(r"PROGRESS:\s*(\d+)\s*/\s*(\d+)\s*[-—:]?\s*(.*)")
@@ -53,6 +54,32 @@ class StreamEvent:
         # Every stream-derived message passes through here regardless of
         # which parser branch built it.
         self.message = redact_db_urls(self.message)
+
+
+def parse_json_dict(line: str) -> dict[str, Any] | None:
+    """One JSONL line as a dict; None for blank, undecodable, or non-object
+    lines. The shared preamble of every stream parser and log scanner."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    """Every JSON-object line of a JSONL file, in order; skips lines that do
+    not decode to a dict. A missing or unreadable file yields nothing."""
+    try:
+        with path.open() as fh:
+            for line in fh:
+                payload = parse_json_dict(line)
+                if payload is not None:
+                    yield payload
+    except OSError:
+        return
 
 
 def typed_token(value: Any) -> int | None:

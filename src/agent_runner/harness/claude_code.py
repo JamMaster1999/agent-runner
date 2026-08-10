@@ -19,7 +19,13 @@ from typing import Any, ClassVar, Mapping
 
 from agent_runner import outcomes, util
 from agent_runner.auth import normalize_token, seed_credential_file
-from agent_runner.harness.base import AgentDef, Capabilities, HarnessAdapter, SpawnSpec
+from agent_runner.harness.base import (
+    COMMON_TERMINAL_MARKERS,
+    AgentDef,
+    Capabilities,
+    HarnessAdapter,
+    SpawnSpec,
+)
 from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.harness.claude_stream import ClaudeStreamParser
 from agent_runner.util import write_text
@@ -47,24 +53,6 @@ def yaml_scalar(value: object) -> str:
     return str(value)
 
 
-def claude_session_id(stdout_path: Path) -> str | None:
-    """The session id from a Claude --print stream-json log, for
-    `claude --resume` follow-ups on an interrupted attempt."""
-    try:
-        with stdout_path.open() as fh:
-            for line in fh:
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                session_id = payload.get("session_id")
-                if session_id:
-                    return str(session_id)
-    except OSError:
-        return None
-    return None
-
-
 class ClaudeCodeAdapter(HarnessAdapter):
     """The Claude Code CLI (`claude --print --output-format stream-json`,
     prompt on stdin)."""
@@ -83,58 +71,9 @@ class ClaudeCodeAdapter(HarnessAdapter):
         doctor=False,
         final_message_artifact=False,
     )
-    # Marker codes ARE outcome words. Identical to the codex table on
-    # purpose: the pre-adapter code matched one shared list for both CLIs;
-    # prune per dialect deliberately, never as a side effect. Order matters —
-    # first match wins, and a subscription CLI's "usage limit" text must
-    # classify rate_limited before the auth/billing sweep sees it.
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
-        (
-            outcomes.RATE_LIMITED,
-            (
-                "rate limit",
-                "rate_limit",
-                "too many requests",
-                "overloaded_error",
-                "usage limit",
-            ),
-        ),
-        (
-            outcomes.AUTH,
-            (
-                "authentication_error",
-                "authentication_failed",
-                "401 unauthorized",
-                "missing bearer",
-                "oauth token has expired",
-                "token expired",
-                "please run /login",
-                "not logged in",
-                "login required",
-                "invalid api key",
-                "api key not found",
-                "billing_error",
-                "credit balance is too low",
-                "insufficient_quota",
-                "payment required",
-                "out of credit",
-            ),
-        ),
-        (
-            outcomes.SPAWN_FAILURE,
-            (
-                "unknown option",
-                "unknown argument",
-                "unexpected argument",
-                "unrecognized argument",
-                "invalid value for",
-                "no such subcommand",
-            ),
-        ),
+        COMMON_TERMINAL_MARKERS
     )
-
-    def resolve_binary(self) -> str | None:
-        return claude_command()
 
     def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
         """CLAUDE_CONFIG_DIR on the volume (config, credentials, and session
@@ -215,25 +154,27 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "--permission-mode",
             "bypassPermissions",
         ]
-        # Tool restrictions are caller DATA (policy["disallowed_tools"]), not
+        # Tool restrictions are caller DATA (policy.disallowed_tools), not
         # a business rule baked into every spawn.
-        disallowed = spec.policy.get("disallowed_tools") or []
-        if disallowed:
-            command.append("--disallowedTools=" + ",".join(str(t) for t in disallowed))
-        # Setting-source isolation as caller data: e.g. ["project"] keeps the
+        if spec.policy.disallowed_tools:
+            command.append(
+                "--disallowedTools=" + ",".join(str(t) for t in spec.policy.disallowed_tools)
+            )
+        # Setting-source isolation as caller data: e.g. ("project",) keeps the
         # operator's user-global Claude state (plugins, skills, personal
         # memory) out of production sessions — the claude-side counterpart of
         # pinning CODEX_HOME.
-        sources = spec.policy.get("setting_sources")
-        if sources is not None:
-            command += ["--setting-sources", ",".join(str(s) for s in sources)]
+        if spec.policy.setting_sources is not None:
+            command += [
+                "--setting-sources",
+                ",".join(str(s) for s in spec.policy.setting_sources),
+            ]
         # Reasoning effort as caller data: the CLI accepts effort only as the
         # session-level --effort flag; agent frontmatter has no effort key.
         # Unknown values are warn-and-ignored by the CLI, so passthrough is
         # safe.
-        effort = spec.policy.get("effort")
-        if effort:
-            command += ["--effort", str(effort)]
+        if spec.policy.effort:
+            command += ["--effort", str(spec.policy.effort)]
         command += [
             "--print",
             "--verbose",
@@ -267,14 +208,13 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "RUNNER_CLAUDE_CLI",
         )
 
-    def session_ref_from_log(self, stdout_path: Path) -> str | None:
-        return claude_session_id(stdout_path)
+    def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
+        # Every claude --print stream-json event carries session_id.
+        session_id = payload.get("session_id")
+        return str(session_id) if session_id else None
 
     def stream_parser(self) -> ClaudeStreamParser:
         return ClaudeStreamParser()
-
-    def hook_event_log(self) -> Path:
-        return util.state_dir() / "claude_hooks" / "events.jsonl"
 
     def normalize_hook_event(
         self, event: dict[str, Any], agent_name: str
@@ -293,20 +233,28 @@ class ClaudeCodeAdapter(HarnessAdapter):
             return "hook_session_end", f"Claude session ended: {event.get('reason') or 'unknown'}"
         return None
 
-    def stream_fatal(self, payload: dict[str, Any]) -> str | None:
+    def stream_fatal(self, payload: dict[str, Any]) -> RunnerError | None:
         """A 401/403 api_retry event is a dead credential the CLI will retry
         ~10 times over ~20 minutes of exponential backoff (live tier,
         2026-08-09); the attempt must fail as auth now, not as timeout after
-        the ladder runs out."""
+        the ladder runs out. The event's own HTTP status decides the outcome
+        — typed evidence, immune to CLI error-text rewording."""
         if payload.get("type") == "system" and payload.get("subtype") == "api_retry":
             try:
                 status = int(payload.get("error_status") or 0)
             except (TypeError, ValueError):
                 return None
             if status in (401, 403):
-                return (
+                message = (
                     f"claude api_retry: {payload.get('error') or 'auth failure'} "
                     f"(HTTP {status})"
+                )
+                return RunnerError(
+                    message,
+                    code=outcomes.AUTH,
+                    retryable=False,
+                    alert=True,
+                    details=message,
                 )
         return None
 

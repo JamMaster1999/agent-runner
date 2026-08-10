@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Characterization tests for codex_thread_id / claude_session_id.
+"""Characterization tests for session-ref extraction.
 
 Pins session-ref extraction from captured attempt stdout files (the inputs
 to `codex exec resume` / `claude --resume`), now living in the harness
@@ -27,8 +27,16 @@ try:
 except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
-from agent_runner.harness.claude_code import claude_session_id  # noqa: E402
-from agent_runner.harness.codex import codex_thread_id  # noqa: E402
+from agent_runner.harness.claude_code import ClaudeCodeAdapter  # noqa: E402
+from agent_runner.harness.codex import CodexAdapter  # noqa: E402
+
+
+def codex_thread_id(path):
+    return CodexAdapter().session_ref_from_log(path)
+
+
+def claude_session_id(path):
+    return ClaudeCodeAdapter().session_ref_from_log(path)
 
 
 def write_jsonl(path: Path, payloads: list) -> Path:

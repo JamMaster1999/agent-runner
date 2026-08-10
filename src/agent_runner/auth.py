@@ -15,6 +15,7 @@ helpers without a cycle.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -28,21 +29,20 @@ def normalize_token(value: str) -> str:
 def seed_credential_file(path: Path, value: str) -> bool:
     """Write ``value`` to ``path`` (mode 0600) only when the file does not
     exist yet — seeded once; a refreshed credential the CLI already wrote is
-    never clobbered by the stale seed. Returns True when it wrote."""
+    never clobbered by the stale seed. Returns True when it wrote.
+
+    The content lands via a pid-unique sibling temp file and one atomic
+    rename, so no reader ever observes a partially written (or empty)
+    credential file — the touch-then-write it replaces left the file empty
+    for a moment, which a concurrently starting CLI read as broken auth."""
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(mode=0o600)
-    path.write_text(value)
-    path.chmod(0o600)
+    tmp = path.parent / f".{path.name}.seed.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, value.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
     return True
-
-
-def prepare_auth(volume_root: Path, *, apply: bool = True) -> dict[str, str]:
-    """Seed every registered adapter's credentials onto the volume-backed
-    homes and return the environment overrides. Auth and sessions share the
-    home, so this is ``sessions.prepare_session_homes`` under its auth name
-    (imported lazily: sessions pulls the adapter registry in)."""
-    from agent_runner.sessions import prepare_session_homes
-
-    return prepare_session_homes(volume_root, apply=apply)

@@ -30,7 +30,6 @@ What crosses the boundary from the project side:
 from __future__ import annotations
 
 import dataclasses
-import json
 import subprocess
 import time
 from pathlib import Path
@@ -39,7 +38,7 @@ from typing import Any, Callable
 from agent_runner import outcomes, util
 from agent_runner.harness import get_adapter
 from agent_runner.harness.base import AgentDef, HarnessAdapter
-from agent_runner.harness.stream import JsonlTail, StreamEvent
+from agent_runner.harness.stream import JsonlTail, StreamEvent, parse_json_dict
 from agent_runner.isolation import agent_env
 from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Verdict
 from agent_runner.sessions import RESUME_PREAMBLE
@@ -49,15 +48,16 @@ from agent_runner.util import write_text
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
 REPAIR_TIMEOUT_MINUTES = 15.0
 
-# Adapter evidence codes -> the outcome vocabulary. Marker tables already
-# speak outcome words; anything unproven is infra by definition.
-_CODE_TO_OUTCOME = {
-    outcomes.AUTH: outcomes.AUTH,
-    outcomes.RATE_LIMITED: outcomes.RATE_LIMITED,
-    outcomes.SPAWN_FAILURE: outcomes.SPAWN_FAILURE,
-    outcomes.TIMEOUT: outcomes.TIMEOUT,
-    "missing_command": outcomes.SPAWN_FAILURE,
-}
+# Adapter evidence codes -> the outcome vocabulary: one alias, outcome words
+# pass through, anything unproven is infra by definition.
+_CODE_ALIASES = {"missing_command": outcomes.SPAWN_FAILURE}
+
+
+def _outcome_for(code: str) -> str:
+    aliased = _CODE_ALIASES.get(code)
+    if aliased:
+        return aliased
+    return code if code in outcomes.OUTCOMES else outcomes.INFRA
 
 
 class AttemptCancelled(RunnerError):
@@ -103,47 +103,36 @@ def _terminate(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def _filtered_hook_events(
-    event_log: Path, run_id: str, key: str, attempt: int
-) -> list[dict[str, Any]]:
-    try:
-        lines = event_log.read_text().splitlines()
-    except FileNotFoundError:
-        return []
-    events: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (
-            event.get("run_id") == run_id
-            and event.get("job_stable_id") == key
-            and int(event.get("attempt") or -1) == attempt
-        ):
-            events.append(event)
-    return events
-
-
 class _HookDrain:
-    """Convert newly captured hook events to StreamEvents, once each."""
+    """Tail the harness hook log and convert this attempt's newly captured
+    events to StreamEvents. The log is shared O_APPEND across parallel
+    attempts, so each line is read once (offset tail) and filtered by the
+    attempt's attribution stamp; a torn or corrupt line is skipped, never
+    fatal."""
 
     def __init__(self, adapter: HarnessAdapter, spec: RunSpec, run_id: str, attempt: int):
         self.adapter = adapter
         self.spec = spec
         self.run_id = run_id
         self.attempt = attempt
-        self.seen: set[str] = set()
+        self.tail = JsonlTail(adapter.hook_event_log())
 
     def drain(self) -> list[StreamEvent]:
         events: list[StreamEvent] = []
-        for event in _filtered_hook_events(
-            self.adapter.hook_event_log(), self.run_id, self.spec.key, self.attempt
-        ):
-            event_key = json.dumps(event, sort_keys=True)
-            if event_key in self.seen:
+        for line in self.tail.read_new_lines():
+            event = parse_json_dict(line)
+            if event is None:
                 continue
-            self.seen.add(event_key)
+            if (
+                event.get("run_id") != self.run_id
+                or event.get("job_stable_id") != self.spec.key
+            ):
+                continue
+            try:
+                if int(event.get("attempt") or -1) != self.attempt:
+                    continue
+            except (TypeError, ValueError):
+                continue
             normalized = self.adapter.normalize_hook_event(event, self.spec.agent_ref)
             if normalized is None:
                 continue
@@ -169,8 +158,7 @@ def _classify_exit(
     failure = adapter.classify_failure(
         detail or f"{adapter.display_name} exited {returncode}."
     )
-    outcome = _CODE_TO_OUTCOME.get(failure.code, outcomes.INFRA)
-    return outcome, f"{spec.key}: {failure}", failure.details
+    return _outcome_for(failure.code), f"{spec.key}: {failure}", failure.details
 
 
 def _repair(
@@ -205,7 +193,9 @@ def _repair(
         )
     )
     try:
-        with followup.stdout_path.open("w") as stdout, followup.stderr_path.open("w") as stderr:
+        # Append, not truncate: repair rounds share these paths, and a
+        # multi-round failure must keep every round's log for debugging.
+        with followup.stdout_path.open("a") as stdout, followup.stderr_path.open("a") as stderr:
             process = subprocess.Popen(
                 followup.command,
                 cwd=util.project_root(),
@@ -261,7 +251,7 @@ def run_attempt(
     here is the closed run-varying set (``{{RUNNER_*}}`` and
     ``{{RESOURCE:*}}`` tokens — values that cannot exist until attempt
     start). ``session_ref`` resumes that session instead of starting fresh
-    (the resume preamble is prepended; ``spec.policy["resume_preamble"]``
+    (the resume preamble is prepended; ``spec.policy.resume_preamble``
     overrides the default text). ``should_stop`` polled true terminates the
     CLI and raises ``AttemptCancelled``.
 
@@ -310,7 +300,8 @@ def run_attempt(
             task, runner_variables(run_id, spec.key, attempt, workdir, resource_variables)
         )
         if session_ref:
-            prompt = str(spec.policy.get("resume_preamble") or RESUME_PREAMBLE) + prompt
+            preamble = spec.policy.resume_preamble
+            prompt = (RESUME_PREAMBLE if preamble is None else preamble) + prompt
 
         try:
             if session_ref:
@@ -338,31 +329,30 @@ def run_attempt(
         stream_parser = adapter.stream_parser()
         hook_drain = _HookDrain(adapter, spec, run_id, attempt)
 
-        fatal_evidence: list[str] = []
+        fatal_errors: list[RunnerError] = []
 
         def drain_streams() -> None:
             for line in stream_tail.read_new_lines():
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    payload = None
-                if isinstance(payload, dict):
+                payload = parse_json_dict(line)
+                if payload is not None:
                     fatal = adapter.stream_fatal(payload)
                     if fatal is not None:
-                        fatal_evidence.append(fatal)
+                        fatal_errors.append(fatal)
+                    # The session ref rides the lines already being tailed —
+                    # no log rescan, ever.
+                    if report.session_ref is None or report.session_ref == session_ref:
+                        live_ref = adapter.session_ref_from_event(payload)
+                        if live_ref and live_ref != report.session_ref:
+                            report.session_ref = live_ref
+                            if on_session is not None:
+                                try:
+                                    on_session(live_ref)
+                                except Exception:
+                                    pass
                 for event in stream_parser.parse_line(line):
                     emit(event)
             for event in hook_drain.drain():
                 emit(event)
-            if report.session_ref is None or report.session_ref == session_ref:
-                live_ref = adapter.session_ref_from_log(spawn.stdout_path)
-                if live_ref and live_ref != report.session_ref:
-                    report.session_ref = live_ref
-                    if on_session is not None:
-                        try:
-                            on_session(live_ref)
-                        except Exception:
-                            pass
 
         with spawn.stdout_path.open("w") as stdout, spawn.stderr_path.open("w") as stderr:
             try:
@@ -399,20 +389,20 @@ def run_attempt(
                 timeout = float(
                     timeout_minutes
                     if timeout_minutes is not None
-                    else spec.policy.get("attempt_timeout_minutes")
-                    or DEFAULT_ATTEMPT_TIMEOUT_MINUTES
+                    else spec.policy.attempt_timeout_minutes
+                    if spec.policy.attempt_timeout_minutes is not None
+                    else DEFAULT_ATTEMPT_TIMEOUT_MINUTES
                 )
                 deadline = time.monotonic() + timeout * 60
                 while process.poll() is None:
                     drain_streams()
-                    if fatal_evidence:
+                    if fatal_errors:
                         # The CLI just proved this attempt cannot succeed;
-                        # waiting out its own retry ladder buys nothing.
+                        # waiting out its own retry ladder buys nothing. The
+                        # first typed fatal decides the outcome.
                         _terminate(process)
-                        failure = adapter.classify_failure("\n".join(fatal_evidence))
-                        report.outcome = _CODE_TO_OUTCOME.get(
-                            failure.code, outcomes.INFRA
-                        )
+                        failure = fatal_errors[0]
+                        report.outcome = _outcome_for(failure.code)
                         report.error = f"{spec.key}: {failure}"
                         report.detail = failure.details
                         return report
@@ -440,25 +430,27 @@ def run_attempt(
 
         # A zero exit is not proof of success for every CLI: some exit 0
         # with a failed final turn, so ask the adapter for terminal stream
-        # evidence before believing the exit code.
-        zero_exit_failure: str | None = None
+        # evidence before believing the exit code. Typed fatals collected
+        # live take precedence over marker classification of terminal text.
+        zero_exit_error: RunnerError | None = None
         if process.returncode == 0:
-            zero_exit_failure = adapter.terminal_failure(spawn.stdout_path)
-            if zero_exit_failure is None and fatal_evidence:
-                zero_exit_failure = "\n".join(fatal_evidence)
+            terminal_text = adapter.terminal_failure(spawn.stdout_path)
+            if terminal_text is not None:
+                zero_exit_error = adapter.classify_failure(terminal_text)
+            elif fatal_errors:
+                zero_exit_error = fatal_errors[0]
 
-        if process.returncode != 0 or zero_exit_failure:
+        if process.returncode != 0 or zero_exit_error:
             # Output validity beats exit code: a crash during shutdown after
             # the deliverable was written must not burn the completed work.
             if verdict is not None and verdict.valid:
                 report.outcome = outcomes.VALID
                 report.data = verdict.data
                 return report
-            if zero_exit_failure:
-                failure = adapter.classify_failure(zero_exit_failure)
-                report.outcome = _CODE_TO_OUTCOME.get(failure.code, outcomes.INFRA)
-                report.error = f"{spec.key}: {failure}"
-                report.detail = failure.details
+            if zero_exit_error:
+                report.outcome = _outcome_for(zero_exit_error.code)
+                report.error = f"{spec.key}: {zero_exit_error}"
+                report.detail = zero_exit_error.details
                 return report
             report.outcome, report.error, report.detail = _classify_exit(
                 adapter, spec, spawn, process.returncode
@@ -479,15 +471,16 @@ def run_attempt(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
                     env, emit, poll_seconds, should_stop,
                 )
-                if repaired:
-                    report.repair_rounds_used += 1
+                if not repaired:
+                    break  # nothing ran; the workdir is unchanged
+                report.repair_rounds_used += 1
                 retry_verdict = validate(workdir)
                 if retry_verdict.valid:
                     emit(StreamEvent("repair_succeeded", "Repair pass fixed the output"))
                     report.outcome = outcomes.VALID
                     report.data = retry_verdict.data
                     return report
-                if not repaired or retry_verdict.message == verdict.message:
+                if retry_verdict.message == verdict.message:
                     break
                 verdict = retry_verdict
 
