@@ -231,6 +231,9 @@ class CodexAdapter(HarnessAdapter):
             outcomes.AUTH,
             (
                 "authentication_error",
+                "authentication_failed",
+                "401 unauthorized",
+                "missing bearer",
                 "oauth token has expired",
                 "token expired",
                 "please run /login",
@@ -374,6 +377,32 @@ class CodexAdapter(HarnessAdapter):
         if hook_name == "PostToolUse" and tool_name in {"wait_agent", "multi_agent_v1wait_agent"}:
             return "hook_subagent_stop", "Codex subagent wait completed"
         return None
+
+    def terminal_failure(self, stdout_path: Path) -> str | None:
+        """codex exec exits 0 even when its turn failed (live tier,
+        2026-08-09): the final turn.failed event on the stream is the truth
+        the exit code hides. A later turn.completed clears earlier failures."""
+        last: str | None = None
+        try:
+            with stdout_path.open() as fh:
+                for line in fh:
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    kind = payload.get("type") or ""
+                    if kind == "turn.completed":
+                        last = None
+                    elif kind == "turn.failed":
+                        last = str(
+                            (payload.get("error") or {}).get("message")
+                            or "codex turn failed"
+                        )
+        except OSError:
+            return None
+        return last
 
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:
         """codex --json emits `turn.failed` / `error` events."""

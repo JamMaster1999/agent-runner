@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -463,6 +464,100 @@ class ClaudeAgentDefTest(FakeCliCase):
         argv = self.recorded_call(0)["argv"]
         self.assertIn("--agent", argv)
         self.assertIn("fixture-claude-agent", argv)
+
+
+class StreamFatalAbortTest(FakeCliCase):
+    def test_claude_auth_retry_loop_aborts_as_auth(self) -> None:
+        # A 401 api_retry ladder must classify auth NOW; before the
+        # stream_fatal hook the attempt sat out the CLI's ~20-minute backoff
+        # and misclassified as timeout (found by the live tier, 2026-08-09).
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "system", "subtype": "init", "session_id": "sess-auth", "model": "m"},
+                        {
+                            "type": "system",
+                            "subtype": "api_retry",
+                            "attempt": 1,
+                            "max_retries": 10,
+                            "error_status": 401,
+                            "error": "authentication_failed",
+                            "session_id": "sess-auth",
+                        },
+                    ],
+                    "sleep": 60,
+                    "exit": 0,
+                }
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n"
+        )
+        start = time.monotonic()
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            poll_seconds=0.05,
+            timeout_minutes=0.5,
+        )
+        self.assertEqual(report.outcome, outcomes.AUTH)
+        self.assertLess(time.monotonic() - start, 30)
+
+
+class ZeroExitTurnFailedTest(FakeCliCase):
+    def test_codex_zero_exit_turn_failed_classifies_auth(self) -> None:
+        # codex exec exits 0 on a failed turn; before the terminal_failure
+        # hook this classified VALID (found by the live tier, 2026-08-09).
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "thread.started", "thread_id": "t-1"},
+                        {
+                            "type": "error",
+                            "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+                        },
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+                            },
+                        },
+                    ],
+                    "exit": 0,
+                }
+            ]
+        )
+        report = run_attempt(codex_spec(), "task", self.workdir, poll_seconds=0.05)
+        self.assertEqual(report.outcome, outcomes.AUTH)
+        self.assertIn("missing bearer", report.detail.lower())
+
+    def test_valid_output_beats_turn_failure(self) -> None:
+        # The preserved policy: a written, validating deliverable wins even
+        # when the final turn reports failure.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "thread.started", "thread_id": "t-2"},
+                        {"type": "turn.failed", "error": {"message": "crash during shutdown"}},
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        report = run_attempt(
+            codex_spec(), "task", self.workdir, validate=self.json_validator(), poll_seconds=0.05
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
 
 
 if __name__ == "__main__":

@@ -215,6 +215,19 @@ class HarnessAdapter(ABC):
             return "\n".join(errors[-5:])
         return read_tail(stderr_path, 4000).strip()
 
+    def stream_fatal(self, payload: dict[str, Any]) -> str | None:
+        """CLI-owned evidence from one LIVE stream event that the attempt can
+        no longer succeed (an auth-dead retry loop, say): the loop terminates
+        the CLI and classifies with this text instead of waiting out the
+        CLI's own backoff ladder. Default: no such evidence."""
+        return None
+
+    def terminal_failure(self, stdout_path: Path) -> str | None:
+        """CLI-owned evidence, read after a ZERO exit, that the final turn
+        failed anyway (a CLI that exits 0 on failed turns). None: the exit
+        code stands. Default: exit codes tell the truth."""
+        return None
+
     def classify(self, text: str) -> RunnerError | None:
         """Terminal-failure evidence from this harness's marker data; None
         means no proof and the core default (``infra``) applies. Callers
