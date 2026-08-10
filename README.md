@@ -1,19 +1,23 @@
 # agent-runner
 
-Run [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) CLI agents from Python — spawn the CLI, stream its output live, and end every attempt with exactly one truthful outcome.
+Use Claude Code and Codex as workers in your automated workflows.
 
-Agent CLIs are easy to start and hard to trust: they retry dead credentials for twenty minutes, exit 0 on failed turns, and bury the real error in a JSON stream. agent-runner wraps one CLI attempt in a loop that always reaps the child process, classifies how it actually ended, and hands back the session handle so a retry can resume the conversation instead of paying for it twice.
+An agentic workflow is a chain of agent steps: research a topic, check the result, save it, move on. Real workflows run many of these agents at once. The cheapest way to run them is through the agent CLIs you already subscribe to. Claude Code and Codex run on your Claude or ChatGPT subscription, so a workflow that fans out fifty research agents needs no API key and no per-token bill.
+
+The problem is that these CLIs were built for a person at a keyboard, not for automation. Left alone, one will retry a dead login for twenty minutes, another reports success after a failed run, and the real error hides inside a JSON stream. agent-runner wraps one CLI run in a loop that always cleans up the process, reads the stream as it happens, and ends with one honest word that says what happened. It also hands you the session, so a retry can pick up where the agent left off instead of paying for the same work twice.
+
+This library grew out of a production pipeline that runs thousands of research agents this way. It contains the runner only. Your prompts, your checks, and your storage stay in your code.
 
 ## Installation
 
 ```bash
 pip install git+https://github.com/JamMaster1999/agent-runner.git
 
-# with the Temporal activity wrapper:
+# with the Temporal workflow wrapper:
 pip install 'agent-runner[temporal] @ git+https://github.com/JamMaster1999/agent-runner.git'
 ```
 
-Requires Python 3.13+ and at least one agent CLI installed and authenticated:
+Requires Python 3.13+ and at least one agent CLI, installed and logged in with your subscription:
 
 ```bash
 npm install -g @anthropic-ai/claude-code   # then: claude login
@@ -21,6 +25,8 @@ npm install -g @openai/codex               # then: codex login
 ```
 
 ## Quick start
+
+One agent, one task, one result file.
 
 ```python
 import os
@@ -30,10 +36,10 @@ from agent_runner.attempt import run_attempt
 from agent_runner.harness.base import AgentDef
 from agent_runner.runtime import RunSpec
 
-# Attempt directories and agent discovery files are created under this root.
+# Working folders and agent files are created under this root.
 os.environ["AGENT_RUNNER_PROJECT_ROOT"] = str(Path.cwd())
 
-workdir = Path("attempt-1")
+workdir = Path("run-1")
 workdir.mkdir(exist_ok=True)
 
 report = run_attempt(
@@ -49,51 +55,51 @@ report = run_attempt(
 )
 
 print(report.outcome)           # "valid"
-print(report.session_ref)       # the handle a later attempt can resume
-print(report.usage.tok_output)  # token usage, aggregated from the stream
+print(report.session_ref)       # the handle a later run can resume
+print(report.usage.tok_output)  # token usage, read from the stream
 ```
 
-`{{RUNNER_OUTPUT_PATH}}` is substituted with the attempt's working directory at spawn time; the CLI only ever sees a concrete local path. Swap `harness="codex"` (and drop the claude-specific `model` config) to run the same attempt on Codex.
+`{{RUNNER_OUTPUT_PATH}}` is replaced with the run's working folder at start time. The agent only ever sees a normal local path. To run the same task on Codex, set `harness="codex"` and give the agent a Codex model name in its config, or an empty config for the defaults.
 
 ## Outcomes
 
-Every attempt ends with exactly one word on `report.outcome`:
+Every run ends with exactly one word on `report.outcome`:
 
 | Outcome | Meaning |
 |---|---|
-| `valid` | the deliverable exists and passed your validator |
-| `invalid_schema` | it ran, but the output failed validation (after any repair rounds) |
-| `rate_limited` | the provider said slow down — includes subscription usage caps |
-| `auth` | the credential is dead; fail fast instead of burning retries |
-| `timeout` | the attempt outlived its budget and the CLI child was reaped |
-| `spawn_failure` | the CLI never started (missing binary, bad flags) |
-| `infra` | it failed, and the CLI's own error text proves nothing more specific |
+| `valid` | the result exists and passed your check |
+| `invalid_schema` | the agent ran, but the result failed your check |
+| `rate_limited` | the provider said slow down, including subscription usage caps |
+| `auth` | the login is dead, so fail fast instead of burning retries |
+| `timeout` | the run took too long and the process was stopped |
+| `spawn_failure` | the CLI never started, for example a missing binary |
+| `infra` | it failed, and the CLI's own error output proves nothing more specific |
 
-Two rules keep the classification honest:
+Two rules keep these words honest:
 
-- **Output validity beats exit code.** A CLI crash after the deliverable was written still classifies `valid`; a zero exit with a failed final turn classifies as the failure it hid.
-- **Evidence comes only from CLI-owned error text** — typed stream error events or stderr — never from the agent transcript, where research content can contain words like "403" incidentally. A stream event proving the attempt can no longer succeed (an auth-dead retry loop) aborts it immediately.
+- **A good result beats the exit code.** If the agent wrote a passing result and the CLI crashed on the way out, the run is still `valid`. If the CLI exited cleanly but its final turn failed, the run is the failure it tried to hide.
+- **Errors are read only from the CLI's own error output, never from the agent's transcript.** A research agent may quote a web page that contains "403". That must never be mistaken for a real error.
 
 ```python
 from agent_runner import outcomes
 
 if report.outcome == outcomes.VALID:
-    publish(report.data)
+    save(report.data)
 elif report.outcome == outcomes.RATE_LIMITED:
-    sleep_long_and_retry()          # costs nothing, the work is intact
+    wait_and_retry()               # costs nothing, the work is intact
 elif report.outcome == outcomes.AUTH:
-    alert_operator(report.error)    # retrying a dead login burns time, not tokens
+    alert_operator(report.error)   # retrying a dead login wastes time
 ```
 
-## Validating output
+## Checking the result
 
-Validation is yours: pass a closure returning a `Verdict`. On a failed verdict with a `repair_message`, the message is sent into the attempt's still-open session — on CLIs that support in-session follow-ups (Codex) — so fixing a malformed output costs seconds, not a fresh run.
+The check is yours: pass a function that returns a `Verdict`. If the check fails and you supply a repair message, that message is sent into the agent's still-open session (on CLIs that support follow-up messages, currently Codex). Fixing a malformed result this way costs seconds, not a fresh run.
 
 ```python
 import json
 from agent_runner.runtime import Verdict
 
-def validate(workdir):
+def check(workdir):
     path = workdir / "answer.json"
     if not path.is_file():
         return Verdict(valid=False, message="answer.json missing",
@@ -109,14 +115,14 @@ report = run_attempt(
     RunSpec(key="survey", harness="codex", agent_config={}, repair_rounds=2),
     "Answer the question as JSON in {{RUNNER_OUTPUT_PATH}}/answer.json: ...",
     workdir,
-    validate=validate,
+    validate=check,
 )
 report.repair_rounds_used  # how many repair messages it took
 ```
 
-## Resuming sessions
+## Resuming a session
 
-Every attempt surfaces the CLI's session handle as soon as the stream reveals it. Pass it back and the CLI reopens that conversation — with all of its context — instead of starting over.
+Every run surfaces the CLI's session handle as soon as the stream reveals it. Pass it back on the next run and the CLI reopens that conversation, with all of its context, instead of starting over. In a workflow this is the difference between a crash costing seconds and a crash costing a full research run.
 
 ```python
 first = run_attempt(spec, "Research the topic and remember your findings.", workdir_1, agent=agent)
@@ -126,31 +132,42 @@ second = run_attempt(
     "Now write the findings from this conversation to {{RUNNER_OUTPUT_PATH}}/findings.md.",
     workdir_2,
     agent=agent,
-    session_ref=first.session_ref,   # resume, don't restart
+    session_ref=first.session_ref,   # resume, do not restart
 )
 second.resumed  # True
 ```
 
-## Live telemetry
+## Running agents in parallel
 
-`on_event` streams progress, tool calls, token usage, and captured provider hook events while the CLI runs. `on_session` fires the moment the session handle appears, so you can persist the resume handle before the attempt ends — that is what makes crash-safe retries possible.
+`run_attempt` is a plain blocking function, so scaling out is ordinary Python. Every run gets its own working folder and its own session. The CLI login is shared, which is the point: all of them run on the one subscription.
 
 ```python
-run_attempt(
-    spec, task, workdir, agent=agent,
-    on_event=lambda e: print(e.kind, e.message),
-    on_session=lambda ref: store_resume_handle(ref),
-)
+from concurrent.futures import ThreadPoolExecutor
+
+topics = ["solar panels", "wind turbines", "heat pumps", "geothermal"]
+
+def research(topic):
+    workdir = Path("runs") / topic.replace(" ", "-")
+    workdir.mkdir(parents=True, exist_ok=True)
+    return run_attempt(
+        RunSpec(key="research-" + topic, harness="claude"),
+        "Research " + topic + " and write a one-page summary to {{RUNNER_OUTPUT_PATH}}/summary.md, then stop.",
+        workdir,
+        agent=agent,
+    )
+
+with ThreadPoolExecutor(max_workers=8) as pool:
+    reports = list(pool.map(research, topics))
 ```
 
-## Temporal integration
+## Workflows that survive crashes
 
-`agent_runner.temporal` (the `[temporal]` extra) wraps `run_attempt` for use inside a [Temporal](https://temporal.io) activity:
+For workflows that must survive worker crashes and run for hours, agent-runner ships a ready-made wrapper for [Temporal](https://temporal.io) as the `[temporal]` extra. Inside a Temporal activity it adds:
 
-- a heartbeat pump runs while the CLI does — liveness is the heartbeat, not a wall clock
-- the session handle rides heartbeat details, so an activity retry on any worker resumes the same CLI session
-- outcomes map to typed retry errors: `rate_limited` backs off long, `infra` retries elsewhere, `auth` is non-retryable
-- a resume budget caps how often one session is resumed before falling back to a fresh one
+- a heartbeat while the CLI runs, so the server knows the agent is alive without guessing from a clock
+- the session handle rides the heartbeat, so a retry on any machine resumes the same session
+- outcomes become typed retry errors: `rate_limited` waits long, `infra` retries elsewhere, `auth` stops immediately
+- a resume budget, so a poisoned session is eventually abandoned for a fresh one
 
 ```python
 from temporalio import activity
@@ -160,14 +177,28 @@ from agent_runner.temporal import run_agent_attempt
 async def research(packet: dict) -> dict:
     report = await run_agent_attempt(
         spec_for(packet), task_for(packet), workdir_for(packet),
-        agent=agent_for(packet), validate=validate_for(packet),
+        agent=agent_for(packet), validate=check_for(packet),
     )
-    return report.data  # non-valid outcomes raise typed ApplicationErrors
+    return report.data  # failed outcomes raise typed errors for Temporal's retry policy
 ```
 
-## Browser access
+## Using your subscription on servers
 
-`agent_runner.resources` provisions what a spec declares. `cdp_browser` spawns Chrome and hands its DevTools endpoint into the task as a template value; specs that declare nothing carry no browser dependencies.
+On your laptop the CLIs are logged in already. On a server fleet, seed the login once from environment variables onto a shared disk. Each CLI writes its refreshed tokens back to that disk, so the login keeps working across restarts and new machines, and every worker runs on the same subscription.
+
+```python
+from pathlib import Path
+from agent_runner.auth import prepare_auth
+
+# Reads CODEX_AUTH_JSON and CLAUDE_CREDENTIALS_JSON from the environment,
+# writes them to the volume the first time, and returns the environment
+# settings that point each CLI at that home.
+env = prepare_auth(Path("/data"))
+```
+
+## Giving an agent a browser
+
+A run can declare that it needs a browser. The `cdp_browser` resource starts Chrome and hands its address into the task as a template value. Runs that declare nothing carry no browser code.
 
 ```python
 from agent_runner.resources import cdp_browser
@@ -178,25 +209,25 @@ run_attempt(spec, "Connect to the browser at {{RESOURCE:cdp_browser.endpoint}} .
             workdir, resources={"cdp_browser": cdp_browser.provider()})
 ```
 
-## Harness adapters
+## How CLI support works
 
-Every provider difference — command shapes, stream dialects, failure markers, credential files, resume mechanics — lives in one adapter per CLI under [`src/agent_runner/harness/`](src/agent_runner/harness/). The core never branches on a provider name; adding a CLI means adding an adapter. `RUNNER_CLAUDE_CLI` / `RUNNER_CODEX_CLI` override binary discovery, which is also how the test rig substitutes a fake CLI.
+Everything specific to one CLI lives in one adapter file under [`src/agent_runner/harness/`](src/agent_runner/harness/): command shapes, stream formats, error markers, login files, resume mechanics. The core never mentions a provider by name. Supporting a new CLI means writing one adapter. The `RUNNER_CLAUDE_CLI` and `RUNNER_CODEX_CLI` variables override where the binaries are found, which is also how the test suite swaps in a fake CLI.
 
-## Worker base image
+## Docker base image
 
-The repo's [`Dockerfile`](Dockerfile) builds a worker base image for containerized deployments: pinned CLI versions with provenance (OCI labels plus `/etc/agent-runner-provenance.json`), Chrome for the browser resource, and the package with the temporal extra. Extend it and add only your own code.
+The repo's [`Dockerfile`](Dockerfile) builds a base image for containerized workers: pinned CLI versions, Chrome for the browser resource, and this package with the Temporal extra. The image records exactly which versions went into it, in its labels and in `/etc/agent-runner-provenance.json`. Extend it and add only your own code.
 
 ## Testing
 
 ```bash
-# token-free: a fake CLI replays scripted streams through the real adapters
+# free: a fake CLI replays scripted output through the real adapters
 python -m unittest discover tests
 
 # the live tier: real CLIs, real tokens, run on purpose
 RUN_LIVE=1 pytest tests/live
 ```
 
-The live tier proves what fakes cannot: that resume really recalls context, that repair really lands in the open session, and that the failure surfaces (auth, rate limit, usage cap) classify as the real binaries render them — rate limits are replicated by pointing the real CLI at a local stub endpoint, so nothing waits on a real cap. CI runs the suite with and without Temporal installed and fails the build on any Temporal import leaking into the core.
+The live tier proves what fakes cannot: that resume really recalls context, that repair really lands in the open session, and that auth failures, rate limits, and usage caps end with the right outcome word. Rate limits are reproduced by pointing the real CLI at a local stub server that answers with the provider's error responses, so nothing waits on a real cap and nothing spends tokens. CI runs the suite with and without Temporal installed and fails the build if a Temporal import leaks into the core.
 
 ## License
 
