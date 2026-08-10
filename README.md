@@ -1,6 +1,6 @@
 # Agent Runner
 
-A production runtime for AI coding agents. Spawn a CLI agent, stream its work, and get back a single classified outcome: the contract a workflow engine needs to treat agents as reliable steps.
+A production runtime for AI coding agents. Run Claude Code and Codex headless from Python, on the subscription you already pay for: spawn the CLI agent, stream its work, and get back a single classified outcome. That outcome is the contract a workflow engine needs to treat agents as reliable steps.
 
 ## The problem
 
@@ -13,7 +13,7 @@ Building with LLMs has followed a clear progression:
 
 Step 4 is where things break down. Workflow engines need activities that return a typed result and declare whether a failure is retryable. Agents don't naturally do that. They crash, hang, or silently produce garbage. And the agent CLIs were built for a person at a keyboard, not for automation. Left alone, one will retry a dead login for twenty minutes, another reports success after a failed run, and the real error hides inside a JSON stream.
 
-**agent-runner is the layer between your workflow and your agents.** It manages the full lifecycle of a CLI-based coding agent (Claude Code, Codex) as a subprocess: spawn, stream, validate, classify, repair, and always reap. Every attempt ends with exactly one of seven outcomes, and each outcome maps cleanly onto retry logic. It also hands you the session, so a retry can pick up where the agent left off instead of paying for the same work twice.
+**agent-runner is the layer between your workflow and your agents.** It manages the full lifecycle of a CLI-based coding agent (Claude Code, Codex) as a subprocess: spawn, stream, validate, classify, repair, and always reap. Every attempt ends with exactly one of seven outcomes, and each outcome maps cleanly onto retry logic. It also hands you the session, so a retry can pick up where the agent left off instead of paying for the same work twice. And because the agents run through the CLIs, everything runs on your existing Claude or ChatGPT plan instead of per-token API billing.
 
 ## Installation
 
@@ -84,6 +84,14 @@ print(report.usage.tok_output)  # token usage, read from the stream
 ```
 
 `{{RUNNER_OUTPUT_PATH}}` is replaced with the run's working folder at start time. The agent only ever sees a normal local path. To run the same task on Codex, set `harness="codex"` and give the agent a Codex model name in its config, or an empty config for the defaults.
+
+## Examples
+
+Three runnable scripts, each one file:
+
+- [`examples/parallel_fanout.py`](examples/parallel_fanout.py): fan out a batch of parallel AI agents on one subscription, four at a time
+- [`examples/kill_and_resume.py`](examples/kill_and_resume.py): kill the process mid-run, then watch a brand new process resume the same session with the agent's memory intact
+- [`examples/temporal_pipeline.py`](examples/temporal_pipeline.py): a durable Temporal workflow where the worker crashes after the agent worked, and the retry picks up the same conversation
 
 ## The seven outcomes
 
@@ -173,7 +181,7 @@ second.resumed  # True
 
 ## Running agents in parallel
 
-`run_attempt` is a plain blocking function, so scaling out is ordinary Python. Every run gets its own working folder and its own session. The CLI login is shared, which is the point: all of them run on the one subscription.
+`run_attempt` is a plain blocking function, so scaling out is ordinary Python. Every run gets its own working folder and its own session. The CLI login is shared, which is the point: all of them run on the one subscription. This is how you batch-process a long list with parallel AI agents and no API key.
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -196,7 +204,7 @@ with ThreadPoolExecutor(max_workers=8) as pool:
 
 
 
-## Workflows that survive crashes
+## Durable workflows that survive crashes
 
 For workflows that must survive worker crashes and run for hours, agent-runner ships a ready-made wrapper for [Temporal](https://temporal.io) as the `[temporal]` extra. Inside a Temporal activity it adds:
 
@@ -238,7 +246,7 @@ env = prepare_auth(Path("/data"))
 
 ## Giving an agent a browser
 
-A run can declare that it needs a browser. The `cdp_browser` resource starts Chrome and hands its address into the task as a template value. Runs that declare nothing carry no browser code.
+A run can declare that it needs a browser. The `cdp_browser` resource starts headless Chrome and hands its DevTools (CDP) address into the task as a template value, so a scraping agent can drive a real browser. Runs that declare nothing carry no browser code.
 
 ```python
 from agent_runner.resources import cdp_browser
@@ -313,6 +321,16 @@ RUN_LIVE=1 pytest tests/live
 ```
 
 The test suite is token-free: a fake-CLI rig stands in for the real CLIs, so spawn/stream/classify/repair run end to end with zero spend. The live tier proves what fakes cannot: that resume really recalls context, that repair really lands in the open session, and that auth failures and rate limits end with the right outcome word. CI runs the suite with and without Temporal installed and fails the build if a Temporal import leaks into core.
+
+## How this compares
+
+If you searched for a way to run Claude Code programmatically, or to use your Claude subscription instead of an API key for automation, you probably found three kinds of projects. Each solves a different problem.
+
+- **Parallel coding tools** (parallel-code, vibe-kanban, amux) run several coding agents in git worktrees while you review the diffs. Great interactive tools, built for a developer at a screen, not for a headless system.
+- **Official SDKs** (claude-agent-sdk, codex-sdk) give you programmatic access to one CLI each. They stop there: no shared outcome vocabulary across providers, no retry mapping, no session resume across machines.
+- **Agent frameworks** (LangGraph, CrewAI) orchestrate API calls, billed per token. They own the agent loop and know nothing about CLI subscriptions.
+
+agent-runner sits in the gap between them: AI agent orchestration where the workers are headless coding agents, the outcomes are typed for a workflow engine, and the bill is the flat subscription you already pay. The parallel runners are for your IDE. This is for your infrastructure.
 
 ## License
 
