@@ -1,35 +1,71 @@
 # agent-runner
 
-The hands that run agents: everything involved in running an agent CLI process (Claude Code, Codex) and telling the truth about what happened. A library shared across projects; each consumer calls it from inside its own activities. It knows nothing about pipelines, prompts, contracts, receipts, or business data — it runs agents.
+**Job:** run one agent CLI attempt — Claude Code or Codex — and tell the truth about how it ended. A Python library you call from your own code: it spawns the CLI, streams the live output, and ends every attempt with exactly one outcome word. Prompts, validation, retries, and storage stay on your side of the line.
 
-The platform half this repo used to carry (jobs, attempts, events, leases over Postgres, and the engine loop that served them) was deleted at the GTM Temporal rewrite's stage 3. Git history is the archive.
+## The shape
 
-## Core — zero Temporal imports, stdlib-only
+```python
+from agent_runner.attempt import run_attempt
+from agent_runner.harness.base import AgentDef
+from agent_runner.runtime import RunSpec, Verdict
 
-One entry point: `agent_runner.attempt.run_attempt(spec, task, workdir, ...)` — spawn an agent CLI with an agent definition and a task message (both already rendered upstream), stream its live output, and end the attempt with exactly one outcome.
+report = run_attempt(
+    RunSpec(key="survey", harness="claude"),
+    "Write the answer as JSON to {{RUNNER_OUTPUT_PATH}}/answer.json, then stop.",
+    workdir,
+    agent=AgentDef(name="surveyor", description="answers one question", config={"model": "haiku"}, body="You are a careful surveyor...\n"),
+    validate=lambda d: Verdict(valid=(d / "answer.json").is_file(), message="answer.json missing"),
+)
 
-- **spawn** — `RunSpec` + `AgentDef` in, CLI process out; provider command shapes live in the harness adapters (`agent_runner/harness/`), core never branches on a provider name
-- **stream** — `StreamEvent` telemetry via `on_event`: progress, tool calls, token usage and cost, plus captured provider hook events
-- **classify** — every attempt ends with exactly one outcome from `agent_runner.outcomes`: `valid` · `invalid_schema` · `rate_limited` · `infra` · `auth` · `timeout` · `spawn_failure`
-- **repair** — on `invalid_schema`, the caller's auto-generated repair message goes into the still-open session (`Verdict.repair_message`) before the attempt gives up
-- **sessions** — `session_ref` extraction for resume; `sessions.prepare_session_homes` points CLI homes at a durable volume so transcripts and sessions survive workers
-- **auth** — volume-backed CLI credential files (the Modal model): seeded once from the environment, refreshed tokens persist to the volume, tokens normalized on read (`agent_runner.auth`)
-- **workdirs** — the folders a model is handed: attempt workspaces and term-scoped checkpoint dirs with term-stamp verification (`agent_runner.workdirs`)
+report.outcome      # one word from the table below
+report.session_ref  # the handle a later attempt resumes
+report.usage        # tokens and cost, aggregated from the stream
+```
+
+The task message is rendered before it arrives; the only substitution performed here is the closed `{{RUNNER_*}}` set bound at attempt start. Validation crosses the boundary as a closure returning a `Verdict` — the library never parses or judges output content itself.
+
+## Outcomes
+
+Every attempt ends with exactly one word. Exit codes are not trusted on their own: a zero exit with a failed final turn classifies as the failure, and a nonzero exit after a valid deliverable classifies `valid` — output validity beats exit code.
+
+| outcome | meaning |
+|---|---|
+| `valid` | the deliverable exists and passed your validator |
+| `invalid_schema` | it ran, but the output failed validation (after any repair rounds) |
+| `rate_limited` | the provider said slow down — includes subscription usage caps |
+| `auth` | the credential is dead; retrying would burn time, fail fast instead |
+| `timeout` | the attempt outlived its budget and the CLI child was reaped |
+| `spawn_failure` | the CLI never started (missing binary, bad flags) |
+| `infra` | it failed and the CLI's own error text proves nothing more specific |
+
+Failure evidence comes only from CLI-owned error text — typed stream error events or stderr — never from the agent transcript, whose research content can contain words like "403" incidentally. A stream event proving the attempt can no longer succeed (an auth-dead retry loop, say) aborts it immediately instead of waiting out the CLI's own backoff.
+
+## What rides the attempt
+
+- **stream** — `on_event` delivers live telemetry: progress, tool calls, token usage and cost, captured provider hook events
+- **repair** — on a failed validation, your `Verdict.repair_message` is sent into the still-open session before the attempt gives up; fixing costs seconds, not a re-run
+- **resume** — pass the previous attempt's `session_ref` and the CLI reopens that conversation instead of starting over
+- **workdirs** — attempt workspaces and term-stamped checkpoint folders; a stale checkpoint from another term is discarded loudly, never resumed
+- **isolation** — the CLI child gets a filtered environment: a safe baseline plus exactly what the spec declared (`required_env`) and what its adapter needs
+- **auth** — credential files seeded once from the environment onto a durable volume; tokens the CLI refreshes persist there, and every token is whitespace-normalized on read
 - **hygiene** — the CLI child is always reaped, on every exit path
-- **isolation** — agents get a filtered environment: a safe baseline plus exactly what the spec declared (`required_env`) and what the adapter's CLI needs (`agent_runner.isolation`)
 
-Validation is the project's: `run_attempt(validate=...)` takes a closure returning a `Verdict`; agent-runner never parses or judges output content itself.
+Provider differences — command shapes, stream dialects, failure markers, credential files — live in one adapter per CLI under `agent_runner/harness/`. The core never spells a provider's name.
 
 ## Optional modules
 
-- `agent_runner.temporal` (`pip install 'agent-runner[temporal]'`) — the ready-made Temporal activity wrapper, called from inside a project's activity: heartbeat pump while the CLI runs, `session_ref` + progress in heartbeat details (a retry resumes the session), the ruled outcome-to-retry mapping (`rate_limited` backs off long and free, `infra` retries on another worker, `auth` fails fast for the caller to alert on), checkpoint folders prepared before spawn with term stamps verified before resume, and a resume budget with fresh-session fallback.
-- `agent_runner.resources` — provisioning for a spec's declared `resource_specs`: `cdp_browser` spawns Chrome and hands its endpoint in as a `{{RESOURCE:cdp_browser.*}}` template value. Projects that declare nothing carry no browser dependencies.
+- `agent_runner.temporal` (`pip install 'agent-runner[temporal]'`) — a ready-made [Temporal](https://temporal.io) activity wrapper: a heartbeat pump while the CLI runs, `session_ref` riding heartbeat details so an activity retry resumes the session, outcome-aware retry errors (`rate_limited` backs off long, `auth` is non-retryable), and a resume budget with fresh-session fallback
+- `agent_runner.resources` — provisioning for a spec's declared resources: `cdp_browser` spawns Chrome and hands its endpoint in as a template value; declare nothing, carry no browser dependencies
 
 ## The base image
 
-`Dockerfile` builds the worker base image (published by `.github/workflows/publish-image.yml` to ghcr.io): pinned claude/codex CLIs with provenance (OCI labels + `/etc/agent-runner-provenance.json`), Chrome, and the package with the temporal extra. Consumer projects extend it and add only their own code, config, and hooks. What enters the image is an allowlist — three named COPY paths — never a blocklist.
+`Dockerfile` builds a worker base image: pinned CLI versions with provenance (OCI labels plus `/etc/agent-runner-provenance.json`), Chrome, and the package with the temporal extra. What enters the image is an allowlist of three named COPY paths — a state file invented tomorrow stays out by construction. Extend it and add only your own code.
 
-## Install / test
+## Install and test
 
-- Editable install: `pip install -e .` (core has zero dependencies); `pip install -e '.[temporal]'` for the activity wrapper.
-- Tests: `python -m unittest discover tests`. The suite is token-free: the fake-CLI rig (`tests/fake_cli/fake-cli`) stands in for the real CLIs via the `RUNNER_CODEX_CLI` / `RUNNER_CLAUDE_CLI` overrides, so spawn/stream/classify/repair run end to end with zero spend. Temporal-less runs skip the temporal suite cleanly; CI runs both modes and fails the build on any Temporal import leak into core.
+- `pip install -e .` — the core has zero dependencies; `pip install -e '.[temporal]'` adds the activity wrapper
+- `python -m unittest discover tests` — token-free: a fake-CLI rig stands in for the real binaries via the `RUNNER_CLAUDE_CLI` / `RUNNER_CODEX_CLI` overrides, so spawn, stream, classify, and repair run end to end with zero spend
+- `RUN_LIVE=1 pytest tests/live` — the live tier: real CLIs, real tokens, run on purpose; proves resume really recalls context, repair really lands in the open session, and the failure surfaces (auth, rate limit, usage cap) classify as the real binaries render them
+- CI runs the suite with and without Temporal installed and fails the build on any Temporal import leaking into the core
+
+MIT licensed.
