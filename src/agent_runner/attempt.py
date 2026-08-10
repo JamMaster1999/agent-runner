@@ -338,8 +338,18 @@ def run_attempt(
         stream_parser = adapter.stream_parser()
         hook_drain = _HookDrain(adapter, spec, run_id, attempt)
 
+        fatal_evidence: list[str] = []
+
         def drain_streams() -> None:
             for line in stream_tail.read_new_lines():
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    fatal = adapter.stream_fatal(payload)
+                    if fatal is not None:
+                        fatal_evidence.append(fatal)
                 for event in stream_parser.parse_line(line):
                     emit(event)
             for event in hook_drain.drain():
@@ -395,6 +405,17 @@ def run_attempt(
                 deadline = time.monotonic() + timeout * 60
                 while process.poll() is None:
                     drain_streams()
+                    if fatal_evidence:
+                        # The CLI just proved this attempt cannot succeed;
+                        # waiting out its own retry ladder buys nothing.
+                        _terminate(process)
+                        failure = adapter.classify_failure("\n".join(fatal_evidence))
+                        report.outcome = _CODE_TO_OUTCOME.get(
+                            failure.code, outcomes.INFRA
+                        )
+                        report.error = f"{spec.key}: {failure}"
+                        report.detail = failure.details
+                        return report
                     if should_stop is not None and should_stop():
                         _terminate(process)
                         raise AttemptCancelled(
@@ -417,12 +438,27 @@ def run_attempt(
 
         verdict = validate(workdir) if validate is not None else None
 
-        if process.returncode != 0:
+        # A zero exit is not proof of success for every CLI: codex exec
+        # exits 0 on a failed turn, so ask the adapter for terminal stream
+        # evidence before believing the exit code.
+        zero_exit_failure: str | None = None
+        if process.returncode == 0:
+            zero_exit_failure = adapter.terminal_failure(spawn.stdout_path)
+            if zero_exit_failure is None and fatal_evidence:
+                zero_exit_failure = "\n".join(fatal_evidence)
+
+        if process.returncode != 0 or zero_exit_failure:
             # Output validity beats exit code: a crash during shutdown after
             # the deliverable was written must not burn the completed work.
             if verdict is not None and verdict.valid:
                 report.outcome = outcomes.VALID
                 report.data = verdict.data
+                return report
+            if zero_exit_failure:
+                failure = adapter.classify_failure(zero_exit_failure)
+                report.outcome = _CODE_TO_OUTCOME.get(failure.code, outcomes.INFRA)
+                report.error = f"{spec.key}: {failure}"
+                report.detail = failure.details
                 return report
             report.outcome, report.error, report.detail = _classify_exit(
                 adapter, spec, spawn, process.returncode

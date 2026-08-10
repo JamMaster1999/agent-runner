@@ -103,6 +103,9 @@ class ClaudeCodeAdapter(HarnessAdapter):
             outcomes.AUTH,
             (
                 "authentication_error",
+                "authentication_failed",
+                "401 unauthorized",
+                "missing bearer",
                 "oauth token has expired",
                 "token expired",
                 "please run /login",
@@ -288,6 +291,23 @@ class ClaudeCodeAdapter(HarnessAdapter):
             return "hook_stop", f"Claude stop hook fired: {agent_name}"
         if hook_name == "SessionEnd":
             return "hook_session_end", f"Claude session ended: {event.get('reason') or 'unknown'}"
+        return None
+
+    def stream_fatal(self, payload: dict[str, Any]) -> str | None:
+        """A 401/403 api_retry event is a dead credential the CLI will retry
+        ~10 times over ~20 minutes of exponential backoff (live tier,
+        2026-08-09); the attempt must fail as auth now, not as timeout after
+        the ladder runs out."""
+        if payload.get("type") == "system" and payload.get("subtype") == "api_retry":
+            try:
+                status = int(payload.get("error_status") or 0)
+            except (TypeError, ValueError):
+                return None
+            if status in (401, 403):
+                return (
+                    f"claude api_retry: {payload.get('error') or 'auth failure'} "
+                    f"(HTTP {status})"
+                )
         return None
 
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:
