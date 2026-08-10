@@ -85,6 +85,14 @@ print(report.usage.tok_output)  # token usage, read from the stream
 
 `{{RUNNER_OUTPUT_PATH}}` is replaced with the run's working folder at start time. The agent only ever sees a normal local path. To run the same task on Codex, set `harness="codex"` and give the agent a Codex model name in its config, or an empty config for the defaults.
 
+## Examples
+
+Three runnable scripts, each one file:
+
+- [`examples/parallel_fanout.py`](examples/parallel_fanout.py): fan out a batch of parallel AI agents on one subscription, four at a time
+- [`examples/kill_and_resume.py`](examples/kill_and_resume.py): kill the process mid-run, then watch a brand new process resume the same session with the agent's memory intact
+- [`examples/temporal_pipeline.py`](examples/temporal_pipeline.py): a durable Temporal workflow where the worker crashes after the agent worked, and the retry picks up the same conversation
+
 ## The seven outcomes
 
 Every run ends with exactly one word on `report.outcome`. No exceptions, no ambiguity.
@@ -313,6 +321,16 @@ RUN_LIVE=1 pytest tests/live
 ```
 
 The test suite is token-free: a fake-CLI rig stands in for the real CLIs, so spawn/stream/classify/repair run end to end with zero spend. The live tier proves what fakes cannot: that resume really recalls context, that repair really lands in the open session, and that auth failures and rate limits end with the right outcome word. CI runs the suite with and without Temporal installed and fails the build if a Temporal import leaks into core.
+
+## How this compares
+
+If you searched for a way to run Claude Code programmatically, or to use your Claude subscription instead of an API key for automation, you probably found three kinds of projects. Each solves a different problem.
+
+- **Parallel coding tools** (parallel-code, vibe-kanban, amux) run several coding agents in git worktrees while you review the diffs. Great interactive tools, built for a developer at a screen, not for a headless system.
+- **Official SDKs** (claude-agent-sdk, codex-sdk) give you programmatic access to one CLI each. They stop there: no shared outcome vocabulary across providers, no retry mapping, no session resume across machines.
+- **Agent frameworks** (LangGraph, CrewAI) orchestrate API calls, billed per token. They own the agent loop and know nothing about CLI subscriptions.
+
+agent-runner sits in the gap between them: AI agent orchestration where the workers are headless coding agents, the outcomes are typed for a workflow engine, and the bill is the flat subscription you already pay. The parallel runners are for your IDE. This is for your infrastructure.
 
 ## License
 
