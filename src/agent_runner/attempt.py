@@ -30,7 +30,9 @@ What crosses the boundary from the project side:
 from __future__ import annotations
 
 import dataclasses
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -88,6 +90,24 @@ def runner_variables(
     }
     variables.update(resource_variables or {})
     return variables
+
+
+def _pdeathsig() -> Callable[[], None] | None:
+    """Linux: the spawned CLI asks the kernel to TERM it when the worker
+    dies, so a hard-killed worker cannot leak a token-burning orphan
+    session. (PR_SET_PDEATHSIG also fires on forking-thread death — fine,
+    the attempt thread always outlives its CLI.) Elsewhere: None — prod
+    runs on Linux containers, which reap on exit anyway."""
+    if sys.platform != "linux":
+        return None
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+    def _set() -> None:
+        libc.prctl(1, signal.SIGTERM)  # 1 = PR_SET_PDEATHSIG
+
+    return _set
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -201,6 +221,7 @@ def _repair(
                 cwd=util.project_root(),
                 env=env,
                 stdin=subprocess.PIPE,
+                preexec_fn=_pdeathsig(),
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
@@ -361,6 +382,7 @@ def run_attempt(
                     cwd=util.project_root(),
                     env=env,
                     stdin=subprocess.PIPE,
+                    preexec_fn=_pdeathsig(),
                     stdout=stdout,
                     stderr=stderr,
                     text=True,
