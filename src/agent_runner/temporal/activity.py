@@ -17,6 +17,7 @@ Temporal-facing mechanics of one CLI attempt:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -71,6 +72,7 @@ class _HeartbeatState:
 
     session_ref: str | None = None
     resume_count: int = 0
+    agent_fp: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -79,8 +81,20 @@ class _HeartbeatState:
             return {
                 "session_ref": self.session_ref,
                 "resume_count": self.resume_count,
+                "agent_fp": self.agent_fp,
                 "progress": dict(self.progress),
             }
+
+
+def agent_fingerprint(agent: AgentDef | None) -> str | None:
+    """A content hash of the prompt the session was started under. A session
+    is only resumable by the SAME prompt: any change — minor bumps included
+    (ruled 2026-08-16) — makes the recorded transcript a conversation with a
+    prompt that no longer exists, so a differing fingerprint runs fresh."""
+    if agent is None:
+        return None
+    material = agent.body + "\x00" + repr(sorted((agent.config or {}).items()))
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def prior_heartbeat_details() -> dict[str, Any] | None:
@@ -132,9 +146,16 @@ async def run_agent_attempt(
     config = config or TemporalRunConfig()
     info = activity.info()
 
-    session_ref, resume_count, fresh_fallback = resume_decision(
-        prior_heartbeat_details(), config.resume_budget
-    )
+    prior = prior_heartbeat_details()
+    current_fp = agent_fingerprint(agent)
+    if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
+        activity.logger.warning(
+            "%s: the agent prompt changed since the prior session started; "
+            "its transcript belongs to a prompt that no longer exists — running fresh",
+            spec.key,
+        )
+        prior = None
+    session_ref, resume_count, fresh_fallback = resume_decision(prior, config.resume_budget)
     if fresh_fallback:
         activity.logger.warning(
             "%s: resume budget (%d) exhausted for the prior session; "
@@ -149,7 +170,9 @@ async def run_agent_attempt(
         # for whatever was lost — time, never correctness.
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
-    state = _HeartbeatState(session_ref=session_ref, resume_count=resume_count)
+    state = _HeartbeatState(
+        session_ref=session_ref, resume_count=resume_count, agent_fp=current_fp
+    )
 
     def on_event(event: StreamEvent) -> None:
         with state.lock:

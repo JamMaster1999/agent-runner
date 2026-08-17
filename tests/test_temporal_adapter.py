@@ -112,6 +112,21 @@ class ResumeDecisionTest(unittest.TestCase):
             self.decide({"session_ref": None, "resume_count": 2}), (None, 0, False)
         )
 
+    def test_fingerprint_names_the_prompt_not_the_run(self) -> None:
+        """Same prompt -> same fingerprint; any body or config change -> a
+        different one (a minor bump kills resume, ruled 2026-08-16)."""
+        from agent_runner.harness.base import AgentDef
+
+        a = AgentDef(name="x", description="d", config={"model": "m"}, body="prompt")
+        same = AgentDef(name="y", description="other", config={"model": "m"}, body="prompt")
+        touched = AgentDef(name="x", description="d", config={"model": "m"}, body="prompt v2")
+        reconfigured = AgentDef(name="x", description="d", config={"model": "m2"}, body="prompt")
+        fp = activity_module.agent_fingerprint
+        self.assertEqual(fp(a), fp(same))
+        self.assertNotEqual(fp(a), fp(touched))
+        self.assertNotEqual(fp(a), fp(reconfigured))
+        self.assertIsNone(fp(None))
+
 
 @unittest.skipUnless(HAVE_TEMPORALIO, "temporalio not installed (core CI is Temporal-less)")
 class ActivityRunTest(unittest.TestCase):
