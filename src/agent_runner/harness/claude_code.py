@@ -61,8 +61,8 @@ class ClaudeCodeAdapter(HarnessAdapter):
     display_name: ClassVar[str] = "Claude"
     start_label: ClassVar[str] = "Claude"
     session_noun: ClassVar[str] = "session"
-    # resume/followup: `claude --resume <session>` (session resume and the
-    # repair path). doctor=False: `claude doctor` exists but is unstructured.
+    # resume/followup: `claude --resume <session>`.
+    # doctor=False: `claude doctor` exists but is unstructured.
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
         followup=True,

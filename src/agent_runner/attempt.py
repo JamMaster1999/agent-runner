@@ -202,7 +202,10 @@ def _repair(
     session_ref = adapter.session_ref_from_log(stdout_path)
     if not session_ref:
         return False
-    followup = adapter.build_followup(spec, workdir, session_ref)
+    try:
+        followup = adapter.build_followup(spec, workdir, session_ref)
+    except RunnerError:
+        return False
     if followup is None:
         return False
     emit(
@@ -212,7 +215,14 @@ def _repair(
             f"messaging the {adapter.display_name} session to repair",
         )
     )
+    repair_tail = JsonlTail(followup.stdout_path)
+    repair_parser = adapter.stream_parser()
+    process: subprocess.Popen | None = None
     try:
+        try:
+            repair_tail.offset = followup.stdout_path.stat().st_size
+        except FileNotFoundError:
+            pass
         # Append, not truncate: repair rounds share these paths, and a
         # multi-round failure must keep every round's log for debugging.
         with followup.stdout_path.open("a") as stdout, followup.stderr_path.open("a") as stderr:
@@ -245,7 +255,12 @@ def _repair(
                 _terminate(process)
     except OSError:
         return False
-    return True
+    finally:
+        if process is not None:
+            for line in repair_tail.read_new_lines():
+                for event in repair_parser.parse_line(line):
+                    emit(event)
+    return process is not None and process.returncode == 0
 
 
 def run_attempt(

@@ -131,7 +131,7 @@ elif report.outcome == outcomes.AUTH:
 
 Validation is yours: pass a function that returns a `Verdict`. agent-runner never parses or judges agent output. It classifies based on your verdict.
 
-If the check fails and you supply a repair message, that message is sent into the agent's still-open session (on CLIs that support follow-up messages, currently Codex). Fixing a malformed result this way costs seconds, not a fresh run. Multiple rounds iterate up to the spec's `repair_rounds` budget.
+If the check fails and you supply a repair message, that message is sent into the agent's still-open session (on CLIs that support follow-up messages, currently Codex and Claude). Fixing a malformed result this way costs seconds, not a fresh run. Multiple rounds iterate up to the spec's `repair_rounds` budget.
 
 ```python
 import json
