@@ -318,6 +318,179 @@ class RepairTest(FakeCliCase):
         self.assertIn("th_1", followup["argv"])
         self.assertEqual(followup["stdin"], "REPAIR: set ok=true in out.json")
 
+    def test_claude_invalid_schema_repairs_into_the_open_session(self) -> None:
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "system", "session_id": "sess-1"}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                },
+                {
+                    "emit": [
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_creation_input_tokens": 20,
+                                "cache_read_input_tokens": 30,
+                                "output_tokens": 40,
+                            },
+                            "total_cost_usd": 0.1,
+                        }
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": "not-json"}],
+                    "exit": 0,
+                },
+                {
+                    "emit": [
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "usage": {
+                                "input_tokens": 1,
+                                "cache_creation_input_tokens": 2,
+                                "cache_read_input_tokens": 3,
+                                "output_tokens": 4,
+                            },
+                            "total_cost_usd": 0.02,
+                        }
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                },
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent",
+            description="fixture",
+            config={},
+            body="Fixture body.\n",
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                repair_rounds=2,
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(report.repair_rounds_used, 2)
+        self.assertEqual(report.usage.tok_input, 11)
+        self.assertEqual(report.usage.tok_cache_write, 22)
+        self.assertEqual(report.usage.tok_cache_read, 33)
+        self.assertEqual(report.usage.tok_output, 44)
+        self.assertAlmostEqual(report.usage.cost_usd, 0.12)
+        followup = self.recorded_call(1)
+        self.assertIn("--resume", followup["argv"])
+        self.assertIn("sess-1", followup["argv"])
+        self.assertEqual(followup["stdin"], "REPAIR: set ok=true in out.json")
+
+    def test_claude_failed_repair_is_not_counted_as_successful(self) -> None:
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "system", "session_id": "sess-1"}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                },
+                {
+                    "emit": [
+                        {
+                            "type": "result",
+                            "subtype": "error_during_execution",
+                            "usage": {
+                                "input_tokens": 5,
+                                "cache_creation_input_tokens": 6,
+                                "cache_read_input_tokens": 7,
+                                "output_tokens": 8,
+                            },
+                            "total_cost_usd": 0.03,
+                        }
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "stderr": "No conversation found with session ID sess-1",
+                    "exit": 1,
+                },
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent",
+            description="fixture",
+            config={},
+            body="Fixture body.\n",
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                repair_rounds=2,
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.INVALID_SCHEMA)
+        self.assertEqual(report.repair_rounds_used, 0)
+        self.assertEqual(report.usage.tok_input, 5)
+        self.assertEqual(report.usage.tok_cache_write, 6)
+        self.assertEqual(report.usage.tok_cache_read, 7)
+        self.assertEqual(report.usage.tok_output, 8)
+        self.assertAlmostEqual(report.usage.cost_usd, 0.03)
+        self.assertFalse((self.calls / "call-02.json").exists())
+
+    def test_claude_followup_build_error_preserves_invalid_verdict(self) -> None:
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "system", "session_id": "sess-1"}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent",
+            description="fixture",
+            config={},
+            body="Fixture body.\n",
+        )
+        validate_json = self.json_validator()
+
+        def validate(workdir: Path) -> Verdict:
+            verdict = validate_json(workdir)
+            (self.tmp / ".claude" / "agents" / "fixture-claude-agent.md").unlink(
+                missing_ok=True
+            )
+            return verdict
+
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                repair_rounds=2,
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            validate=validate,
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.INVALID_SCHEMA)
+        self.assertEqual(report.repair_rounds_used, 0)
+        self.assertFalse((self.calls / "call-01.json").exists())
+
     def test_no_repair_budget_ends_invalid_schema(self) -> None:
         self.scenario(
             [

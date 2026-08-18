@@ -93,6 +93,35 @@ def test_codex_resume_recalls_context(project_root: Path) -> None:
     _resume_recalls_codeword(codex_spec, CODEX_AGENT, project_root)
 
 
+@require_claude
+def test_claude_repair_into_open_session(workdir: Path) -> None:
+    """Round 1 writes only what the task asked; the validator demands a second
+    file and supplies the repair message. The repair must land in the SAME
+    session and fix the output without a fresh attempt."""
+    repair = (
+        f"Your output is incomplete. Also write exactly the word BETA into the file "
+        f"{workdir}/beta.txt, then stop."
+    )
+
+    def validate(directory: Path):
+        alpha = file_check("alpha.txt", "ALPHA")(directory)
+        if not alpha.valid:
+            return alpha
+        return file_check("beta.txt", "BETA", repair=repair)(directory)
+
+    report = run_attempt(
+        claude_spec(repair_rounds=2),
+        "Write exactly the word ALPHA into the file {{RUNNER_OUTPUT_PATH}}/alpha.txt, then stop. "
+        "Do not create any other files.",
+        workdir,
+        agent=CLAUDE_AGENT,
+        validate=validate,
+        timeout_minutes=8,
+    )
+    assert report.outcome == outcomes.VALID, report.error
+    assert report.repair_rounds_used >= 1, "repair never ran — outcome was reached some other way"
+
+
 @require_codex
 def test_codex_repair_into_open_session(workdir: Path) -> None:
     """Round 1 writes only what the task asked; the validator demands a second
