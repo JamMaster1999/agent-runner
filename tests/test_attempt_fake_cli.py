@@ -318,6 +318,46 @@ class RepairTest(FakeCliCase):
         self.assertIn("th_1", followup["argv"])
         self.assertEqual(followup["stdin"], "REPAIR: set ok=true in out.json")
 
+    def test_claude_invalid_schema_repairs_into_the_open_session(self) -> None:
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "system", "session_id": "sess-1"}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                },
+                {
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                },
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent",
+            description="fixture",
+            config={},
+            body="Fixture body.\n",
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                repair_rounds=2,
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(report.repair_rounds_used, 1)
+        followup = self.recorded_call(1)
+        self.assertIn("--resume", followup["argv"])
+        self.assertIn("sess-1", followup["argv"])
+        self.assertEqual(followup["stdin"], "REPAIR: set ok=true in out.json")
+
     def test_no_repair_budget_ends_invalid_schema(self) -> None:
         self.scenario(
             [

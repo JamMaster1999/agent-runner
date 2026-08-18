@@ -61,12 +61,11 @@ class ClaudeCodeAdapter(HarnessAdapter):
     display_name: ClassVar[str] = "Claude"
     start_label: ClassVar[str] = "Claude"
     session_noun: ClassVar[str] = "session"
-    # resume: `claude --resume <session>`. followup=False: no in-session
-    # repair today — validation failure goes straight to retry (the central
-    # degradation). doctor=False: `claude doctor` exists but is unstructured.
+    # resume/followup: `claude --resume <session>` (session resume and the
+    # repair path). doctor=False: `claude doctor` exists but is unstructured.
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
-        followup=False,
+        followup=True,
         hooks=True,
         doctor=False,
         final_message_artifact=False,
@@ -194,6 +193,18 @@ class ClaudeCodeAdapter(HarnessAdapter):
             command=spawn.command + ["--resume", session_ref],
             stdout_path=spawn.stdout_path,
             stderr_path=spawn.stderr_path,
+        )
+
+    def build_followup(
+        self, spec: RunSpec, directory: Path, session_ref: str
+    ) -> SpawnSpec | None:
+        if not claude_command():
+            return None
+        resume = self.build_resume(spec, directory, session_ref)
+        return SpawnSpec(
+            command=resume.command,
+            stdout_path=directory / "claude.repair.stdout.log",
+            stderr_path=directory / "claude.repair.stderr.log",
         )
 
     def env_overrides(self) -> dict[str, str]:

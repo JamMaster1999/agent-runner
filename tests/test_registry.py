@@ -59,7 +59,7 @@ class BuiltinRegistrationTest(unittest.TestCase):
             adapter.capabilities,
             Capabilities(
                 resume=True,
-                followup=False,
+                followup=True,
                 hooks=True,
                 doctor=False,
                 final_message_artifact=False,
