@@ -245,13 +245,13 @@ class CheckpointMirrorTest(MirrorCase):
         directory = self.checkpoint("worker-a")
         stamp = directory / "progress.json"
         stamp.write_text(json.dumps({"term": "2026FALL", "pages": 12}))
-        state.push_checkpoints(directory)
+        workdirs.push_checkpoints(directory)
 
         # The folder path IS the key, so the next worker — which mounts the
         # volume in the same place and starts with nothing in it — reads
         # worker A's stamps back.
         stamp.unlink()
-        state.pull_checkpoints(directory)
+        workdirs.pull_checkpoints(directory)
         survivors = workdirs.verify_or_discard(directory, "2026FALL")
         self.assertEqual([p.name for p in survivors], ["progress.json"])
         self.assertEqual(json.loads(stamp.read_text())["pages"], 12)
@@ -260,14 +260,14 @@ class CheckpointMirrorTest(MirrorCase):
         directory = self.checkpoint("worker-a")
         stamp = directory / "progress.json"
         stamp.write_text(json.dumps({"term": "2026FALL", "pages": 1}))
-        state.push_checkpoints(directory)
+        workdirs.push_checkpoints(directory)
         stamp.write_text(json.dumps({"term": "2026FALL", "pages": 99}))
         _os.utime(stamp, (self.s3.clock.timestamp() + 60,) * 2)
-        state.pull_checkpoints(directory)
+        workdirs.pull_checkpoints(directory)
         self.assertEqual(json.loads(stamp.read_text())["pages"], 99)
 
     def test_an_empty_folder_pushes_nothing(self) -> None:
-        state.push_checkpoints(self.checkpoint("worker-a"))
+        workdirs.push_checkpoints(self.checkpoint("worker-a"))
         self.assertFalse(self.s3.objects)
 
 
@@ -303,7 +303,7 @@ class KeyLayoutTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "escaped.jsonl").exists())
 
     def test_the_checkpoint_folder_path_is_its_key(self) -> None:
-        group = state.checkpoint_group(Path("/data/checkpoints/mit/run-7/scrape/2026FALL"))
+        group = workdirs.checkpoint_group(Path("/data/checkpoints/mit/run-7/scrape/2026FALL"))
         self.assertEqual(
             group, "checkpoints/data/checkpoints/mit/run-7/scrape/2026FALL"
         )
@@ -424,8 +424,8 @@ class MirrorUnsetTest(unittest.TestCase):
                 self.assertTrue(sessions.ensure_session_local(adapter, "th_gone"))
                 sessions.push_session(adapter, "th_gone")
             directory = workdirs.checkpoint_dir(Path(tmp), "scrape", "2026FALL")
-            state.pull_checkpoints(directory)
-            state.push_checkpoints(directory)
+            workdirs.pull_checkpoints(directory)
+            workdirs.push_checkpoints(directory)
 
 
 class MissingDependencyTest(unittest.TestCase):

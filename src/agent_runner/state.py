@@ -1,5 +1,10 @@
-"""State mirror: worker-local session and checkpoint files, mirrored
-through S3 so any worker can pick up any run.
+"""State mirror: worker-local files mirrored through S3 so any worker can
+pick up any run.
+
+This module is the transport and its policy — where objects go, what is
+allowed to travel, what a failure costs. What travels is its callers':
+``agent_runner.sessions`` mirrors CLI session transcripts,
+``agent_runner.workdirs`` mirrors checkpoint folders.
 
 Local disk stays the working layer. The CLIs read and write their own
 files exactly as before, and nothing here sits on the hot path: the mirror
@@ -34,11 +39,12 @@ import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import urlparse
 
 STATE_S3_ENV = "AGENT_RUNNER_STATE_S3"
 
-# The exclusion, spelled out: these two are the CLI login files every worker
-# seeds for itself, and the rest are the usual credential-file names.
+# The exclusion, spelled out: the first two are the CLI login files every
+# worker seeds for itself, then the usual credential-file names.
 DENIED_NAMES = frozenset({"auth.json", ".credentials.json", ".netrc", ".env"})
 
 # ...plus anything whose name says credential. Session transcripts are
@@ -76,14 +82,12 @@ def parse_s3_url(url: str) -> tuple[str, str]:
     """``s3://bucket/prefix`` -> ``("bucket", "prefix")``. Raises on
     anything else: a misconfigured destination is a boot-time error, never
     a silently disabled mirror."""
-    if not url.startswith("s3://"):
+    parsed = urlparse(url)
+    if parsed.scheme != "s3" or not parsed.netloc:
         raise RuntimeError(
             f"{STATE_S3_ENV}={url!r} is not an S3 URL; expected s3://bucket/prefix."
         )
-    bucket, _, prefix = url[len("s3://") :].partition("/")
-    if not bucket:
-        raise RuntimeError(f"{STATE_S3_ENV}={url!r} names no bucket.")
-    return bucket, prefix.strip("/")
+    return parsed.netloc, parsed.path.strip("/")
 
 
 def _warn(message: str) -> None:
@@ -92,15 +96,25 @@ def _warn(message: str) -> None:
 
 def s3_client() -> Any:
     """A fresh S3 client on its own boto3 Session — boto3's default session
-    is not thread-safe, and attempts finish concurrently."""
+    is not thread-safe, and attempts finish concurrently.
+
+    Timeouts are short and retries few on purpose: these calls sit in an
+    attempt's teardown, where a stalled transfer costs heartbeats. A mirror
+    that gives up quickly is doing its job."""
     try:
         import boto3
+        from botocore.config import Config
     except ImportError as exc:
         raise RuntimeError(
             f"{STATE_S3_ENV} is set but boto3 is not installed. Install the "
             "optional extra: pip install 'agent-runner[s3]'."
         ) from exc
-    return boto3.session.Session().client("s3")
+    return boto3.session.Session().client(
+        "s3",
+        config=Config(
+            connect_timeout=5, read_timeout=30, retries={"max_attempts": 2}
+        ),
+    )
 
 
 class StateMirror:
@@ -120,48 +134,49 @@ class StateMirror:
     def key(self, group: str, relative: str = "") -> str:
         return "/".join(part for part in (self.prefix, group, relative) if part)
 
-    def push(self, group: str, root: Path, files: Iterable[Path]) -> list[str]:
+    def push(self, group: str, root: Path, files: Iterable[Path]) -> None:
         """Upload each file under ``group`` at its path relative to
         ``root``, so a restore lands it exactly where the CLI looks for it.
-        Returns the keys written; failures warn and are skipped."""
-        written: list[str] = []
+        A file that will not upload warns and is skipped."""
         for path in files:
             if is_denied(path.name):
+                # Never silent: session and checkpoint files cannot hit the
+                # denylist, so a name that does is worth an operator's eyes.
+                _warn(f"{path.name} reads as a credential; not uploaded")
                 continue
             try:
                 relative = path.relative_to(root).as_posix()
             except ValueError:
                 _warn(f"{path} is outside {root}; not mirrored")
                 continue
-            key = self.key(group, relative)
             try:
                 self.client.upload_file(
-                    Filename=str(path), Bucket=self.bucket, Key=key
+                    Filename=str(path), Bucket=self.bucket, Key=self.key(group, relative)
                 )
             except Exception as exc:
                 _warn(f"upload of {path} failed: {exc}")
-                continue
-            written.append(key)
-        return written
 
-    def pull(self, group: str, root: Path) -> list[Path]:
+    def pull(self, group: str, root: Path) -> None:
         """Download everything under ``group`` into ``root``, skipping files
-        this host already has at least as fresh. Returns the paths written;
-        failures warn and leave the file absent."""
+        this host already has at least as fresh. A file that will not
+        download warns and stays absent, which every caller reads as
+        "run fresh"."""
         root = Path(root)
         base = self.key(group)
-        restored: list[Path] = []
         try:
             listing = list(self._list(base + "/"))
         except Exception as exc:
             _warn(f"listing {base} failed: {exc}")
-            return restored
+            return
         for key, modified in listing:
             relative = key[len(base) + 1 :]
             if not relative:
                 continue  # a folder-marker object names no file
             target = root / relative
-            if is_denied(target.name) or not self._inside(root, target):
+            if is_denied(target.name):
+                _warn(f"{target.name} reads as a credential; not downloaded")
+                continue
+            if not self._inside(root, target):
                 continue
             if not _is_stale(target, modified):
                 continue
@@ -172,9 +187,6 @@ class StateMirror:
                 )
             except Exception as exc:
                 _warn(f"download of {key} failed: {exc}")
-                continue
-            restored.append(target)
-        return restored
 
     def _list(self, prefix: str) -> Iterator[tuple[str, Any]]:
         token: str | None = None
@@ -185,9 +197,11 @@ class StateMirror:
             response = self.client.list_objects_v2(**request)
             for item in response.get("Contents") or ():
                 yield item["Key"], item.get("LastModified")
-            if not response.get("IsTruncated"):
-                return
             token = response.get("NextContinuationToken")
+            # No token means there is no next page to ask for, whatever the
+            # truncation flag says: asking again would replay this one.
+            if not response.get("IsTruncated") or not token:
+                return
 
     @staticmethod
     def _inside(root: Path, target: Path) -> bool:
@@ -235,42 +249,3 @@ def active_mirror() -> StateMirror | None:
     except Exception as exc:
         _warn(str(exc))
         return None
-
-
-def checkpoint_group(directory: Path) -> str:
-    """The mirror key prefix for one checkpoint folder: its own absolute
-    path. The folder path already carries every scope its caller gave it
-    (run, child, term) and every worker mounts the volume at the same place,
-    so the path IS the identity — there is no second naming scheme to keep
-    in sync with the first."""
-    parts = [key_segment(part) for part in Path(directory).parts if part not in (os.sep, "/")]
-    return "/".join(["checkpoints", *parts])
-
-
-def push_checkpoints(directory: Path) -> None:
-    """Mirror a checkpoint folder after the attempt that stamped it. Files
-    only, one key each, top level only — the same set the term-stamp gate
-    verifies."""
-    active = active_mirror()
-    if active is None:
-        return
-    directory = Path(directory)
-    if not directory.is_dir():
-        return
-    active.push(
-        checkpoint_group(directory),
-        directory,
-        [path for path in sorted(directory.iterdir()) if path.is_file()],
-    )
-
-
-def pull_checkpoints(directory: Path) -> None:
-    """Bring another worker's stamps here before the term-stamp gate reads
-    them, so verification judges the whole run's progress and not just this
-    host's share of it."""
-    active = active_mirror()
-    if active is None:
-        return
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    active.pull(checkpoint_group(directory), directory)
