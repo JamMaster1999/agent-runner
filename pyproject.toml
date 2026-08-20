@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runner"
-version = "1.0.0"   # 1.0.0: stage-3 carve-out — core + optional modules; the platform half (jobs/attempts/events/leases over Postgres) is deleted
+version = "1.1.0"   # 1.1.0: the optional S3 state mirror — sessions and checkpoints follow a run to any worker (1.0.0: stage-3 carve-out, the Postgres platform half deleted)
 description = "Runs codex/claude CLI agents and tells the truth about what happened: spawn, stream, classify, repair, sessions, auth, workdirs, hygiene, isolation."
 requires-python = ">=3.13"        # matches the worker base image and consumer CI
 dependencies = []                 # core is stdlib-only by design; CI proves it imports with Temporal absent
 
 [project.optional-dependencies]
 temporal = ["temporalio>=1.7"]    # the activity wrapper (agent_runner.temporal)
+s3 = ["boto3>=1.34"]              # the state mirror (agent_runner.state), imported only when AGENT_RUNNER_STATE_S3 is set
 
 [project.scripts]
 agent-runner = "agent_runner.cli:main"

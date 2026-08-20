@@ -227,6 +227,17 @@ class HarnessAdapter(ABC):
                 return ref
         return None
 
+    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
+        """``(home, files)`` for one session: the CLI home that anchors this
+        harness's transcripts, and the files currently holding
+        ``session_ref`` there (empty when this host has never seen it).
+        Home and files answer together on purpose — an adapter either knows
+        where its transcripts live or it does not, and None means the state
+        mirror leaves this harness alone. Paths are relative to the home, so
+        a file restored from another worker lands exactly where the CLI
+        looks for it. Default: no locatable transcript."""
+        return None
+
     # -- telemetry ---------------------------------------------------------
 
     @abstractmethod

@@ -8,7 +8,8 @@ Temporal-facing mechanics of one CLI attempt:
 - session_ref + progress in heartbeat details (a retry resumes the session)
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
-  resume (mismatch: discard, log loudly, run fresh)
+  resume (mismatch: discard, log loudly, run fresh), and mirrored after
+  the attempt when a state mirror is configured
 - graceful cancellation: a cancelled activity terminates and reaps the CLI
   before the cancellation propagates
 - the ruled outcome-to-retry mapping on the way out (retry.py)
@@ -167,7 +168,10 @@ async def run_agent_attempt(
     if checkpoint is not None:
         # Prepared before spawn; verified before ANY resume of work in it.
         # A stamp from another term is discarded loudly and the run is fresh
-        # for whatever was lost — time, never correctness.
+        # for whatever was lost — time, never correctness. The mirror pull
+        # runs first so the gate judges the run's whole progress, including
+        # the attempts that ran on other hosts.
+        workdirs.pull_checkpoints(checkpoint.directory)
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
     state = _HeartbeatState(
@@ -238,6 +242,11 @@ async def run_agent_attempt(
         # The last word always lands: the final state (session_ref for the
         # next attempt's resume) is heartbeat-recorded even on failure.
         activity.heartbeat(state.payload())
+        if checkpoint is not None:
+            # A failed attempt still stamped whatever it finished; mirroring
+            # here is what lets the next attempt claim that work from any
+            # host.
+            workdirs.push_checkpoints(checkpoint.directory)
 
     if report.outcome == outcomes.VALID:
         return report

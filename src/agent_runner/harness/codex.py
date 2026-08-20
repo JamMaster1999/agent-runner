@@ -13,6 +13,7 @@ nothing read from disk."""
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -262,6 +263,17 @@ class CodexAdapter(HarnessAdapter):
         if payload.get("type") == "thread.started":
             return payload.get("thread_id") or None
         return None
+
+    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
+        """Rollout transcripts live date-nested under CODEX_HOME:
+        ``sessions/YYYY/MM/DD/rollout-<timestamp>-<thread>.jsonl``. The date
+        is the CLI's, not ours, so the thread is matched by glob."""
+        home = os.environ.get("CODEX_HOME")
+        if not home:
+            return None
+        home_path = Path(home)
+        pattern = f"sessions/*/*/*/rollout-*{glob.escape(session_ref)}*.jsonl"
+        return home_path, sorted(home_path.glob(pattern))
 
     def stream_parser(self) -> CodexStreamParser:
         return CodexStreamParser()
