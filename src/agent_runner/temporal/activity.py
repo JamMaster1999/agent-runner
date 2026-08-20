@@ -8,7 +8,8 @@ Temporal-facing mechanics of one CLI attempt:
 - session_ref + progress in heartbeat details (a retry resumes the session)
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
-  resume (mismatch: discard, log loudly, run fresh)
+  resume (mismatch: discard, log loudly, run fresh), and mirrored after
+  the attempt when a state mirror is configured
 - graceful cancellation: a cancelled activity terminates and reaps the CLI
   before the cancellation propagates
 - the ruled outcome-to-retry mapping on the way out (retry.py)
@@ -26,7 +27,7 @@ from typing import Any, Callable
 
 from temporalio import activity
 
-from agent_runner import outcomes, workdirs
+from agent_runner import outcomes, state, workdirs
 from agent_runner.attempt import AttemptCancelled, run_attempt
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
@@ -167,35 +168,41 @@ async def run_agent_attempt(
     if checkpoint is not None:
         # Prepared before spawn; verified before ANY resume of work in it.
         # A stamp from another term is discarded loudly and the run is fresh
-        # for whatever was lost — time, never correctness.
+        # for whatever was lost — time, never correctness. The mirror pull
+        # runs first so the gate judges the run's whole progress, including
+        # the attempts that ran on other hosts.
+        state.pull_checkpoints(checkpoint.directory)
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
-    state = _HeartbeatState(
+    heartbeat_state = _HeartbeatState(
         session_ref=session_ref, resume_count=resume_count, agent_fp=current_fp
     )
 
     def on_event(event: StreamEvent) -> None:
-        with state.lock:
+        with heartbeat_state.lock:
             if event.current is not None or event.total is not None:
-                state.progress = {
+                heartbeat_state.progress = {
                     "current": event.current,
                     "total": event.total,
                     "message": event.message,
                 }
             else:
-                state.progress = {**state.progress, "message": event.message}
+                heartbeat_state.progress = {
+                    **heartbeat_state.progress,
+                    "message": event.message,
+                }
 
     def on_session(ref: str) -> None:
-        with state.lock:
+        with heartbeat_state.lock:
             if ref != session_ref:
                 # A fresh session opened: the budget is the session's, so the
                 # count restarts with it.
-                state.resume_count = 0
-            state.session_ref = ref
+                heartbeat_state.resume_count = 0
+            heartbeat_state.session_ref = ref
 
     async def pump() -> None:
         while True:
-            activity.heartbeat(state.payload())
+            activity.heartbeat(heartbeat_state.payload())
             await asyncio.sleep(config.heartbeat_seconds)
 
     stop = threading.Event()
@@ -237,7 +244,12 @@ async def run_agent_attempt(
             pass
         # The last word always lands: the final state (session_ref for the
         # next attempt's resume) is heartbeat-recorded even on failure.
-        activity.heartbeat(state.payload())
+        activity.heartbeat(heartbeat_state.payload())
+        if checkpoint is not None:
+            # A failed attempt still stamped whatever it finished; mirroring
+            # here is what lets the next attempt claim that work from any
+            # host.
+            state.push_checkpoints(checkpoint.directory)
 
     if report.outcome == outcomes.VALID:
         return report

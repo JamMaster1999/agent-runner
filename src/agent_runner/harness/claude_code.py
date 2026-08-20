@@ -11,6 +11,7 @@ definition and a task message with nothing authored on disk by the caller."""
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -223,6 +224,19 @@ class ClaudeCodeAdapter(HarnessAdapter):
         # Every claude --print stream-json event carries session_id.
         session_id = payload.get("session_id")
         return str(session_id) if session_id else None
+
+    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
+        """One transcript per session under CLAUDE_CONFIG_DIR, in a folder
+        named after the cwd it ran in:
+        ``projects/<escaped-project-path>/<session_id>.jsonl``. The folder
+        name is the CLI's own escaping, so it is matched by glob and
+        restored under the name it was written with."""
+        home = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not home:
+            return None
+        home_path = Path(home)
+        pattern = f"projects/*/{glob.escape(session_ref)}.jsonl"
+        return home_path, sorted(home_path.glob(pattern))
 
     def stream_parser(self) -> ClaudeStreamParser:
         return ClaudeStreamParser()

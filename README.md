@@ -20,8 +20,8 @@ Step 4 is where things break down. Workflow engines need activities that return 
 ```bash
 pip install git+https://github.com/JamMaster1999/agent-runner.git
 
-# with the Temporal workflow wrapper:
-pip install 'agent-runner[temporal] @ git+https://github.com/JamMaster1999/agent-runner.git'
+# with the Temporal workflow wrapper, and the S3 state mirror:
+pip install 'agent-runner[temporal,s3] @ git+https://github.com/JamMaster1999/agent-runner.git'
 ```
 
 Requires Python 3.13+ and at least one agent CLI, installed and logged in:
@@ -244,6 +244,24 @@ env = prepare_session_homes(Path("/data"))
 
 
 
+## Workers that can pick up any run
+
+A session transcript and a checkpoint folder are files on one machine's disk. If the retry lands on a different machine, the agent's memory of the run is not there, and the work starts over. Set one variable and those files are written through to S3 as they are produced, so any worker can resume any session and read any checkpoint.
+
+```bash
+export AGENT_RUNNER_STATE_S3=s3://my-bucket/agent-state
+# AWS credentials and region come from the standard AWS_* variables
+```
+
+- **Local disk stays the working layer.** The CLIs read and write their own files exactly as before. Uploads happen after an attempt ends, downloads only when this machine is missing a file a resume needs.
+- **Absent everywhere means a fresh run**, which is what a single-machine setup already did.
+- **A mirror problem never costs a run.** Failed uploads warn and the local copy stands. A worker does refuse to start when the variable is set but unusable, such as a malformed URL or a missing extra, so a typo surfaces at deploy time instead of at 3am.
+- **Logins never travel.** Credential files are excluded in both directions, by name. Every worker seeds its own login from the environment, and a login file on a shared bucket is a login file nobody audits.
+
+Requires the `s3` extra (`pip install 'agent-runner[s3]'`); boto3 is imported only when the variable is set. Unset, this feature does not exist.
+
+
+
 ## Giving an agent a browser
 
 A run can declare that it needs a browser. The `cdp_browser` resource starts headless Chrome and hands its DevTools (CDP) address into the task as a template value, so a scraping agent can drive a real browser. Runs that declare nothing carry no browser code.
@@ -294,6 +312,7 @@ Everything specific to one CLI lives in one adapter file under `[src/agent_runne
 
 - `agent_runner.temporal`: the Temporal activity wrapper (heartbeat, resume, retry mapping)
 - `agent_runner.resources`: resource provisioning (e.g., headless Chrome via CDP)
+- `agent_runner.state`: the S3 state mirror (sessions and checkpoints readable from any worker)
 
 
 
@@ -303,6 +322,7 @@ Everything specific to one CLI lives in one adapter file under `[src/agent_runne
 - **Environment isolation**: agent processes get a filtered environment, a safe baseline plus only what the spec declared. Operator secrets never leak to model-driven shell commands.
 - **Fatal early termination**: live stream evidence of dead-end conditions (e.g., auth retry loops) terminates the CLI early instead of waiting out its twenty-minute backoff ladder.
 - **Credential normalization**: token whitespace from copy-paste is stripped before it reaches the CLI, preventing silent auth failures from line-break-wrapped pastes.
+- **Credentials stay on the worker**: the state mirror carries session transcripts and checkpoints only. Credential files are refused by name on upload and on download, so a shared bucket can neither collect a login nor plant one.
 
 
 

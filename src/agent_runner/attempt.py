@@ -44,7 +44,7 @@ from agent_runner.harness.base import AgentDef, HarnessAdapter
 from agent_runner.harness.stream import JsonlTail, StreamEvent, parse_json_dict
 from agent_runner.isolation import agent_env
 from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Verdict
-from agent_runner.sessions import RESUME_PREAMBLE
+from agent_runner.sessions import RESUME_PREAMBLE, ensure_session_local, push_session
 from agent_runner.templates import substitute
 from agent_runner.util import write_text
 
@@ -354,6 +354,7 @@ def run_attempt(
     provisioned: list[Any] = []
     resources = resources or {}
     process: subprocess.Popen | None = None
+    report: AttemptReport | None = None
     try:
         for resource_spec in spec.resource_specs:
             provider = resources.get(resource_spec.get("kind"))
@@ -371,6 +372,11 @@ def run_attempt(
         prompt = substitute(
             task, runner_variables(run_id, spec.key, attempt, workdir, resource_variables)
         )
+        if session_ref and not ensure_session_local(adapter, session_ref):
+            # The transcript exists on no worker and in no mirror, so the
+            # CLI has nothing to reopen: run fresh rather than spend the
+            # attempt on a resume that cannot land.
+            session_ref = None
         if session_ref:
             preamble = spec.policy.resume_preamble
             prompt = (RESUME_PREAMBLE if preamble is None else preamble) + prompt
@@ -568,3 +574,8 @@ def run_attempt(
                 resource.close()
             except Exception:
                 pass
+        # The CLI is reaped, so its transcript is final: mirror it on every
+        # exit path (valid, failed, cancelled) — a lost attempt is exactly
+        # the one whose session the next attempt wants.
+        if report is not None and report.session_ref:
+            push_session(adapter, report.session_ref)

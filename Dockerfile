@@ -57,13 +57,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
         "@openai/codex@${CODEX_CLI_VERSION}" \
     && npm cache clean --force
 
-# The package itself, with the Temporal activity wrapper — workers are the
-# audience of this image. COPY is the allowlist (see header): exactly these
-# three paths, nothing else, no operator dot-dirs by construction.
+# The package itself, with the Temporal activity wrapper and the S3 state
+# mirror — workers are the audience of this image, and a worker is only
+# fungible if it can fetch another host's sessions and checkpoints. COPY is
+# the allowlist (see header): exactly these three paths, nothing else, no
+# operator dot-dirs by construction.
 COPY pyproject.toml /opt/agent-runner/pyproject.toml
 COPY README.md /opt/agent-runner/README.md
 COPY src /opt/agent-runner/src
-RUN pip install --no-cache-dir "/opt/agent-runner[temporal]"
+RUN pip install --no-cache-dir "/opt/agent-runner[temporal,s3]"
 
 # Machine-readable provenance inside the image.
 RUN printf '{\n  "git_sha": "%s",\n  "build_date": "%s",\n  "claude_code_version": "%s",\n  "codex_cli_version": "%s",\n  "chromium": "%s",\n  "node": "%s"\n}\n' \
