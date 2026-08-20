@@ -30,6 +30,7 @@ What crosses the boundary from the project side:
 from __future__ import annotations
 
 import dataclasses
+import os
 import signal
 import subprocess
 import sys
@@ -108,6 +109,41 @@ def _pdeathsig() -> Callable[[], None] | None:
         libc.prctl(1, signal.SIGTERM)  # 1 = PR_SET_PDEATHSIG
 
     return _set
+
+
+def _cpu_affinity() -> Callable[[], None] | None:
+    """Linux: AGENT_RUNNER_AGENT_CPUS=N pins the spawned CLI to cores
+    0..N-1, so its runtime sizes thread pools to N instead of every
+    visible core. The workload is network-bound; on a big host each CLI
+    otherwise idles 40+ threads, and a container's task cap dies at a few
+    dozen agents. Unset, invalid, or elsewhere: None — behavior unchanged."""
+    if sys.platform != "linux":
+        return None
+    try:
+        cpus = int(os.environ.get("AGENT_RUNNER_AGENT_CPUS", ""))
+    except ValueError:
+        return None
+    if cpus <= 0:
+        return None
+
+    def _set() -> None:
+        os.sched_setaffinity(0, range(cpus))
+
+    return _set
+
+
+def _preexec() -> Callable[[], None] | None:
+    """Everything the CLI child runs between fork and exec: PDEATHSIG,
+    then the optional CPU clamp."""
+    hooks = [hook for hook in (_pdeathsig(), _cpu_affinity()) if hook is not None]
+    if not hooks:
+        return None
+
+    def _run() -> None:
+        for hook in hooks:
+            hook()
+
+    return _run
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -231,7 +267,7 @@ def _repair(
                 cwd=util.project_root(),
                 env=env,
                 stdin=subprocess.PIPE,
-                preexec_fn=_pdeathsig(),
+                preexec_fn=_preexec(),
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
@@ -397,7 +433,7 @@ def run_attempt(
                     cwd=util.project_root(),
                     env=env,
                     stdin=subprocess.PIPE,
-                    preexec_fn=_pdeathsig(),
+                    preexec_fn=_preexec(),
                     stdout=stdout,
                     stderr=stderr,
                     text=True,
