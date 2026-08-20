@@ -8,9 +8,13 @@ imports, zero database, zero business knowledge: retries, receipts, and
 workflows are the caller's.
 
 Hygiene rides here too: the CLI child is ALWAYS reaped — on valid exit, on
-timeout, on cancellation, and on any exception crossing the loop — so a
-dead attempt can never leave a live agent burning provider budget, and
-heavy memory dies with the process.
+timeout, on a stall, on cancellation, and on any exception crossing the
+loop — so a dead attempt can never leave a live agent burning provider
+budget, and heavy memory dies with the process.
+
+Liveness is measured as OUTPUT, not as a running process: a CLI that goes
+silent for the stall window is terminated and the attempt ends ``stalled``
+(see ``_stall_seconds``).
 
 What crosses the boundary from the project side:
 
@@ -50,6 +54,10 @@ from agent_runner.util import write_text
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
 REPAIR_TIMEOUT_MINUTES = 15.0
+# Ten minutes of total silence. Normal agent cadence is a stream line per
+# tool call and per turn; the longest legitimate gap is one model call, so
+# this leaves an order of magnitude of headroom over a slow-but-live agent.
+DEFAULT_STALL_SECONDS = 600.0
 
 # Adapter evidence codes -> the outcome vocabulary: one alias, outcome words
 # pass through, anything unproven is infra by definition.
@@ -130,6 +138,23 @@ def _cpu_affinity() -> Callable[[], None] | None:
         os.sched_setaffinity(0, range(cpus))
 
     return _set
+
+
+def _stall_seconds(spec: RunSpec) -> float:
+    """The stall window: how long the CLI may produce NOTHING before the
+    runner calls it dead. The spec's policy when the caller said, else
+    AGENT_RUNNER_STALL_SECONDS, else the default. Zero — explicitly, or from
+    an unreadable value — disables the watchdog, leaving only the attempt
+    timeout as the backstop."""
+    if spec.policy.stall_seconds is not None:
+        return max(float(spec.policy.stall_seconds), 0.0)
+    configured = os.environ.get("AGENT_RUNNER_STALL_SECONDS")
+    if configured is None:
+        return DEFAULT_STALL_SECONDS
+    try:
+        return max(float(configured), 0.0)
+    except ValueError:
+        return 0.0
 
 
 def _preexec() -> Callable[[], None] | None:
@@ -325,7 +350,8 @@ def run_attempt(
     start). ``session_ref`` resumes that session instead of starting fresh
     (the resume preamble is prepended; ``spec.policy.resume_preamble``
     overrides the default text). ``should_stop`` polled true terminates the
-    CLI and raises ``AttemptCancelled``.
+    CLI and raises ``AttemptCancelled``. A CLI that stops producing for the
+    stall window is terminated too, ending the attempt ``stalled``.
 
     Configuration errors (an unknown harness, an unrenderable agent, a
     malformed template) RAISE — they are caller bugs, not attempt outcomes.
@@ -409,8 +435,12 @@ def run_attempt(
 
         fatal_errors: list[RunnerError] = []
 
-        def drain_streams() -> None:
-            for line in stream_tail.read_new_lines():
+        def drain_streams() -> bool:
+            """Consume everything the CLI produced since the last pass;
+            True when that was anything at all — the watchdog's proof that
+            the agent is still producing, not merely running."""
+            lines = stream_tail.read_new_lines()
+            for line in lines:
                 payload = parse_json_dict(line)
                 if payload is not None:
                     fatal = adapter.stream_fatal(payload)
@@ -429,8 +459,10 @@ def run_attempt(
                                     pass
                 for event in stream_parser.parse_line(line):
                     emit(event)
-            for event in hook_drain.drain():
+            hook_events = hook_drain.drain()
+            for event in hook_events:
                 emit(event)
+            return bool(lines or hook_events)
 
         with spawn.stdout_path.open("w") as stdout, spawn.stderr_path.open("w") as stderr:
             try:
@@ -473,8 +505,11 @@ def run_attempt(
                     else DEFAULT_ATTEMPT_TIMEOUT_MINUTES
                 )
                 deadline = time.monotonic() + timeout * 60
+                stall_seconds = _stall_seconds(spec)
+                last_output = time.monotonic()
                 while process.poll() is None:
-                    drain_streams()
+                    if drain_streams():
+                        last_output = time.monotonic()
                     if fatal_errors:
                         # The CLI just proved this attempt cannot succeed;
                         # waiting out its own retry ladder buys nothing. The
@@ -496,6 +531,23 @@ def run_attempt(
                         report.error = (
                             f"{spec.key}: timed out after {timeout:g} minutes "
                             f"waiting for {adapter.display_name}"
+                        )
+                        return report
+                    if stall_seconds and time.monotonic() - last_output > stall_seconds:
+                        # Alive is not producing: a CLI whose helper died
+                        # under it holds its process open and streams
+                        # nothing, and a heartbeat that watches the process
+                        # calls that healthy until the caller's multi-hour
+                        # backstop. Silence for the window ends the attempt
+                        # now, so the retry gets a fresh CLI in minutes.
+                        _terminate(process)
+                        report.outcome = outcomes.STALLED
+                        report.error = (
+                            f"{spec.key}: {adapter.display_name} produced no output "
+                            f"for {stall_seconds:g} seconds while still running"
+                        )
+                        report.detail = adapter.error_report(
+                            spawn.stdout_path, spawn.stderr_path
                         )
                         return report
                     time.sleep(poll_seconds)

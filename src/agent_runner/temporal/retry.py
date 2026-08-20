@@ -1,10 +1,10 @@
 """Outcome-to-retry mapping: what each attempt outcome means to Temporal.
 
 One table, ruled (agent_runner.md): ``rate_limited`` backs off long and
-free; ``infra``/``spawn_failure``/``timeout``/``invalid_schema`` are
-ordinary retries the server reschedules — a dead worker's replacement picks
-them up; ``auth`` is non-retryable and fails the activity fast, for the
-project's workflow to alert on. Everything runs under the caller's
+free; ``infra``/``spawn_failure``/``timeout``/``stalled``/``invalid_schema``
+are ordinary retries the server reschedules — a dead worker's replacement
+picks them up; ``auth`` is non-retryable and fails the activity fast, for
+the project's workflow to alert on. Everything runs under the caller's
 retry-policy backstop — this module recommends one but the project's
 activity options are the authority.
 """

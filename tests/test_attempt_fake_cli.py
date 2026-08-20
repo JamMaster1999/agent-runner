@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A-tier attempt tests: spawn / stream / classify / repair through the
 real adapters against the fake-CLI rig — zero tokens (test_matrix.md rows
-C1, C3, C5, C7 plus the valid, timeout, resume, cancel, and isolation
-scenarios).
+C1, C3, C5, C7 plus the valid, timeout, stall, resume, cancel, and
+isolation scenarios).
 
 The rig is ``tests/fake_cli/fake-cli``; the adapters reach it through
 their binary overrides (RUNNER_CODEX_CLI / RUNNER_CLAUDE_CLI), so every
@@ -33,9 +33,14 @@ except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
 from agent_runner import outcomes  # noqa: E402
-from agent_runner.attempt import AttemptCancelled, run_attempt  # noqa: E402
+from agent_runner.attempt import (  # noqa: E402
+    DEFAULT_STALL_SECONDS,
+    AttemptCancelled,
+    _stall_seconds,
+    run_attempt,
+)
 from agent_runner.harness.base import AgentDef  # noqa: E402
-from agent_runner.runtime import RunSpec, Verdict  # noqa: E402
+from agent_runner.runtime import Policy, RunSpec, Verdict  # noqa: E402
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 
@@ -287,6 +292,110 @@ class TimeoutTest(FakeCliCase):
         )
         self.assertEqual(report.outcome, outcomes.TIMEOUT)
         self.assertIn("timed out", report.error)
+
+
+class StallWatchdogTest(FakeCliCase):
+    """Liveness is output, not a live process. A CLI whose helper dies under
+    it stays alive and streams nothing; the heartbeat calls that healthy
+    until the caller's multi-hour backstop (production, twice on
+    2026-08-20). Silence for the stall window ends the attempt instead."""
+
+    def test_slow_but_writing_agent_survives_a_shorter_window(self) -> None:
+        # Ten lines 0.15s apart outlast the 1s window several times over: the
+        # watchdog measures the GAP between outputs, so a long run of small
+        # steps never trips it.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": f"i{n}",
+                                "type": "agent_message",
+                                "text": f"PROGRESS: {n}/10 — still working",
+                            },
+                        }
+                        for n in range(1, 11)
+                    ],
+                    "emit_every": 0.15,
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        events = []
+        report = run_attempt(
+            codex_spec(policy=Policy(stall_seconds=1.0)),
+            "task",
+            self.workdir,
+            validate=self.json_validator(),
+            on_event=events.append,
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(len([e for e in events if e.event == "agent_progress"]), 10)
+
+    def test_wedged_agent_is_killed_at_the_window_and_reports_stalled(self) -> None:
+        # Alive and silent: one line, then nothing for a 30s sleep the
+        # attempt must not sit through.
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "thread.started", "thread_id": "th_1"}],
+                    "sleep": 30,
+                    "stderr": "helper process exited unexpectedly",
+                    "exit": 0,
+                }
+            ]
+        )
+        start = time.monotonic()
+        report = run_attempt(
+            codex_spec(policy=Policy(stall_seconds=0.5)),
+            "task",
+            self.workdir,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.STALLED)
+        self.assertIn("produced no output", report.error)
+        self.assertLess(time.monotonic() - start, 15)
+        # The session the stream revealed survives the kill: the retry
+        # resumes this agent instead of paying for the work again.
+        self.assertEqual(report.session_ref, "th_1")
+
+    def test_disabled_window_leaves_a_silent_agent_alone(self) -> None:
+        # Zero is today's behavior: the same silence that stalls above runs
+        # to the CLI's own exit, judged only by its output.
+        self.scenario(
+            [
+                {
+                    "sleep": 1,
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        with mock.patch.dict(_os.environ, {"AGENT_RUNNER_STALL_SECONDS": "0"}):
+            report = run_attempt(
+                codex_spec(), "task", self.workdir,
+                validate=self.json_validator(), poll_seconds=0.05,
+            )
+        self.assertEqual(report.outcome, outcomes.VALID)
+
+    def test_window_comes_from_the_policy_then_the_environment(self) -> None:
+        with mock.patch.dict(_os.environ):
+            _os.environ.pop("AGENT_RUNNER_STALL_SECONDS", None)
+            self.assertEqual(_stall_seconds(codex_spec()), DEFAULT_STALL_SECONDS)
+        with mock.patch.dict(_os.environ, {"AGENT_RUNNER_STALL_SECONDS": "30"}):
+            self.assertEqual(_stall_seconds(codex_spec()), 30.0)
+            # The caller's policy outranks the operator's default.
+            spec = codex_spec(policy=Policy(stall_seconds=5))
+            self.assertEqual(_stall_seconds(spec), 5.0)
+        # Off, unreadable, or nonsense: no watchdog, unchanged behavior.
+        for value in ("0", "", "-1", "ten minutes"):
+            with mock.patch.dict(_os.environ, {"AGENT_RUNNER_STALL_SECONDS": value}):
+                self.assertEqual(_stall_seconds(codex_spec()), 0.0)
 
 
 class RepairTest(FakeCliCase):
