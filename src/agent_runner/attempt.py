@@ -54,10 +54,11 @@ from agent_runner.util import write_text
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
 REPAIR_TIMEOUT_MINUTES = 15.0
-# Ten minutes of total silence. Normal agent cadence is a stream line per
-# tool call and per turn; the longest legitimate gap is one model call, so
-# this leaves an order of magnitude of headroom over a slow-but-live agent.
-DEFAULT_STALL_SECONDS = 600.0
+# Fifteen minutes of total silence. Measured across the 60 most recent
+# production transcripts, the worst gap between events on a healthy run is
+# about 3.6 minutes, so the window is 4x the typical worst: wide enough for
+# a slow model call, narrow enough to catch a wedge inside a quarter hour.
+DEFAULT_STALL_SECONDS = 900.0
 
 # Adapter evidence codes -> the outcome vocabulary: one alias, outcome words
 # pass through, anything unproven is infra by definition.
