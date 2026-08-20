@@ -364,9 +364,10 @@ class StallWatchdogTest(FakeCliCase):
         # resumes this agent instead of paying for the work again.
         self.assertEqual(report.session_ref, "th_1")
 
-    def test_disabled_window_leaves_a_silent_agent_alone(self) -> None:
-        # Zero is today's behavior: the same silence that stalls above runs
-        # to the CLI's own exit, judged only by its output.
+    def test_policy_zero_disables_and_leaves_a_silent_agent_alone(self) -> None:
+        # Only the caller's code can switch the watchdog off: an explicit
+        # Policy zero restores the old behavior — the same silence that
+        # stalls above runs to the CLI's own exit, judged only by its output.
         self.scenario(
             [
                 {
@@ -376,11 +377,10 @@ class StallWatchdogTest(FakeCliCase):
                 }
             ]
         )
-        with mock.patch.dict(_os.environ, {"AGENT_RUNNER_STALL_SECONDS": "0"}):
-            report = run_attempt(
-                codex_spec(), "task", self.workdir,
-                validate=self.json_validator(), poll_seconds=0.05,
-            )
+        report = run_attempt(
+            codex_spec(policy=Policy(stall_seconds=0.0)), "task", self.workdir,
+            validate=self.json_validator(), poll_seconds=0.05,
+        )
         self.assertEqual(report.outcome, outcomes.VALID)
 
     def test_window_comes_from_the_policy_then_the_environment(self) -> None:
@@ -392,10 +392,13 @@ class StallWatchdogTest(FakeCliCase):
             # The caller's policy outranks the operator's default.
             spec = codex_spec(policy=Policy(stall_seconds=5))
             self.assertEqual(_stall_seconds(spec), 5.0)
-        # Off, unreadable, or nonsense: no watchdog, unchanged behavior.
+        # The environment can never disable: zero, negative, or unreadable
+        # values fall back to the default instead of switching it off.
         for value in ("0", "", "-1", "ten minutes"):
             with mock.patch.dict(_os.environ, {"AGENT_RUNNER_STALL_SECONDS": value}):
-                self.assertEqual(_stall_seconds(codex_spec()), 0.0)
+                self.assertEqual(_stall_seconds(codex_spec()), DEFAULT_STALL_SECONDS)
+        # The caller's explicit zero IS honored — the only off-switch.
+        self.assertEqual(_stall_seconds(codex_spec(policy=Policy(stall_seconds=0.0))), 0.0)
 
 
 class RepairTest(FakeCliCase):

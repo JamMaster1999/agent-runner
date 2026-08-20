@@ -144,18 +144,18 @@ def _cpu_affinity() -> Callable[[], None] | None:
 def _stall_seconds(spec: RunSpec) -> float:
     """The stall window: how long the CLI may produce NOTHING before the
     runner calls it dead. The spec's policy when the caller said, else
-    AGENT_RUNNER_STALL_SECONDS, else the default. Zero — explicitly, or from
-    an unreadable value — disables the watchdog, leaving only the attempt
-    timeout as the backstop."""
+    AGENT_RUNNER_STALL_SECONDS, else the default. Only the caller's code
+    can disable the watchdog (an explicit ``Policy(stall_seconds=0)``); the
+    environment merely tunes the window — zero, negative, or unreadable
+    values fall back to the default, so an operator typo can never switch
+    the protection off."""
     if spec.policy.stall_seconds is not None:
         return max(float(spec.policy.stall_seconds), 0.0)
-    configured = os.environ.get("AGENT_RUNNER_STALL_SECONDS")
-    if configured is None:
-        return DEFAULT_STALL_SECONDS
     try:
-        return max(float(configured), 0.0)
-    except ValueError:
-        return 0.0
+        configured = float(os.environ["AGENT_RUNNER_STALL_SECONDS"])
+    except (KeyError, ValueError):
+        return DEFAULT_STALL_SECONDS
+    return configured if configured > 0 else DEFAULT_STALL_SECONDS
 
 
 def _preexec() -> Callable[[], None] | None:
