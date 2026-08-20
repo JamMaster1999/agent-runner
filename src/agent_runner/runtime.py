@@ -53,6 +53,7 @@ class Policy:
     value (timeout 0, empty preamble) is honored as given."""
 
     attempt_timeout_minutes: float | None = None
+    stall_seconds: float | None = None
     disallowed_tools: tuple[str, ...] = ()
     setting_sources: tuple[str, ...] | None = None
     effort: str | None = None

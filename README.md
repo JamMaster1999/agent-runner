@@ -13,7 +13,7 @@ Building with LLMs has followed a clear progression:
 
 Step 4 is where things break down. Workflow engines need activities that return a typed result and declare whether a failure is retryable. Agents don't naturally do that. They crash, hang, or silently produce garbage. And the agent CLIs were built for a person at a keyboard, not for automation. Left alone, one will retry a dead login for twenty minutes, another reports success after a failed run, and the real error hides inside a JSON stream.
 
-**agent-runner is the layer between your workflow and your agents.** It manages the full lifecycle of a CLI-based coding agent (Claude Code, Codex) as a subprocess: spawn, stream, validate, classify, repair, and always reap. Every attempt ends with exactly one of seven outcomes, and each outcome maps cleanly onto retry logic. It also hands you the session, so a retry can pick up where the agent left off instead of paying for the same work twice. And because the agents run through the CLIs, everything runs on your existing Claude or ChatGPT plan instead of per-token API billing.
+**agent-runner is the layer between your workflow and your agents.** It manages the full lifecycle of a CLI-based coding agent (Claude Code, Codex) as a subprocess: spawn, stream, validate, classify, repair, and always reap. Every attempt ends with exactly one of eight outcomes, and each outcome maps cleanly onto retry logic. It also hands you the session, so a retry can pick up where the agent left off instead of paying for the same work twice. And because the agents run through the CLIs, everything runs on your existing Claude or ChatGPT plan instead of per-token API billing.
 
 ## Installation
 
@@ -42,10 +42,10 @@ Every call to `run_attempt` walks through the same lifecycle:
 | **Spawn**    | Build the CLI command from a `RunSpec` and an `AgentDef`, start it as a subprocess, and write the task prompt to its stdin. The command shape is provider-specific, but your code never branches on a provider name. |
 | **Stream**   | Read the CLI's JSON output line by line as it runs. `StreamEvent`s surface progress, tool calls, token usage, and cost in real time via an `on_event` callback.                          |
 | **Validate** | When the CLI exits, call your `validate` function. You decide what a correct result looks like. agent-runner never parses or judges the agent's output.                                  |
-| **Classify** | End the attempt with exactly one of seven outcome words (`valid`, `invalid_schema`, `rate_limited`, `infra`, `auth`, `timeout`, `spawn_failure`). Uses only CLI-owned error evidence, never the agent's transcript. |
+| **Classify** | End the attempt with exactly one of eight outcome words (`valid`, `invalid_schema`, `rate_limited`, `infra`, `auth`, `timeout`, `stalled`, `spawn_failure`). Uses only CLI-owned error evidence, never the agent's transcript. |
 | **Repair**   | If validation fails, send your repair prompt into the still-open session and re-validate. Fixes a malformed result in seconds without a full re-run. Multiple rounds iterate up to a budget you set. |
 | **Resume**   | The CLI's session handle is extracted from the stream as soon as it appears. On the next attempt, pass it back and the agent picks up where it left off with all of its prior context.   |
-| **Reap**     | The CLI child process is always terminated and cleaned up, on every exit path. Valid exit, timeout, cancellation, exception: no code path leaves a live agent burning provider budget.    |
+| **Reap**     | The CLI child process is always terminated and cleaned up, on every exit path. Valid exit, timeout, stall, cancellation, exception: no code path leaves a live agent burning provider budget.    |
 
 Your workflow calls `run_attempt`, gets back an `AttemptReport` with one outcome word, and decides what to do next.
 
@@ -93,7 +93,7 @@ Three runnable scripts, each one file:
 - [`examples/kill_and_resume.py`](examples/kill_and_resume.py): kill the process mid-run, then watch a brand new process resume the same session with the agent's memory intact
 - [`examples/temporal_pipeline.py`](examples/temporal_pipeline.py): a durable Temporal workflow where the worker crashes after the agent worked, and the retry picks up the same conversation
 
-## The seven outcomes
+## The eight outcomes
 
 Every run ends with exactly one word on `report.outcome`. No exceptions, no ambiguity.
 
@@ -105,6 +105,7 @@ Every run ends with exactly one word on `report.outcome`. No exceptions, no ambi
 | `rate_limited`   | the provider said slow down, including subscription usage caps         | Yes, long backoff   |
 | `auth`           | the login is dead, so fail fast instead of burning retries             | No, alert           |
 | `timeout`        | the run took too long and the process was stopped                      | Yes                 |
+| `stalled`        | the agent stopped producing output, so the process was stopped         | Yes                 |
 | `spawn_failure`  | the CLI never started, for example a missing binary                    | Yes, another worker |
 | `infra`          | it failed, and the CLI's own error output proves nothing more specific | Yes, another worker |
 
@@ -208,7 +209,7 @@ with ThreadPoolExecutor(max_workers=8) as pool:
 
 For workflows that must survive worker crashes and run for hours, agent-runner ships a ready-made wrapper for [Temporal](https://temporal.io) as the `[temporal]` extra. Inside a Temporal activity it adds:
 
-- A **heartbeat** while the CLI runs, so the server knows the agent is alive
+- A **heartbeat** while the CLI runs, so the server knows the attempt is alive (whether the agent still is, is the stall watchdog's job)
 - The **session handle rides the heartbeat**, so a retry on any machine resumes the same session
 - Outcomes become **typed retry errors**: `rate_limited` waits long, `infra` retries elsewhere, `auth` stops immediately
 - A **resume budget**, so a poisoned session is eventually abandoned for a fresh one
@@ -318,9 +319,10 @@ Everything specific to one CLI lives in one adapter file under `[src/agent_runne
 
 ## Production guarantees
 
-- **Process hygiene**: the CLI child is always reaped on every exit path (valid, timeout, cancellation, exception). A dead attempt never leaves a live agent burning provider budget.
+- **Process hygiene**: the CLI child is always reaped on every exit path (valid, timeout, stall, cancellation, exception). A dead attempt never leaves a live agent burning provider budget.
 - **Environment isolation**: agent processes get a filtered environment, a safe baseline plus only what the spec declared. Operator secrets never leak to model-driven shell commands.
 - **Fatal early termination**: live stream evidence of dead-end conditions (e.g., auth retry loops) terminates the CLI early instead of waiting out its twenty-minute backoff ladder.
+- **Stall watchdog**: alive is not the same as working. A CLI that holds its process open but streams nothing for fifteen minutes is reaped and the attempt ends `stalled`, so a wedged agent is retried in a quarter hour instead of sitting out the run's multi-hour backstop. `AGENT_RUNNER_STALL_SECONDS` tunes the window; only caller code can switch the watchdog off (`Policy(stall_seconds=0)`) — a zero, negative, or unreadable environment value falls back to the default.
 - **Credential normalization**: token whitespace from copy-paste is stripped before it reaches the CLI, preventing silent auth failures from line-break-wrapped pastes.
 - **Credentials stay on the worker**: the state mirror carries session transcripts and checkpoints only. Credential files are refused by name on upload and on download, so a shared bucket can neither collect a login nor plant one.
 

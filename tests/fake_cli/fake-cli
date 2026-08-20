@@ -9,9 +9,10 @@ RUNNER_CLAUDE_CLI). Behavior is scripted per invocation:
 - FAKE_CLI_SCENARIO — path to a JSON list; element N drives call N (the
   last element repeats when calls outnumber elements). Each element:
     {"emit": [ ...JSON objects printed to stdout as JSONL... ],
+     "emit_every": seconds,     # pause between emitted lines (a slow agent)
      "stderr": "text",
      "write": [{"path": "...", "text": "..."}],
-     "sleep": seconds,
+     "sleep": seconds,          # produce nothing, stay alive (a wedged agent)
      "exit": code}
 - FAKE_CLI_CALLS — a directory where every invocation records itself as
   call-NN.json ({"argv": [...], "stdin": "...", "env": {...}}), so tests
@@ -61,7 +62,10 @@ def main() -> None:
     if scenario:
         call = scenario[count] if count < len(scenario) else scenario[-1]
 
+    emit_every = float(call.get("emit_every") or 0)
     for payload in call.get("emit", []):
+        if emit_every:
+            time.sleep(emit_every)
         sys.stdout.write(json.dumps(payload) + "\n")
         sys.stdout.flush()
     if call.get("stderr"):

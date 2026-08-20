@@ -4,7 +4,9 @@ Runs INSIDE a project's activity function. The project owns the workflow,
 the activity registration, and its retry policy; this wrapper owns the
 Temporal-facing mechanics of one CLI attempt:
 
-- the heartbeat pump while the CLI runs (liveness is the heartbeat)
+- the heartbeat pump while the CLI runs (the heartbeat says the attempt is
+  still running; whether the agent is still PRODUCING is the attempt loop's
+  stall watchdog, which fails the attempt so the retry lands here)
 - session_ref + progress in heartbeat details (a retry resumes the session)
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
