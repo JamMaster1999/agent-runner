@@ -23,7 +23,7 @@ import asyncio
 import hashlib
 import threading
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,6 +77,7 @@ class _HeartbeatState:
     resume_count: int = 0
     agent_fp: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
+    attempts: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
@@ -86,7 +87,29 @@ class _HeartbeatState:
                 "resume_count": self.resume_count,
                 "agent_fp": self.agent_fp,
                 "progress": dict(self.progress),
+                "attempts": list(self.attempts),
             }
+
+    def record_failure(self, attempt: int, report: AttemptReport) -> None:
+        """One line per failed attempt, carried to the next attempt by the
+        heartbeat and into history by the final result or failure. Bounded:
+        the retry policy caps attempts, the slice caps a runaway one."""
+        with self.lock:
+            self.attempts.append(
+                {
+                    "attempt": attempt,
+                    "outcome": report.outcome,
+                    "error": report.error,
+                    "detail": report.detail[-ATTEMPT_DETAIL_LIMIT:],
+                    "session_ref": report.session_ref,
+                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            )
+            del self.attempts[:-ATTEMPTS_KEPT]
+
+
+ATTEMPTS_KEPT = 10
+ATTEMPT_DETAIL_LIMIT = 500
 
 
 def agent_fingerprint(agent: AgentDef | None) -> str | None:
@@ -150,6 +173,10 @@ async def run_agent_attempt(
     info = activity.info()
 
     prior = prior_heartbeat_details()
+    # The failed-attempt record outlives the session it came from: a prompt
+    # change or an exhausted resume budget starts a fresh session, not a
+    # fresh history.
+    attempts = list((prior or {}).get("attempts") or [])
     current_fp = agent_fingerprint(agent)
     if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
         activity.logger.warning(
@@ -177,7 +204,10 @@ async def run_agent_attempt(
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
     state = _HeartbeatState(
-        session_ref=session_ref, resume_count=resume_count, agent_fp=current_fp
+        session_ref=session_ref,
+        resume_count=resume_count,
+        agent_fp=current_fp,
+        attempts=attempts,
     )
 
     def on_event(event: StreamEvent) -> None:
@@ -227,6 +257,9 @@ async def run_agent_attempt(
     )
     try:
         report = await asyncio.shield(inner)
+        report.prior_attempts = tuple(attempts)
+        if report.outcome != outcomes.VALID:
+            state.record_failure(info.attempt, report)
     except asyncio.CancelledError:
         # Graceful cancel: terminate and reap the CLI before propagating.
         stop.set()

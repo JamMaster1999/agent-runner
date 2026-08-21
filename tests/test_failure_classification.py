@@ -109,6 +109,17 @@ class ClassifyFailureTest(unittest.TestCase):
         )
         self.assertEqual(error.code, outcomes.RATE_LIMITED)
 
+    def test_session_limit_text_classifies_rate_limited(self) -> None:
+        # The Claude subscription cap's synthetic turn (live tier,
+        # 2026-08-21): a window message, so it backs off — never infra.
+        for text in (
+            "claude result success: You've hit your session limit · resets 8:50pm (UTC)",
+            "You've hit your limit · resets 5pm",
+        ):
+            error = get_adapter("claude").classify_failure(text)
+            self.assertEqual(error.code, outcomes.RATE_LIMITED)
+            self.assertTrue(error.retryable)
+
     def test_ambiguous_text_is_retryable_infra(self) -> None:
         text = "network flake: connection reset by peer (HTTP 403 from registrar page)"
         adapter = get_adapter("codex")

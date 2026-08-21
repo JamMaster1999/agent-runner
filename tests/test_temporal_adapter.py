@@ -63,6 +63,35 @@ class RetryMappingTest(unittest.TestCase):
         self.assertFalse(error.non_retryable)
         self.assertEqual(error.next_retry_delay, timedelta(minutes=45))
 
+    def test_failure_details_carry_the_whole_report(self) -> None:
+        # The error that reaches history is the report, not its first line:
+        # the outcome word, the CLI-owned text, the session to resume, and
+        # the attempts before it (the b51 lesson, 2026-08-21 — the session
+        # limit text never left the worker).
+        report = AttemptReport(
+            outcome=outcomes.INFRA,
+            error="k: claude attempt failed",
+            detail="claude result success: You've hit your session limit",
+            session_ref="sess-1",
+            prior_attempts=({"attempt": 1, "outcome": "stalled"},),
+        )
+        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
+        self.assertEqual(
+            error.details[0],
+            {
+                "outcome": outcomes.INFRA,
+                "detail": "claude result success: You've hit your session limit",
+                "session_ref": "sess-1",
+                "prior_attempts": [{"attempt": 1, "outcome": "stalled"}],
+            },
+        )
+
+    def test_failure_detail_is_bounded(self) -> None:
+        report = AttemptReport(outcome=outcomes.INFRA, error="k", detail="x" * 5000 + "END")
+        details = application_error_for(report, rate_limit_backoff=timedelta(minutes=1)).details[0]
+        self.assertEqual(len(details["detail"]), 2000)
+        self.assertTrue(details["detail"].endswith("END"))
+
     def test_auth_fails_fast(self) -> None:
         report = AttemptReport(outcome=outcomes.AUTH, error="not logged in")
         error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
@@ -276,6 +305,68 @@ class ActivityRunTest(unittest.TestCase):
         self.assertIn("resume", call["argv"])
         self.assertIn("th_9", call["argv"])
         self.assertEqual(heartbeats[-1][0]["resume_count"], 1)
+
+    def test_failed_attempt_is_recorded_for_the_next_one(self) -> None:
+        # A failure lands in the final heartbeat's ``attempts`` — the next
+        # attempt inherits it, and the error's details name it too.
+        self.scenario_path.write_text(
+            json.dumps([{"emit": [{"type": "error", "message": "boom"}], "exit": 1}])
+        )
+
+        async def act():
+            return await run_agent_attempt(
+                self.spec(),
+                "task",
+                self.workdir,
+                validate=self.validator(),
+                config=TemporalRunConfig(heartbeat_seconds=0.05),
+            )
+
+        prior = {
+            "session_ref": "th_1",
+            "resume_count": 0,
+            "attempts": [{"attempt": 1, "outcome": "stalled", "error": "silent"}],
+        }
+        with mock.patch.object(activity_module, "prior_heartbeat_details", return_value=prior):
+            with self.assertRaises(ApplicationError) as caught:
+                self.run_activity(act)
+        details = caught.exception.details[0]
+        self.assertEqual(details["outcome"], outcomes.INFRA)
+        self.assertEqual(details["prior_attempts"], prior["attempts"])
+
+    def test_success_names_the_attempts_before_it(self) -> None:
+        self.scenario_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "write": [
+                            {"path": str(self.workdir / "out.json"), "text": '{"ok": true}'}
+                        ],
+                        "exit": 0,
+                    }
+                ]
+            )
+        )
+
+        async def act():
+            return await run_agent_attempt(
+                self.spec(),
+                "task",
+                self.workdir,
+                validate=self.validator(),
+                config=TemporalRunConfig(heartbeat_seconds=0.05),
+            )
+
+        attempts = [{"attempt": 1, "outcome": "infra", "error": "died"}]
+        with mock.patch.object(
+            activity_module,
+            "prior_heartbeat_details",
+            return_value={"session_ref": None, "resume_count": 0, "attempts": attempts},
+        ):
+            report, heartbeats = self.run_activity(act)
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(list(report.prior_attempts), attempts)
+        self.assertEqual(heartbeats[-1][0]["attempts"], attempts)
 
     def test_resume_budget_exhausted_falls_back_fresh(self) -> None:
         # Matrix C4: budget spent -> fresh session, recorded.

@@ -38,6 +38,8 @@ COMMON_TERMINAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "too many requests",
             "overloaded_error",
             "usage limit",
+            "session limit",
+            "hit your limit",
         ),
     ),
     (
