@@ -278,7 +278,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
             message = f"claude rate_limit_event: {info.get('rateLimitType') or 'limit'} rejected"
             try:
                 resets_at = datetime.fromtimestamp(int(info["resetsAt"]), tz=timezone.utc)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
                 resets_at = None
             if resets_at is not None:
                 message += f", resets {resets_at.isoformat(timespec='seconds')}"
