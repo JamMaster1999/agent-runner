@@ -336,6 +336,54 @@ class StallWatchdogTest(FakeCliCase):
         self.assertEqual(report.outcome, outcomes.VALID)
         self.assertEqual(len([e for e in events if e.event == "agent_progress"]), 10)
 
+    def test_silent_but_cpu_busy_tree_survives_the_window(self) -> None:
+        # Liveness evidence, channel 1: the CLI streams nothing while a
+        # CHILD process burns CPU (a long compute-heavy command). The
+        # kernel's accounting proves life; the watchdog must not fire.
+        if not _os.path.isdir("/proc/self"):
+            self.skipTest("CPU evidence reads /proc (Linux); files channel covers dev boxes")
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "thread.started", "thread_id": "th_busy"}],
+                    "busy": 3,
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        report = run_attempt(
+            codex_spec(policy=Policy(stall_seconds=1.0)),
+            "task",
+            self.workdir,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+
+    def test_silent_but_file_writing_agent_survives_the_window(self) -> None:
+        # Liveness evidence, channel 2: the CLI streams nothing while its
+        # work writes files under the workdir (checkpointing). Portable —
+        # no /proc required.
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "thread.started", "thread_id": "th_touch"}],
+                    "touch": {"path": str(self.workdir / "progress.log"), "seconds": 3, "every": 0.2},
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        report = run_attempt(
+            codex_spec(policy=Policy(stall_seconds=1.0)),
+            "task",
+            self.workdir,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+
     def test_wedged_agent_is_killed_at_the_window_and_reports_stalled(self) -> None:
         # Alive and silent: one line, then nothing for a 30s sleep the
         # attempt must not sit through.

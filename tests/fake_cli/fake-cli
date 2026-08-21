@@ -77,6 +77,25 @@ def main() -> None:
             os.makedirs(directory, exist_ok=True)
         with open(item["path"], "w") as fh:
             fh.write(item["text"])
+    if call.get("busy"):
+        # Stay stream-silent while a CHILD burns CPU — a healthy agent
+        # awaiting a long compute-heavy command (liveness evidence: cpu).
+        seconds = float(call["busy"])
+        import subprocess
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import time\nend=time.time()+{seconds}\nwhile time.time()<end: pass"]
+        )
+        child.wait()
+    if call.get("touch"):
+        # Stay stream-silent while periodically writing a file — a healthy
+        # agent checkpointing its work (liveness evidence: files).
+        spec = call["touch"]
+        end = time.time() + float(spec["seconds"])
+        while time.time() < end:
+            with open(spec["path"], "a") as fh:
+                fh.write("tick\n")
+            time.sleep(float(spec.get("every", 0.2)))
     if call.get("sleep"):
         time.sleep(float(call["sleep"]))
     sys.exit(int(call.get("exit", 0)))

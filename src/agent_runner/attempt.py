@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_runner import outcomes, util
+from agent_runner import liveness, outcomes, util
 from agent_runner.harness import get_adapter
 from agent_runner.harness.base import AgentDef, HarnessAdapter
 from agent_runner.harness.stream import JsonlTail, StreamEvent, parse_json_dict
@@ -508,9 +508,11 @@ def run_attempt(
                 deadline = time.monotonic() + timeout * 60
                 stall_seconds = _stall_seconds(spec)
                 last_output = time.monotonic()
+                evidence = liveness.WorkEvidence(process.pid, workdir)
                 while process.poll() is None:
                     if drain_streams():
                         last_output = time.monotonic()
+                        evidence.reset()
                     if fatal_errors:
                         # The CLI just proved this attempt cannot succeed;
                         # waiting out its own retry ladder buys nothing. The
@@ -534,18 +536,32 @@ def run_attempt(
                             f"waiting for {adapter.display_name}"
                         )
                         return report
-                    if stall_seconds and time.monotonic() - last_output > stall_seconds:
+                    silent = time.monotonic() - last_output
+                    if stall_seconds and silent > stall_seconds / 2 and not evidence.primed:
+                        # Mid-window snapshot: the window's-edge verdict
+                        # needs a baseline to measure growth against.
+                        evidence.prime()
+                    if stall_seconds and silent > stall_seconds:
+                        if evidence.working():
+                            # Silent but WORKING: the tree grew CPU time or
+                            # touched files — a long quiet command, not a
+                            # wedge. The clock resets; a true wedge cannot
+                            # produce either signal.
+                            last_output = time.monotonic()
+                            continue
                         # Alive is not producing: a CLI whose helper died
-                        # under it holds its process open and streams
-                        # nothing, and a heartbeat that watches the process
-                        # calls that healthy until the caller's multi-hour
-                        # backstop. Silence for the window ends the attempt
-                        # now, so the retry gets a fresh CLI in minutes.
+                        # under it holds its process open, streams nothing,
+                        # burns no CPU, and writes nothing — and a heartbeat
+                        # that watches the process calls that healthy until
+                        # the caller's multi-hour backstop. Silence on every
+                        # channel for the window ends the attempt now, so
+                        # the retry gets a fresh CLI in minutes.
                         _terminate(process)
                         report.outcome = outcomes.STALLED
                         report.error = (
                             f"{spec.key}: {adapter.display_name} produced no output "
-                            f"for {stall_seconds:g} seconds while still running"
+                            f"and no work evidence (cpu, files) for "
+                            f"{stall_seconds:g} seconds while still running"
                         )
                         report.detail = adapter.error_report(
                             spawn.stdout_path, spawn.stderr_path
