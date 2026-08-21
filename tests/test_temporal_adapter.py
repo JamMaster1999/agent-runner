@@ -334,6 +334,17 @@ class ActivityRunTest(unittest.TestCase):
         self.assertEqual(details["outcome"], outcomes.INFRA)
         self.assertEqual(details["prior_attempts"], prior["attempts"])
 
+    def test_vanished_attempts_are_named_from_the_attempt_number(self) -> None:
+        # A worker killed mid-attempt reports nothing; attempt 4 arriving
+        # with attempts 1 and 3 on record means 2 died with its worker.
+        recorded = [{"attempt": 1, "outcome": "stalled"}, {"attempt": 3, "outcome": "infra"}]
+        (gap,) = activity_module.vanished_attempts(4, recorded)
+        self.assertEqual(gap["attempt"], 2)
+        self.assertEqual(gap["outcome"], outcomes.INFRA)
+        self.assertIn("worker died", gap["error"])
+        self.assertEqual(activity_module.vanished_attempts(1, []), [])
+        self.assertEqual(activity_module.vanished_attempts(3, recorded[:1] + [{"attempt": 2}]), [])
+
     def test_success_names_the_attempts_before_it(self) -> None:
         self.scenario_path.write_text(
             json.dumps(

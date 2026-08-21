@@ -123,6 +123,26 @@ def agent_fingerprint(agent: AgentDef | None) -> str | None:
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
+def vanished_attempts(attempt: int, recorded: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The attempts nobody reported: a worker that dies mid-attempt never
+    writes its failure, Temporal just starts the next attempt elsewhere. The
+    attempt number counts them anyway, so the gap between it and the record
+    names them — the only trace a killed worker leaves in history."""
+    seen = {entry.get("attempt") for entry in recorded}
+    return [
+        {
+            "attempt": number,
+            "outcome": outcomes.INFRA,
+            "error": "attempt ended without a report — the worker died mid-attempt",
+            "detail": "",
+            "session_ref": None,
+            "at": None,
+        }
+        for number in range(1, attempt)
+        if number not in seen
+    ]
+
+
 def prior_heartbeat_details() -> dict[str, Any] | None:
     """The previous attempt's last recorded heartbeat payload, or None on a
     first attempt."""
@@ -177,6 +197,7 @@ async def run_agent_attempt(
     # change or an exhausted resume budget starts a fresh session, not a
     # fresh history.
     attempts = list((prior or {}).get("attempts") or [])
+    attempts.extend(vanished_attempts(info.attempt, attempts))
     current_fp = agent_fingerprint(agent)
     if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
         activity.logger.warning(
