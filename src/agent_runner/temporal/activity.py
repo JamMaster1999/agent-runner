@@ -23,7 +23,7 @@ import asyncio
 import hashlib
 import threading
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,6 +77,7 @@ class _HeartbeatState:
     resume_count: int = 0
     agent_fp: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
+    attempts: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
@@ -86,7 +87,29 @@ class _HeartbeatState:
                 "resume_count": self.resume_count,
                 "agent_fp": self.agent_fp,
                 "progress": dict(self.progress),
+                "attempts": list(self.attempts),
             }
+
+    def record_failure(self, attempt: int, report: AttemptReport) -> None:
+        """One line per failed attempt, carried to the next attempt by the
+        heartbeat and into history by the final result or failure. Bounded:
+        the retry policy caps attempts, the slice caps a runaway one."""
+        with self.lock:
+            self.attempts.append(
+                {
+                    "attempt": attempt,
+                    "outcome": report.outcome,
+                    "error": report.error,
+                    "detail": report.detail[-ATTEMPT_DETAIL_LIMIT:],
+                    "session_ref": report.session_ref,
+                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            )
+            del self.attempts[:-ATTEMPTS_KEPT]
+
+
+ATTEMPTS_KEPT = 10
+ATTEMPT_DETAIL_LIMIT = 500
 
 
 def agent_fingerprint(agent: AgentDef | None) -> str | None:
@@ -98,6 +121,26 @@ def agent_fingerprint(agent: AgentDef | None) -> str | None:
         return None
     material = agent.body + "\x00" + repr(sorted((agent.config or {}).items()))
     return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def vanished_attempts(attempt: int, recorded: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The attempts nobody reported: a worker that dies mid-attempt never
+    writes its failure, Temporal just starts the next attempt elsewhere. The
+    attempt number counts them anyway, so the gap between it and the record
+    names them — the only trace a killed worker leaves in history."""
+    seen = {entry.get("attempt") for entry in recorded}
+    return [
+        {
+            "attempt": number,
+            "outcome": outcomes.INFRA,
+            "error": "attempt ended without a report — the worker died mid-attempt",
+            "detail": "",
+            "session_ref": None,
+            "at": None,
+        }
+        for number in range(1, attempt)
+        if number not in seen
+    ]
 
 
 def prior_heartbeat_details() -> dict[str, Any] | None:
@@ -150,6 +193,11 @@ async def run_agent_attempt(
     info = activity.info()
 
     prior = prior_heartbeat_details()
+    # The failed-attempt record outlives the session it came from: a prompt
+    # change or an exhausted resume budget starts a fresh session, not a
+    # fresh history.
+    attempts = list((prior or {}).get("attempts") or [])
+    attempts.extend(vanished_attempts(info.attempt, attempts))
     current_fp = agent_fingerprint(agent)
     if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
         activity.logger.warning(
@@ -177,7 +225,10 @@ async def run_agent_attempt(
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
     state = _HeartbeatState(
-        session_ref=session_ref, resume_count=resume_count, agent_fp=current_fp
+        session_ref=session_ref,
+        resume_count=resume_count,
+        agent_fp=current_fp,
+        attempts=attempts,
     )
 
     def on_event(event: StreamEvent) -> None:
@@ -227,6 +278,9 @@ async def run_agent_attempt(
     )
     try:
         report = await asyncio.shield(inner)
+        report.prior_attempts = tuple(attempts)
+        if report.outcome != outcomes.VALID:
+            state.record_failure(info.attempt, report)
     except asyncio.CancelledError:
         # Graceful cancel: terminate and reap the CLI before propagating.
         stop.set()

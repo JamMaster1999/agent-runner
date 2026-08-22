@@ -131,6 +131,9 @@ class AttemptReport:
     the handle a later attempt resumes. ``error`` is the operator-facing
     message for non-valid outcomes; ``detail`` the CLI-owned error text
     behind it. ``data`` is the validator's parsed output on ``valid``.
+    ``prior_attempts`` is the record of the failed attempts before this one
+    (``agent_runner.temporal`` fills it from heartbeat details; the core
+    runner leaves it empty) — a later success still names what it cost.
     """
 
     outcome: str
@@ -142,3 +145,4 @@ class AttemptReport:
     resumed: bool = False
     repair_rounds_used: int = 0
     workdir: Path | None = None
+    prior_attempts: tuple[dict[str, Any], ...] = ()

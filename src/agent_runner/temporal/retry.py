@@ -12,6 +12,7 @@ activity options are the authority.
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
@@ -26,7 +27,9 @@ def application_error_for(
     """The ApplicationError one non-valid attempt outcome raises.
 
     ``type`` is the outcome word, so workflows and retry policies route on
-    the same vocabulary the attempt ended with. ``rate_limited`` carries
+    the same vocabulary the attempt ended with. ``details`` carries the
+    evidence (``failure_details``) so the error that reaches history is the
+    whole report, not its first line. ``rate_limited`` carries
     ``next_retry_delay`` — the long, free backoff that overrides the retry
     policy's interval for exactly this attempt. ``auth`` is non-retryable:
     the activity fails fast and the caller alerts."""
@@ -34,15 +37,33 @@ def application_error_for(
     if report.outcome == outcomes.RATE_LIMITED:
         return ApplicationError(
             message,
+            failure_details(report),
             type=report.outcome,
             non_retryable=False,
             next_retry_delay=rate_limit_backoff,
         )
     return ApplicationError(
         message,
+        failure_details(report),
         type=report.outcome,
         non_retryable=report.outcome in outcomes.TERMINAL,
     )
+
+
+DETAIL_LIMIT = 2000
+
+
+def failure_details(report: AttemptReport) -> dict[str, Any]:
+    """The one details payload a failed attempt leaves in history: the
+    outcome word, the CLI-owned text behind it, the session to resume, and
+    the attempts that failed before this one. Bounded, so a chatty CLI can
+    never push a failure past the payload limit."""
+    return {
+        "outcome": report.outcome,
+        "detail": report.detail[-DETAIL_LIMIT:],
+        "session_ref": report.session_ref,
+        "prior_attempts": list(report.prior_attempts),
+    }
 
 
 def recommended_retry_policy(

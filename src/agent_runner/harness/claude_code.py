@@ -15,6 +15,7 @@ import glob
 import json
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
@@ -259,11 +260,33 @@ class ClaudeCodeAdapter(HarnessAdapter):
         return None
 
     def stream_fatal(self, payload: dict[str, Any]) -> RunnerError | None:
-        """A 401/403 api_retry event is a dead credential the CLI will retry
-        ~10 times over ~20 minutes of exponential backoff (live tier,
-        2026-08-09); the attempt must fail as auth now, not as timeout after
-        the ladder runs out. The event's own HTTP status decides the outcome
-        — typed evidence, immune to CLI error-text rewording."""
+        """Typed stream evidence that the attempt cannot succeed — the event's
+        own fields decide the outcome, immune to CLI error-text rewording.
+
+        A ``rate_limit_event`` with status ``rejected`` is the subscription
+        cap (live tier, 2026-08-21: the CLI then prints a synthetic "You've
+        hit your session limit" turn, exits 0, and the result carries
+        ``is_error``); it classifies ``rate_limited`` with the reset time in
+        the detail. A 401/403 ``api_retry`` event is a dead credential the
+        CLI will retry ~10 times over ~20 minutes of exponential backoff
+        (2026-08-09); the attempt must fail as auth now, not as timeout after
+        the ladder runs out."""
+        if payload.get("type") == "rate_limit_event":
+            info = payload.get("rate_limit_info") or {}
+            if info.get("status") != "rejected":
+                return None
+            message = f"claude rate_limit_event: {info.get('rateLimitType') or 'limit'} rejected"
+            try:
+                resets_at = datetime.fromtimestamp(int(info["resetsAt"]), tz=timezone.utc)
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                resets_at = None
+            if resets_at is not None:
+                message += f", resets {resets_at.isoformat(timespec='seconds')}"
+            if info.get("overageDisabledReason"):
+                message += f" ({info['overageDisabledReason']})"
+            return RunnerError(
+                message, code=outcomes.RATE_LIMITED, retryable=True, alert=False, details=message
+            )
         if payload.get("type") == "system" and payload.get("subtype") == "api_retry":
             try:
                 status = int(payload.get("error_status") or 0)

@@ -212,6 +212,7 @@ For workflows that must survive worker crashes and run for hours, agent-runner s
 - A **heartbeat** while the CLI runs, so the server knows the attempt is alive (whether the agent still is, is the stall watchdog's job)
 - The **session handle rides the heartbeat**, so a retry on any machine resumes the same session
 - Outcomes become **typed retry errors**: `rate_limited` waits long, `infra` retries elsewhere, `auth` stops immediately
+- **The evidence travels with the error**: the failure's details carry the outcome word, the CLI's own error text, the session handle, and the failed attempts before it — so history, not the worker's disk, answers "why did this fail"
 - A **resume budget**, so a poisoned session is eventually abandoned for a fresh one
 
 ```python

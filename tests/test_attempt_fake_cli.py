@@ -796,6 +796,90 @@ class StreamFatalAbortTest(FakeCliCase):
         self.assertLess(time.monotonic() - start, 30)
 
 
+    def test_claude_rate_limit_event_classifies_rate_limited_with_reset(self) -> None:
+        # The subscription cap arrives as a typed rate_limit_event before
+        # the synthetic "hit your session limit" turn; the CLI then exits 0
+        # (live tier, 2026-08-21). The event decides: rate_limited, with
+        # the reset time in the detail for the operator.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "system", "subtype": "init", "session_id": "sess-cap", "model": "m"},
+                        {
+                            "type": "rate_limit_event",
+                            "rate_limit_info": {
+                                "status": "rejected",
+                                "resetsAt": 1787345400,
+                                "rateLimitType": "five_hour",
+                                "overageStatus": "rejected",
+                                "overageDisabledReason": "out_of_credits",
+                            },
+                            "session_id": "sess-cap",
+                        },
+                    ],
+                    "sleep": 60,
+                    "exit": 0,
+                }
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n"
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            poll_seconds=0.05,
+            timeout_minutes=0.5,
+        )
+        self.assertEqual(report.outcome, outcomes.RATE_LIMITED)
+        self.assertIn("five_hour rejected", report.detail)
+        self.assertIn("resets 2026-08-21T20:50:00+00:00", report.detail)
+        self.assertIn("out_of_credits", report.detail)
+
+    def test_claude_rate_limit_allowed_event_is_not_fatal(self) -> None:
+        # The CLI also emits rate_limit_event with status "allowed" as a
+        # usage notice; only "rejected" ends the attempt.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "system", "subtype": "init", "session_id": "sess-ok", "model": "m"},
+                        {
+                            "type": "rate_limit_event",
+                            "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour"},
+                        },
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n"
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            validate=self.json_validator(),
+            poll_seconds=0.05,
+            timeout_minutes=0.5,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+
+
 class ZeroExitTurnFailedTest(FakeCliCase):
     def test_codex_zero_exit_turn_failed_classifies_auth(self) -> None:
         # codex exec exits 0 on a failed turn; before the terminal_failure
