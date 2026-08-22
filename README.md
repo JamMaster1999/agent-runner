@@ -180,6 +180,35 @@ second.resumed  # True
 
 
 
+## What an attempt cost
+
+Every report carries two `Usage` values (`tok_input`, `tok_cache_write`, `tok_cache_read`, `tok_output`, `cost_usd`):
+
+- `report.usage` is what this attempt alone spent, repair rounds included.
+- `report.session_usage` is the session's total at the end of it, every earlier attempt on the same session included.
+
+The two CLIs report usage differently, and agent-runner normalizes both:
+
+| CLI         | What the stream reports                                                                                                                                 | What agent-runner does                                                   |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Claude Code | The `result` event's `total_cost_usd` and `usage` cover that invocation only. A `--resume` run reports its own spend, not the session's. `usage` counts the main agent loop; `total_cost_usd` includes subagents. | Adds each invocation's result. `session_usage` = the baseline you pass + `usage`. |
+| Codex       | `turn.completed.usage` is the thread's running total, seeded from the transcript on `exec resume`, so a resumed thread's first event already counts every earlier run on it. The stream carries no dollars. | Takes the latest total as `session_usage`; `usage` = that total minus the baseline. |
+
+The baseline is the `session_usage` argument to `run_attempt`: pass the prior attempt's `report.session_usage` when you pass its `session_ref`. Without it a resumed Codex attempt would be charged for the whole thread. Pass `on_usage` to watch the attempt's own running usage before it ends. The Temporal wrapper does all of this from the attempt record.
+
+```python
+second = run_attempt(
+    spec, task, workdir_2, agent=agent,
+    session_ref=first.session_ref,
+    session_usage=first.session_usage,
+    on_usage=lambda usage: print(usage.tok_output),
+)
+second.usage          # this attempt's spend
+second.session_usage  # first + second
+```
+
+Cost is a client-side estimate from the CLI's price table, and only Claude reports one. Treat it as budgeting insight, not billing.
+
 ## Running agents in parallel
 
 `run_attempt` is a plain blocking function, so scaling out is ordinary Python. Every run gets its own working folder and its own session. The CLI login is shared, which is the point: all of them run on the one subscription. This is how you batch-process a long list with parallel AI agents and no API key.
@@ -210,9 +239,9 @@ with ThreadPoolExecutor(max_workers=8) as pool:
 For workflows that must survive worker crashes and run for hours, agent-runner ships a ready-made wrapper for [Temporal](https://temporal.io) as the `[temporal]` extra. Inside a Temporal activity it adds:
 
 - A **heartbeat** while the CLI runs, so the server knows the attempt is alive (whether the agent still is, is the stall watchdog's job)
-- The **session handle rides the heartbeat**, so a retry on any machine resumes the same session
-- Outcomes become **typed retry errors**: `rate_limited` waits long, `infra` retries elsewhere, `auth` stops immediately
-- **The evidence travels with the error**: the failure's details carry the outcome word, the CLI's own error text, the session handle, and the failed attempts before it — so history, not the worker's disk, answers "why did this fail"
+- The **session handle and the running usage ride the heartbeat**, so a retry on any machine resumes the same session and a dashboard shows spend while the attempt runs
+- Outcomes become **typed retry errors**: `rate_limited` waits until the CLI's reset time when it named one (floored at 30s, capped at 6h), else the configured backoff; `infra` retries elsewhere; `auth` stops immediately
+- **One record per attempt**, success included: `attempt`, `outcome`, `error`, `detail`, `session_ref`, `resumed`, `resets_at`, `started_at`, `ended_at`, `usage` (this attempt alone), and `session_usage` (the session's total after it). The list rides the heartbeat as `attempts`, lands on the final report as `report.attempts`, and travels in failure details beside the outcome word, the CLI's own error text, and the session handle — so history, not the worker's disk, answers "why did this fail" and "what did it cost". An attempt whose worker died mid-run is named from the gap in attempt numbers, with its fields null.
 - A **resume budget**, so a poisoned session is eventually abandoned for a fresh one
 
 ```python
