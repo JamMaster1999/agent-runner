@@ -74,9 +74,11 @@ class RetryMappingTest(unittest.TestCase):
             error="k: claude attempt failed",
             detail="claude result success: You've hit your session limit",
             session_ref="sess-1",
-            attempts=({"attempt": 1, "outcome": "stalled"},),
+            attempts=({"attempt": 1, "outcome": "stalled"}, {"attempt": 2, "outcome": "infra"}),
         )
         error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
+        # The failing attempt is the error itself; its own record (last) is
+        # not repeated beside the outcome/detail/session_ref that describe it.
         self.assertEqual(
             error.details[0],
             {
@@ -92,14 +94,14 @@ class RetryMappingTest(unittest.TestCase):
         # after the limit lifts instead of probing every quarter hour.
         now = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)
         delay = retry_module.rate_limit_delay
-        default = timedelta(minutes=15)
-        self.assertEqual(delay(None, default, now), default)
-        self.assertEqual(delay(now + timedelta(minutes=50), default, now), timedelta(minutes=50))
+        default, cap = timedelta(minutes=15), timedelta(hours=6)
+        self.assertEqual(delay(None, default, cap, now), default)
+        self.assertEqual(delay(now + timedelta(minutes=50), default, cap, now), timedelta(minutes=50))
         # Already past (or a few seconds out): retry promptly, not instantly.
-        self.assertEqual(delay(now - timedelta(hours=1), default, now), retry_module.RESET_DELAY_FLOOR)
-        # A weekly cap's reset is days away; the wait is capped so the
-        # caller's schedule-to-close backstop, not this delay, ends the run.
-        self.assertEqual(delay(now + timedelta(days=3), default, now), retry_module.RESET_DELAY_CAP)
+        self.assertEqual(delay(now - timedelta(hours=1), default, cap, now), retry_module.RESET_DELAY_FLOOR)
+        # The cap is the caller's: a waiting retry holds its slot.
+        self.assertEqual(delay(now + timedelta(days=3), default, cap, now), cap)
+        self.assertEqual(delay(now + timedelta(hours=2), default, timedelta(hours=1), now), timedelta(hours=1))
 
         report = AttemptReport(
             outcome=outcomes.RATE_LIMITED,
@@ -107,8 +109,64 @@ class RetryMappingTest(unittest.TestCase):
             resets_at=datetime.now(timezone.utc) + timedelta(hours=2),
         )
         error = application_error_for(report, rate_limit_backoff=default)
+        self.assertFalse(error.non_retryable)
         self.assertGreater(error.next_retry_delay, timedelta(hours=1, minutes=59))
         self.assertLessEqual(error.next_retry_delay, timedelta(hours=2))
+
+    def test_a_reset_past_the_activity_deadline_fails_at_once(self) -> None:
+        # The retry could never start before schedule-to-close fires, so
+        # idling until then only holds the slot: fail now, non-retryable,
+        # naming both times.
+        resets_at = datetime(2026, 8, 22, 9, 0, tzinfo=timezone.utc)
+        report = AttemptReport(outcome=outcomes.RATE_LIMITED, error="k: capped", resets_at=resets_at)
+        error = application_error_for(
+            report,
+            rate_limit_backoff=timedelta(minutes=15),
+            deadline=resets_at - timedelta(minutes=1),
+        )
+        self.assertEqual(error.type, outcomes.RATE_LIMITED)
+        self.assertTrue(error.non_retryable)
+        self.assertIsNone(error.next_retry_delay)
+        self.assertIn("2026-08-22T09:00:00+00:00", error.message)
+        self.assertIn("deadline 2026-08-22T08:59:00+00:00", error.message)
+        # A reset inside the deadline waits as usual.
+        error = application_error_for(
+            report, rate_limit_backoff=timedelta(minutes=15), deadline=resets_at + timedelta(hours=1)
+        )
+        self.assertFalse(error.non_retryable)
+        self.assertIsNotNone(error.next_retry_delay)
+
+    def test_activity_deadline_is_scheduled_time_plus_schedule_to_close(self) -> None:
+        import dataclasses
+
+        info = ActivityEnvironment().info
+        scheduled = datetime(2026, 8, 22, 8, 0, tzinfo=timezone.utc)
+        info = dataclasses.replace(info, scheduled_time=scheduled, schedule_to_close_timeout=timedelta(hours=8))
+        self.assertEqual(activity_module.activity_deadline(info), scheduled + timedelta(hours=8))
+        info = dataclasses.replace(info, schedule_to_close_timeout=None)
+        self.assertIsNone(activity_module.activity_deadline(info))
+
+    def test_heartbeat_with_ten_maximal_records_stays_small(self) -> None:
+        # Temporal caps heartbeat details at 2 MB; the record bounds its own
+        # texts by bytes, so ten of the worst stay far under it.
+        loud = AttemptReport(
+            outcome=outcomes.INFRA,
+            error="é" * 10_000,
+            detail="x" * 100_000,
+            session_ref="s" * 64,
+            resets_at=datetime.now(timezone.utc),
+        )
+        state = activity_module._HeartbeatState(session_ref="s" * 64, progress={"message": "m" * 300})
+        for number in range(1, 30):
+            state.record(activity_module.attempt_record(number, loud, "2026-08-22T08:00:00+00:00", "2026-08-22T09:00:00+00:00"))
+        payload = state.payload()
+        self.assertEqual(len(payload["attempts"]), activity_module.ATTEMPTS_KEPT)
+        record = payload["attempts"][-1]
+        self.assertLessEqual(len(record["error"].encode()), activity_module.RECORD_TEXT_LIMIT)
+        self.assertLessEqual(len(record["detail"].encode()), activity_module.RECORD_TEXT_LIMIT)
+        self.assertLess(len(json.dumps(payload).encode()), 32_000)
+        # A worker that died at attempt 1000 names only the newest gap.
+        self.assertEqual(len(activity_module.vanished_attempts(1000, [], None)), activity_module.ATTEMPTS_KEPT)
 
     def test_failure_detail_is_bounded(self) -> None:
         report = AttemptReport(outcome=outcomes.INFRA, error="k", detail="x" * 5000 + "END")
@@ -222,9 +280,9 @@ class ActivityRunTest(unittest.TestCase):
 
         return validate
 
-    def run_activity(self, coro_fn, *args, **kwargs):
+    def run_activity(self, coro_fn, *args, heartbeats: list | None = None, **kwargs):
         env = ActivityEnvironment()
-        heartbeats: list = []
+        heartbeats = [] if heartbeats is None else heartbeats
         env.on_heartbeat = lambda *details: heartbeats.append(details)
         result = asyncio.run(env.run(coro_fn, *args, **kwargs))
         return result, heartbeats
@@ -351,14 +409,17 @@ class ActivityRunTest(unittest.TestCase):
             "resume_count": 0,
             "attempts": [{"attempt": 1, "outcome": "stalled", "error": "silent"}],
         }
+        heartbeats: list = []
         with mock.patch.object(activity_module, "prior_heartbeat_details", return_value=prior):
             with self.assertRaises(ApplicationError) as caught:
-                self.run_activity(act)
+                self.run_activity(act, heartbeats=heartbeats)
         details = caught.exception.details[0]
         self.assertEqual(details["outcome"], outcomes.INFRA)
-        # Every attempt's record, this one last.
-        self.assertEqual(details["attempts"][0], prior["attempts"][0])
-        own = details["attempts"][1]
+        # The failure's details name the attempts before it; the failing
+        # one is described by the error itself.
+        self.assertEqual(details["attempts"], prior["attempts"])
+        # The heartbeat carries the whole list, the failing attempt last.
+        own = heartbeats[-1][0]["attempts"][-1]
         self.assertEqual(own["outcome"], outcomes.INFRA)
         self.assertTrue(own["resumed"])
         self.assertEqual(own["session_ref"], "th_1")
@@ -367,16 +428,45 @@ class ActivityRunTest(unittest.TestCase):
         # A worker killed mid-attempt reports nothing; attempt 4 arriving
         # with attempts 1 and 3 on record means 2 died with its worker.
         recorded = [{"attempt": 1, "outcome": "stalled"}, {"attempt": 3, "outcome": "infra"}]
-        (gap,) = activity_module.vanished_attempts(4, recorded)
+        (gap,) = activity_module.vanished_attempts(4, recorded, None)
         self.assertEqual(gap["attempt"], 2)
         self.assertEqual(gap["outcome"], outcomes.INFRA)
         self.assertIn("worker died", gap["error"])
+        self.assertEqual(set(gap), set(activity_module.RECORD_KEYS))
         self.assertIsNone(gap["usage"])
-        # One record shape: a vanished entry carries every field, as null.
-        full = activity_module.attempt_record(1, AttemptReport(outcome="infra"), "t0", "t1")
-        self.assertEqual(set(gap), set(full))
-        self.assertEqual(activity_module.vanished_attempts(1, []), [])
-        self.assertEqual(activity_module.vanished_attempts(3, recorded[:1] + [{"attempt": 2}]), [])
+        self.assertEqual(activity_module.vanished_attempts(1, [], None), [])
+        self.assertEqual(activity_module.vanished_attempts(3, recorded[:1] + [{"attempt": 2}], None), [])
+
+    def test_a_vanished_attempt_keeps_what_its_last_heartbeat_knew(self) -> None:
+        # The dead worker's heartbeat carried the session it was in and the
+        # running usage: attempt 2's record takes them, so attempt 3's
+        # baseline on the same thread is 2500, not attempt 1's 1000 — the
+        # dead attempt's 1500 is charged to it, not to the next one.
+        one = {"attempt": 1, "outcome": "stalled", "session_ref": "th_1",
+               "usage": Usage(1000).as_dict(), "session_usage": Usage(1000).as_dict()}
+        prior = {
+            "attempt": 2,
+            "session_ref": "th_1",
+            "usage": Usage(1500).as_dict(),
+            "session_usage": Usage(2500).as_dict(),
+            "attempts": [one],
+        }
+        (gap,) = activity_module.vanished_attempts(3, [one], prior)
+        self.assertEqual(gap["session_ref"], "th_1")
+        self.assertEqual(gap["usage"], Usage(1500).as_dict())
+        self.assertEqual(gap["session_usage"], Usage(2500).as_dict())
+        self.assertEqual(activity_module.session_usage_before("th_1", [one, gap]), Usage(2500))
+        # A heartbeat from an earlier attempt (the dead one never beat) says
+        # nothing about the gap.
+        (gap,) = activity_module.vanished_attempts(3, [one], {**prior, "attempt": 1})
+        self.assertIsNone(gap["usage"])
+        self.assertEqual(activity_module.session_usage_before("th_1", [one, gap]), Usage(1000))
+
+    def test_session_usage_baseline_survives_a_newer_record_shape(self) -> None:
+        # A mid-run redeploy may replay a record written by a newer Usage:
+        # unknown keys are ignored instead of crashing every later attempt.
+        entry = {"attempt": 1, "session_ref": "th_1", "session_usage": {"tok_input": 5, "tok_images": 2}}
+        self.assertEqual(activity_module.session_usage_before("th_1", [entry]), Usage(tok_input=5))
 
     def test_every_attempt_leaves_a_typed_record(self) -> None:
         # Success included: the record names what the attempt spent, when,
@@ -434,13 +524,14 @@ class ActivityRunTest(unittest.TestCase):
         # The heartbeat carried the running attempt's usage, typed, before
         # the record existed; the final one carries both.
         final = heartbeats[-1][0]
+        self.assertEqual(final["attempt"], 1)
         self.assertEqual(final["usage"]["tok_input"], 500)
+        self.assertEqual(final["session_usage"]["tok_input"], 500)
         self.assertEqual(final["attempts"], list(report.attempts))
 
     def test_resumed_attempt_records_its_own_spend_and_the_session_total(self) -> None:
-        # The codex stream reports the thread's running total; attempt 2's
-        # record must carry only what it added, measured from where the
-        # prior record left the session.
+        # Attempt 2's record carries what it spent, and the session's total
+        # continues from where the prior record on the same thread left it.
         self.scenario_path.write_text(
             json.dumps(
                 [
@@ -485,9 +576,9 @@ class ActivityRunTest(unittest.TestCase):
             report, _ = self.run_activity(act)
         own = report.attempts[-1]
         self.assertTrue(own["resumed"])
-        self.assertEqual(own["usage"], Usage(300, 0, 200, 30).as_dict())
-        self.assertEqual(own["session_usage"], Usage(800, 0, 300, 80).as_dict())
-        self.assertEqual(report.usage, Usage(300, 0, 200, 30))
+        self.assertEqual(own["usage"], Usage(800, 0, 300, 80).as_dict())
+        self.assertEqual(own["session_usage"], Usage(1300, 0, 400, 130).as_dict())
+        self.assertEqual(report.usage, Usage(800, 0, 300, 80))
 
     def test_resume_budget_exhausted_falls_back_fresh(self) -> None:
         # Matrix C4: budget spent -> fresh session, recorded.

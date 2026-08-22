@@ -110,13 +110,8 @@ class Verdict:
 @dataclass
 class Usage:
     """Token and cost totals, read from the stream's typed usage events.
-
-    A stream reports usage one of two ways (``Capabilities.usage_cumulative``):
-    each event is its own invocation's spend, so events ADD; or each event is
-    the session's running total since it began, so the latest event REPLACES
-    and an attempt's own share is the total minus where the session stood
-    before it. ``Usage`` arithmetic covers both.
-    """
+    Every usage event is one CLI invocation's own spend (both CLIs report
+    per process, a resumed run included), so events add."""
 
     tok_input: int = 0
     tok_cache_write: int = 0
@@ -130,12 +125,6 @@ class Usage:
             if value is not None:
                 setattr(self, name, getattr(self, name) + value)
 
-    def set_event(self, event: Any) -> None:
-        for name in self.names():
-            value = getattr(event, name, None)
-            if value is not None:
-                setattr(self, name, value)
-
     def assign(self, other: Usage) -> None:
         for name in self.names():
             setattr(self, name, getattr(other, name))
@@ -143,11 +132,14 @@ class Usage:
     def __add__(self, other: Usage) -> Usage:
         return Usage(*(getattr(self, n) + getattr(other, n) for n in self.names()))
 
-    def __sub__(self, other: Usage) -> Usage:
-        return Usage(*(getattr(self, n) - getattr(other, n) for n in self.names()))
-
     def as_dict(self) -> dict[str, int | float]:
         return {name: getattr(self, name) for name in self.names()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Usage:
+        """The mirror of ``as_dict`` over data that may be older or newer
+        than this code: unknown keys are ignored, missing ones default."""
+        return cls(**{name: data[name] for name in cls.names() if name in data})
 
     @classmethod
     def names(cls) -> tuple[str, ...]:

@@ -5,8 +5,14 @@ events-out so captured ``codex.stdout.jsonl`` files replay offline.
 
 Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
 consumer API — event messages are display-only. ``turn.completed.usage``
-is the thread's running total, not the turn's own spend (see the
-adapter's ``usage_cumulative`` capability); the stream carries no dollars.
+is the process's running total (``TokenUsageInfo.total_token_usage``:
+every API call of the turn added up), and one ``codex exec`` process runs
+one turn, so it is that invocation's own spend. The source seeds the
+total from the rollout on resume (core/src/session/mod.rs), but measured
+on codex-cli 0.149.0-alpha.4 an ``exec resume`` process reports its own
+turn only (2026-08-22: three runs on one thread reported 17102, 20918,
+23128 input tokens with ``total == last`` in the rollout). The stream
+carries no dollars.
 """
 
 from __future__ import annotations

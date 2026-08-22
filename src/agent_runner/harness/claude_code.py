@@ -65,10 +65,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
     session_noun: ClassVar[str] = "session"
     # resume/followup: `claude --resume <session>`.
     # doctor=False: `claude doctor` exists but is unstructured.
-    # usage_cumulative=False: the result event's total_cost_usd and usage
-    # cover that invocation only — a --resume'd run reports its own spend,
-    # never the session's (Agent SDK cost-tracking docs: "each result
-    # reflects only the cost of that individual call").
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
         followup=True,

@@ -167,11 +167,18 @@ class ClaudeStreamParserTest(unittest.TestCase):
                 "subtype": "success",
                 "duration_ms": 1000,
                 "num_turns": 4,
+                # The main loop's block: not read. Tokens come from the
+                # per-model table, which also counts the subagent's calls —
+                # the same scope as total_cost_usd.
                 "usage": {
                     "input_tokens": 10,
                     "cache_creation_input_tokens": 20,
                     "cache_read_input_tokens": 30,
                     "output_tokens": 40,
+                },
+                "modelUsage": {
+                    "claude-opus-4-6": {"inputTokens": 10, "cacheCreationInputTokens": 20, "cacheReadInputTokens": 30, "outputTokens": 40, "costUSD": 1.0},
+                    "claude-haiku-4-5": {"inputTokens": 1, "cacheCreationInputTokens": 2, "cacheReadInputTokens": 3, "outputTokens": 4, "costUSD": 0.2345},
                 },
                 "total_cost_usd": 1.2345,
             }
@@ -179,10 +186,10 @@ class ClaudeStreamParserTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event, "result_success")
         self.assertEqual(events[0].message, "Claude result: success (1000 ms, 4 turns)")
-        self.assertEqual(events[0].tok_input, 10)
-        self.assertEqual(events[0].tok_cache_write, 20)
-        self.assertEqual(events[0].tok_cache_read, 30)
-        self.assertEqual(events[0].tok_output, 40)
+        self.assertEqual(events[0].tok_input, 11)
+        self.assertEqual(events[0].tok_cache_write, 22)
+        self.assertEqual(events[0].tok_cache_read, 33)
+        self.assertEqual(events[0].tok_output, 44)
         self.assertEqual(events[0].cost_usd, 1.2345)
 
     def test_result_cost_typed_without_usage_block(self) -> None:
@@ -190,7 +197,7 @@ class ClaudeStreamParserTest(unittest.TestCase):
             {"type": "result", "subtype": "success", "total_cost_usd": 0.123456789}
         )
         self.assertEqual(events[0].cost_usd, 0.123456789)
-        # No usage block -> token fields stay untyped even though cost is set.
+        # No per-model table -> token fields stay untyped even though cost is set.
         self.assertIsNone(events[0].tok_input)
 
     def test_result_error_appends_detail(self) -> None:

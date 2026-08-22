@@ -50,6 +50,11 @@ class TemporalRunConfig:
     heartbeat_seconds: float = 15.0
     resume_budget: int = 3            # resumes of ONE session before a fresh fallback
     rate_limit_backoff: timedelta = timedelta(minutes=15)
+    # The longest a rate_limited retry waits on the CLI's reset time. A
+    # waiting retry holds whatever slot the caller gated the activity
+    # behind, so the cap is the caller's call; a reset past the activity's
+    # own deadline fails at once instead (retry.application_error_for).
+    rate_limit_reset_cap: timedelta = timedelta(hours=6)
 
 
 @dataclass
@@ -77,22 +82,26 @@ class _HeartbeatState:
     each payload a consistent snapshot — never a stale session_ref beside a
     reset resume_count."""
 
+    attempt: int = 1
     session_ref: str | None = None
     resume_count: int = 0
     agent_fp: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
+    session_usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     attempts: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
         with self.lock:
             return {
+                "attempt": self.attempt,
                 "session_ref": self.session_ref,
                 "resume_count": self.resume_count,
                 "agent_fp": self.agent_fp,
                 "progress": dict(self.progress),
                 "usage": dict(self.usage),
+                "session_usage": dict(self.session_usage),
                 "attempts": list(self.attempts),
             }
 
@@ -106,24 +115,42 @@ class _HeartbeatState:
 
 
 ATTEMPTS_KEPT = 10
-ATTEMPT_DETAIL_LIMIT = 500
+RECORD_TEXT_LIMIT = 500  # bytes, for each of error and detail
+
+# What one attempt leaves behind, success or not: how it ended, the session
+# it ran in, when, what it alone spent, and where that left the session's
+# total. One shape for reported and vanished attempts alike.
+RECORD_KEYS = (
+    "attempt",
+    "outcome",
+    "error",
+    "detail",
+    "session_ref",
+    "resumed",
+    "resets_at",
+    "started_at",
+    "ended_at",
+    "usage",
+    "session_usage",
+)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _tail(text: str, limit: int) -> str:
+    return text.encode()[-limit:].decode(errors="ignore")
+
+
 def attempt_record(
     attempt: int, report: AttemptReport, started_at: str, ended_at: str
 ) -> dict[str, Any]:
-    """What one attempt leaves behind, success or not: how it ended, the
-    session it ran in, when, what it alone spent, and where that left the
-    session's total."""
     return {
         "attempt": attempt,
         "outcome": report.outcome,
-        "error": report.error,
-        "detail": report.detail[-ATTEMPT_DETAIL_LIMIT:],
+        "error": _tail(report.error, RECORD_TEXT_LIMIT),
+        "detail": _tail(report.detail, RECORD_TEXT_LIMIT),
         "session_ref": report.session_ref,
         "resumed": report.resumed,
         "resets_at": (
@@ -142,7 +169,7 @@ def session_usage_before(session_ref: str | None, attempts: list[dict[str, Any]]
     if session_ref:
         for entry in reversed(attempts):
             if entry.get("session_ref") == session_ref and entry.get("session_usage"):
-                return Usage(**entry["session_usage"])
+                return Usage.from_dict(entry["session_usage"])
     return Usage()
 
 
@@ -157,29 +184,38 @@ def agent_fingerprint(agent: AgentDef | None) -> str | None:
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
-def vanished_attempts(attempt: int, recorded: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def vanished_attempts(
+    attempt: int, recorded: list[dict[str, Any]], prior: dict[str, Any] | None
+) -> list[dict[str, Any]]:
     """The attempts nobody reported: a worker that dies mid-attempt never
     writes its failure, Temporal just starts the next attempt elsewhere. The
     attempt number counts them anyway, so the gap between it and the record
-    names them — the only trace a killed worker leaves in history."""
+    names them. The dead worker's last heartbeat is its only other trace:
+    when it belongs to a vanished attempt, that attempt's record takes the
+    session it was in and what it had spent, so the session's total still
+    counts the dead attempt. Only the newest ``ATTEMPTS_KEPT`` numbers are
+    named — older ones would be sliced away anyway."""
     seen = {entry.get("attempt") for entry in recorded}
-    return [
-        {
-            "attempt": number,
-            "outcome": outcomes.INFRA,
-            "error": "attempt ended without a report — the worker died mid-attempt",
-            "detail": "",
-            "session_ref": None,
-            "resumed": None,
-            "resets_at": None,
-            "started_at": None,
-            "ended_at": None,
-            "usage": None,
-            "session_usage": None,
-        }
-        for number in range(1, attempt)
-        if number not in seen
-    ]
+    prior = prior or {}
+    entries = []
+    for number in range(max(1, attempt - ATTEMPTS_KEPT), attempt):
+        if number in seen:
+            continue
+        entry = dict.fromkeys(RECORD_KEYS)
+        entry.update(
+            attempt=number,
+            outcome=outcomes.INFRA,
+            error="attempt ended without a report — the worker died mid-attempt",
+            detail="",
+        )
+        if prior.get("attempt") == number:
+            entry.update(
+                session_ref=prior.get("session_ref"),
+                usage=prior.get("usage"),
+                session_usage=prior.get("session_usage"),
+            )
+        entries.append(entry)
+    return entries
 
 
 def prior_heartbeat_details() -> dict[str, Any] | None:
@@ -236,7 +272,8 @@ async def run_agent_attempt(
     # or an exhausted resume budget starts a fresh session, not a fresh
     # history.
     attempts = list((prior or {}).get("attempts") or [])
-    attempts.extend(vanished_attempts(info.attempt, attempts))
+    attempts.extend(vanished_attempts(info.attempt, attempts, prior))
+    del attempts[:-ATTEMPTS_KEPT]
     current_fp = agent_fingerprint(agent)
     if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
         activity.logger.warning(
@@ -263,10 +300,13 @@ async def run_agent_attempt(
         workdirs.pull_checkpoints(checkpoint.directory)
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
+    before = session_usage_before(session_ref, attempts)
     state = _HeartbeatState(
+        attempt=info.attempt,
         session_ref=session_ref,
         resume_count=resume_count,
         agent_fp=current_fp,
+        session_usage=before.as_dict(),
         attempts=attempts,
     )
 
@@ -289,9 +329,10 @@ async def run_agent_attempt(
                 state.resume_count = 0
             state.session_ref = ref
 
-    def on_usage(usage: Usage) -> None:
+    def on_usage(usage: Usage, session_usage: Usage) -> None:
         with state.lock:
             state.usage = usage.as_dict()
+            state.session_usage = session_usage.as_dict()
 
     async def pump() -> None:
         while True:
@@ -313,7 +354,7 @@ async def run_agent_attempt(
             on_session=on_session,
             on_usage=on_usage,
             session_ref=session_ref,
-            session_usage=session_usage_before(session_ref, attempts),
+            session_usage=before,
             run_id=info.workflow_run_id or "",
             attempt=info.attempt,
             variables=variables,
@@ -351,4 +392,17 @@ async def run_agent_attempt(
 
     if report.outcome == outcomes.VALID:
         return report
-    raise application_error_for(report, rate_limit_backoff=config.rate_limit_backoff)
+    raise application_error_for(
+        report,
+        rate_limit_backoff=config.rate_limit_backoff,
+        reset_cap=config.rate_limit_reset_cap,
+        deadline=activity_deadline(info),
+    )
+
+
+def activity_deadline(info: activity.Info) -> datetime | None:
+    """When this activity's schedule-to-close runs out, or None when the
+    caller set no such backstop."""
+    if info.schedule_to_close_timeout is None:
+        return None
+    return info.scheduled_time + info.schedule_to_close_timeout

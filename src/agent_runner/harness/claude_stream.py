@@ -5,10 +5,12 @@ Lands beside its adapter (extraction step 6, plan §1); pure line-in/
 events-out so captured ``claude.stdout.log`` files replay offline.
 
 Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
-consumer API — event messages are display-only. The ``result`` event's
-``usage`` and ``total_cost_usd`` cover that invocation alone (a resumed
-run reports its own spend, never the session's); ``usage`` counts the
-main agent loop only, ``total_cost_usd`` includes subagents.
+consumer API — event messages are display-only. The ``result`` event
+covers that invocation alone (a resumed run reports its own spend, never
+the session's). Tokens are summed from ``modelUsage``, the per-model
+table that spans the main loop, subagents, and compaction — the same
+scope as ``total_cost_usd``; the result's ``usage`` block counts the main
+loop only and is not read.
 """
 
 from __future__ import annotations
@@ -21,6 +23,25 @@ from agent_runner.harness.stream import (
     progress_events,
     typed_token,
 )
+
+
+TOKEN_KEYS = ("inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens")
+
+
+def model_usage_totals(model_usage: object) -> dict[str, int]:
+    """Token counts summed across the result's per-model table; a key is
+    present only when at least one model reported a genuine count."""
+    totals: dict[str, int] = {}
+    if not isinstance(model_usage, dict):
+        return totals
+    for entry in model_usage.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in TOKEN_KEYS:
+            value = typed_token(entry.get(key))
+            if value is not None:
+                totals[key] = totals.get(key, 0) + value
+    return totals
 
 
 class ClaudeStreamParser:
@@ -117,18 +138,18 @@ class ClaudeStreamParser:
             detail = f"Claude result: {subtype}"
             if duration is not None:
                 detail += f" ({duration} ms, {turns} turns)"
-            usage = payload.get("usage") or {}
             cost = payload.get("total_cost_usd")
             if subtype != "success" and payload.get("result"):
                 detail += f" — {clip(str(payload.get('result')), 160)}"
+            tokens = model_usage_totals(payload.get("modelUsage"))
             return [
                 StreamEvent(
                     event,
                     detail,
-                    tok_input=typed_token(usage.get("input_tokens")),
-                    tok_cache_write=typed_token(usage.get("cache_creation_input_tokens")),
-                    tok_cache_read=typed_token(usage.get("cache_read_input_tokens")),
-                    tok_output=typed_token(usage.get("output_tokens")),
+                    tok_input=tokens.get("inputTokens"),
+                    tok_cache_write=tokens.get("cacheCreationInputTokens"),
+                    tok_cache_read=tokens.get("cacheReadInputTokens"),
+                    tok_output=tokens.get("outputTokens"),
                     cost_usd=cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
                 )
             ]

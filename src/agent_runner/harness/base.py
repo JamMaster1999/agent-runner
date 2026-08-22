@@ -82,16 +82,13 @@ class Capabilities:
     """Proven degradation flags, not speculation: every False path already
     ran in production. No ``resume`` -> every attempt is fresh; no
     ``followup`` -> validation failure goes straight to retry; no ``hooks``
-    -> stream telemetry only. ``usage_cumulative`` names the stream's usage
-    dialect: True when each usage event is the session's running total
-    (resume included), False when each is its own invocation's spend."""
+    -> stream telemetry only."""
 
     resume: bool = False             # can reopen a session and continue
     followup: bool = False           # can inject a message into an existing session (repair)
     hooks: bool = False              # emits lifecycle hooks the runner can capture
     doctor: bool = False             # structured self-diagnosis command
     final_message_artifact: bool = False
-    usage_cumulative: bool = False   # usage events are session totals, not per-invocation spend
 
 
 @dataclass(frozen=True)

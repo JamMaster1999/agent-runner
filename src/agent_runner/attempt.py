@@ -26,9 +26,9 @@ What crosses the boundary from the project side:
 - ``on_session`` — called once with the CLI session ref as soon as the
   stream reveals it, so a caller can persist the resume handle before the
   attempt ends.
-- ``on_usage`` — called with the attempt's own running ``Usage`` each time
-  the stream reports spend, so a caller can show it before the attempt
-  ends.
+- ``on_usage`` — called with the attempt's own running ``Usage`` and the
+  session's total each time the stream reports spend, so a caller can show
+  them before the attempt ends.
 - ``resources`` — registered providers for the spec's declared
   ``resource_specs`` (see ``agent_runner.resources``); their values arrive
   in the task as ``{{RESOURCE:*}}`` template substitutions.
@@ -234,16 +234,20 @@ def _spawn_report(spec: RunSpec, message: str, detail: str = "") -> AttemptRepor
     )
 
 
-def _classify_exit(
-    adapter: HarnessAdapter, spec: RunSpec, spawn, returncode: int
-) -> tuple[str, str, str]:
-    """(outcome, error, detail) for a nonzero CLI exit, from CLI-owned error
-    text only — never agent transcript tails."""
+def _classify_exit(adapter: HarnessAdapter, spawn, returncode: int) -> RunnerError:
+    """The failure behind a nonzero CLI exit, from CLI-owned error text
+    only — never agent transcript tails."""
     detail = adapter.error_report(spawn.stdout_path, spawn.stderr_path)
-    failure = adapter.classify_failure(
-        detail or f"{adapter.display_name} exited {returncode}."
-    )
-    return _outcome_for(failure.code), f"{spec.key}: {failure}", failure.details
+    return adapter.classify_failure(detail or f"{adapter.display_name} exited {returncode}.")
+
+
+def _apply(report: AttemptReport, spec: RunSpec, failure: RunnerError) -> AttemptReport:
+    """End the attempt with this failure's verdict."""
+    report.outcome = _outcome_for(failure.code)
+    report.error = f"{spec.key}: {failure}"
+    report.detail = failure.details
+    report.resets_at = failure.resets_at
+    return report
 
 
 def _repair(
@@ -335,7 +339,7 @@ def run_attempt(
     validate: Callable[[Path], Verdict] | None = None,
     on_event: Callable[[StreamEvent], None] | None = None,
     on_session: Callable[[str], None] | None = None,
-    on_usage: Callable[[Usage], None] | None = None,
+    on_usage: Callable[[Usage, Usage], None] | None = None,
     session_ref: str | None = None,
     session_usage: Usage | None = None,
     run_id: str = "",
@@ -355,7 +359,7 @@ def run_attempt(
     (the resume preamble is prepended; ``spec.policy.resume_preamble``
     overrides the default text); ``session_usage`` is where that session
     stood before this attempt (the prior attempt's ``report.session_usage``),
-    so the report can tell this attempt's spend from the session's total.
+    so ``report.session_usage`` can carry the session's whole total.
     ``should_stop`` polled true terminates the CLI and raises
     ``AttemptCancelled``. A CLI that stops producing for the stall window
     is terminated too, ending the attempt ``stalled``.
@@ -373,16 +377,12 @@ def run_attempt(
     before = Usage()
 
     def emit(event: StreamEvent) -> None:
-        if adapter.capabilities.usage_cumulative:
-            session_total.set_event(event)
-        else:
-            session_total.add_event(event)
-        spent = session_total - before
-        if spent != usage:
-            usage.assign(spent)
+        if any(getattr(event, name) is not None for name in Usage.names()):
+            usage.add_event(event)
+            session_total.assign(before + usage)
             if on_usage is not None:
                 try:
-                    on_usage(dataclasses.replace(usage))
+                    on_usage(dataclasses.replace(usage), dataclasses.replace(session_total))
                 except Exception:
                     pass
         if on_event is not None:
@@ -531,12 +531,7 @@ def run_attempt(
                         # waiting out its own retry ladder buys nothing. The
                         # first typed fatal decides the outcome.
                         _terminate(process)
-                        failure = fatal_errors[0]
-                        report.outcome = _outcome_for(failure.code)
-                        report.error = f"{spec.key}: {failure}"
-                        report.detail = failure.details
-                        report.resets_at = failure.resets_at
-                        return report
+                        return _apply(report, spec, fatal_errors[0])
                     if should_stop is not None and should_stop():
                         _terminate(process)
                         raise AttemptCancelled(
@@ -595,16 +590,11 @@ def run_attempt(
                 report.outcome = outcomes.VALID
                 report.data = verdict.data
                 return report
-            if zero_exit_error:
-                report.outcome = _outcome_for(zero_exit_error.code)
-                report.error = f"{spec.key}: {zero_exit_error}"
-                report.detail = zero_exit_error.details
-                report.resets_at = zero_exit_error.resets_at
-                return report
-            report.outcome, report.error, report.detail = _classify_exit(
-                adapter, spec, spawn, process.returncode
+            return _apply(
+                report,
+                spec,
+                zero_exit_error or _classify_exit(adapter, spawn, process.returncode),
             )
-            return report
 
         if verdict is None or verdict.valid:
             report.outcome = outcomes.VALID

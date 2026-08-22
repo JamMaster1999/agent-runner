@@ -465,11 +465,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "success",
-                            "usage": {
-                                "input_tokens": 10,
-                                "cache_creation_input_tokens": 20,
-                                "cache_read_input_tokens": 30,
-                                "output_tokens": 40,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 10,
+                                    "cacheCreationInputTokens": 20,
+                                    "cacheReadInputTokens": 30,
+                                    "outputTokens": 40,
+                                }
                             },
                             "total_cost_usd": 0.1,
                         }
@@ -482,11 +484,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "success",
-                            "usage": {
-                                "input_tokens": 1,
-                                "cache_creation_input_tokens": 2,
-                                "cache_read_input_tokens": 3,
-                                "output_tokens": 4,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 1,
+                                    "cacheCreationInputTokens": 2,
+                                    "cacheReadInputTokens": 3,
+                                    "outputTokens": 4,
+                                }
                             },
                             "total_cost_usd": 0.02,
                         }
@@ -540,11 +544,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "error_during_execution",
-                            "usage": {
-                                "input_tokens": 5,
-                                "cache_creation_input_tokens": 6,
-                                "cache_read_input_tokens": 7,
-                                "output_tokens": 8,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 5,
+                                    "cacheCreationInputTokens": 6,
+                                    "cacheReadInputTokens": 7,
+                                    "outputTokens": 8,
+                                }
                             },
                             "total_cost_usd": 0.03,
                         }
@@ -663,14 +669,16 @@ class RepairTest(FakeCliCase):
 
 
 class UsageTest(FakeCliCase):
-    """Two usage dialects, one report: ``usage`` is what this attempt
-    spent, ``session_usage`` where the session stands after it."""
+    """One report, two figures: ``usage`` is what this attempt spent,
+    ``session_usage`` where the session stands after it. Both CLIs report
+    each invocation's own spend (a resumed run included), so a resumed
+    attempt adds onto the baseline its caller passes."""
 
-    def test_cumulative_stream_reports_the_delta_from_the_session_baseline(self) -> None:
-        # Codex turn.completed carries the thread's running total, seeded
-        # from the transcript on resume: two invocations (the run and a
-        # repair round) report 1000 then 1500 on a thread that stood at 400
-        # before this attempt. Summing would say 2500; the attempt spent 1100.
+    def test_every_invocation_adds_its_own_spend(self) -> None:
+        # Codex turn.completed is the process's own turn, on a fresh thread
+        # and on `exec resume` alike (measured 2026-08-22, see
+        # codex_stream.py): the run and its repair round add up, on top of
+        # where the thread stood before this attempt.
         self.scenario(
             [
                 {
@@ -690,21 +698,21 @@ class UsageTest(FakeCliCase):
                 },
             ]
         )
-        seen: list[Usage] = []
+        seen: list[tuple[Usage, Usage]] = []
         report = run_attempt(
             codex_spec(repair_rounds=1), "task", self.workdir,
             validate=self.json_validator(),
             session_ref="th_9",
             session_usage=Usage(tok_input=400, tok_cache_read=200, tok_output=40),
-            on_usage=seen.append,
+            on_usage=lambda usage, total: seen.append((usage, total)),
             poll_seconds=0.05,
         )
         self.assertEqual(report.outcome, outcomes.VALID)
-        self.assertEqual(report.usage, Usage(tok_input=1100, tok_cache_read=700, tok_output=120))
-        self.assertEqual(report.session_usage, Usage(tok_input=1500, tok_cache_read=900, tok_output=160))
-        # The running usage reached the caller at each step, as this
-        # attempt's own share.
-        self.assertEqual([u.tok_input for u in seen], [600, 1100])
+        self.assertEqual(report.usage, Usage(tok_input=2500, tok_cache_read=1500, tok_output=260))
+        self.assertEqual(report.session_usage, Usage(tok_input=2900, tok_cache_read=1700, tok_output=300))
+        # The running figures reached the caller at each step: this
+        # attempt's own share, and the session's total.
+        self.assertEqual([(u.tok_input, t.tok_input) for u, t in seen], [(1000, 1400), (2500, 2900)])
         self.assertEqual((self.workdir / "repair-1.md").read_text(), "REPAIR: set ok=true in out.json")
 
     def test_baseline_is_dropped_when_the_attempt_runs_fresh(self) -> None:
@@ -726,9 +734,9 @@ class UsageTest(FakeCliCase):
         self.assertEqual(report.usage, Usage(tok_input=10, tok_output=1))
         self.assertEqual(report.session_usage, report.usage)
 
-    def test_per_invocation_stream_adds_onto_the_session_baseline(self) -> None:
-        # A Claude result covers its invocation alone, so a resumed attempt's
-        # spend adds to where the session stood.
+    def test_a_resumed_claude_result_adds_onto_the_session_baseline(self) -> None:
+        # A Claude result covers its invocation alone; tokens come from the
+        # per-model table, the same scope as total_cost_usd.
         self.scenario(
             [
                 {
@@ -737,7 +745,7 @@ class UsageTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "success",
-                            "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 5, "output_tokens": 2},
+                            "modelUsage": {"m": {"inputTokens": 10, "cacheCreationInputTokens": 0, "cacheReadInputTokens": 5, "outputTokens": 2}},
                             "total_cost_usd": 0.25,
                         },
                     ],
