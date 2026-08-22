@@ -42,13 +42,14 @@ class CodexStreamParser:
 
     def _delta(self, usage: dict[str, Any], key: str) -> int | None:
         """This turn's share of a running total; None when the total did
-        not report the key."""
+        not report the key. A total lower than the last one is a count
+        that started over, so it is the whole share — never a negative."""
         value = typed_token(usage.get(key))
         if value is None:
             return None
-        delta = value - self._total.get(key, 0)
+        previous = self._total.get(key, 0)
         self._total[key] = value
-        return delta
+        return value if value < previous else value - previous
 
     def parse_line(self, line: str) -> list[StreamEvent]:
         payload = parse_json_dict(line)

@@ -76,6 +76,17 @@ class CodexStreamParserTest(unittest.TestCase):
         self.assertEqual((second.tok_input, second.tok_cache_read, second.tok_output), (600, None, 30))
         self.assertEqual((third.tok_input, third.tok_cache_read, third.tok_output), (100, 500, 10))
 
+    def test_a_regressing_total_is_a_new_baseline(self) -> None:
+        # A total lower than the last one is a count that started over;
+        # the turn's share is the whole new total, never a negative that
+        # would pull a consumer's sum down.
+        parser = CodexStreamParser()
+        parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "output_tokens": 50}}))
+        fallen = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 80}}))[0]
+        self.assertEqual((fallen.tok_input, fallen.tok_output), (300, 30))
+        later = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 450, "output_tokens": 90}}))[0]
+        self.assertEqual((later.tok_input, later.tok_output), (150, 10))
+
     def test_turn_completed_cache_write_is_typed(self) -> None:
         events = self.parse(
             {
