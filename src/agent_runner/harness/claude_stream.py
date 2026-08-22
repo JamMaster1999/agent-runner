@@ -2,9 +2,13 @@
 JSONL -> StreamEvents.
 
 Lands beside its adapter (extraction step 6, plan §1); pure line-in/
-events-out so captured ``claude.stdout.log`` files replay offline. The
-usage message strings are load-bearing: the dashboard parses token/cost
-numbers back out of them (typed==regex parity, tests/test_usage_parity.py).
+events-out so captured ``claude.stdout.log`` files replay offline.
+
+Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
+consumer API — event messages are display-only. The ``result`` event's
+``usage`` and ``total_cost_usd`` cover that invocation alone (a resumed
+run reports its own spend, never the session's); ``usage`` counts the
+main agent loop only, ``total_cost_usd`` includes subagents.
 """
 
 from __future__ import annotations
@@ -114,23 +118,9 @@ class ClaudeStreamParser:
             if duration is not None:
                 detail += f" ({duration} ms, {turns} turns)"
             usage = payload.get("usage") or {}
-            if usage:
-                # Same message-text convention as the Codex turn_completed
-                # event — the dashboard parses these numbers back out.
-                detail += (
-                    f" (input {usage.get('input_tokens')}, "
-                    f"cache write {usage.get('cache_creation_input_tokens')}, "
-                    f"cache read {usage.get('cache_read_input_tokens')}, "
-                    f"output {usage.get('output_tokens')} tokens)"
-                )
             cost = payload.get("total_cost_usd")
-            if cost is not None:
-                detail += f" (cost ${cost:.4f})"
             if subtype != "success" and payload.get("result"):
                 detail += f" — {clip(str(payload.get('result')), 160)}"
-            # Typed mirror of the rendered numbers: cost keeps full float
-            # precision (the message rounds to 4 places) and is set even when
-            # usage is empty, matching the message branch above.
             return [
                 StreamEvent(
                     event,

@@ -179,12 +179,18 @@ class CodexAdapter(HarnessAdapter):
     # repair path). hooks: PostToolUse etc. fire under `codex exec`;
     # dedicated Subagent hooks do not (see normalize_hook_event).
     # final_message_artifact: --output-last-message.
+    # usage_cumulative: turn.completed.usage is the thread's running total
+    # (TokenUsageInfo.total_token_usage), seeded from the rollout on
+    # `exec resume` — so a resumed thread's first event already counts every
+    # earlier invocation on it (codex-rs exec/event_processor_with_jsonl_output.rs,
+    # core/src/session/mod.rs "Seed usage info from the recorded rollout").
     capabilities: ClassVar[Capabilities] = Capabilities(
         resume=True,
         followup=True,
         hooks=True,
         doctor=True,
         final_message_artifact=True,
+        usage_cumulative=True,
     )
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
         COMMON_TERMINAL_MARKERS

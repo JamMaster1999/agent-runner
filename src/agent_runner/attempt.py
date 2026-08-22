@@ -26,6 +26,9 @@ What crosses the boundary from the project side:
 - ``on_session`` — called once with the CLI session ref as soon as the
   stream reveals it, so a caller can persist the resume handle before the
   attempt ends.
+- ``on_usage`` — called with the attempt's own running ``Usage`` each time
+  the stream reports spend, so a caller can show it before the attempt
+  ends.
 - ``resources`` — registered providers for the spec's declared
   ``resource_specs`` (see ``agent_runner.resources``); their values arrive
   in the task as ``{{RESOURCE:*}}`` template substitutions.
@@ -332,7 +335,9 @@ def run_attempt(
     validate: Callable[[Path], Verdict] | None = None,
     on_event: Callable[[StreamEvent], None] | None = None,
     on_session: Callable[[str], None] | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
     session_ref: str | None = None,
+    session_usage: Usage | None = None,
     run_id: str = "",
     attempt: int = 1,
     variables: dict[str, str] | None = None,
@@ -348,9 +353,12 @@ def run_attempt(
     ``{{RESOURCE:*}}`` tokens — values that cannot exist until attempt
     start). ``session_ref`` resumes that session instead of starting fresh
     (the resume preamble is prepended; ``spec.policy.resume_preamble``
-    overrides the default text). ``should_stop`` polled true terminates the
-    CLI and raises ``AttemptCancelled``. A CLI that stops producing for the
-    stall window is terminated too, ending the attempt ``stalled``.
+    overrides the default text); ``session_usage`` is where that session
+    stood before this attempt (the prior attempt's ``report.session_usage``),
+    so the report can tell this attempt's spend from the session's total.
+    ``should_stop`` polled true terminates the CLI and raises
+    ``AttemptCancelled``. A CLI that stops producing for the stall window
+    is terminated too, ending the attempt ``stalled``.
 
     Configuration errors (an unknown harness, an unrenderable agent, a
     malformed template) RAISE — they are caller bugs, not attempt outcomes.
@@ -361,9 +369,22 @@ def run_attempt(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     usage = Usage()
+    session_total = Usage()
+    before = Usage()
 
     def emit(event: StreamEvent) -> None:
-        usage.add_event(event)
+        if adapter.capabilities.usage_cumulative:
+            session_total.set_event(event)
+        else:
+            session_total.add_event(event)
+        spent = session_total - before
+        if spent != usage:
+            usage.assign(spent)
+            if on_usage is not None:
+                try:
+                    on_usage(dataclasses.replace(usage))
+                except Exception:
+                    pass
         if on_event is not None:
             try:
                 on_event(event)
@@ -405,6 +426,9 @@ def run_attempt(
         if session_ref:
             preamble = spec.policy.resume_preamble
             prompt = (RESUME_PREAMBLE if preamble is None else preamble) + prompt
+            if session_usage is not None:
+                before.assign(session_usage)
+                session_total.assign(session_usage)
 
         try:
             if session_ref:
@@ -426,6 +450,7 @@ def run_attempt(
             outcome=outcomes.INFRA,
             session_ref=session_ref,
             usage=usage,
+            session_usage=session_total,
             resumed=bool(session_ref),
             workdir=workdir,
         )

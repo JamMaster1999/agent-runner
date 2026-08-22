@@ -48,6 +48,7 @@ class BuiltinRegistrationTest(unittest.TestCase):
                 hooks=True,
                 doctor=True,
                 final_message_artifact=True,
+                usage_cumulative=True,
             ),
         )
 

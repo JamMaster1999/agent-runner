@@ -6,7 +6,7 @@
 #              (agent_runner.md). The temporal suite MUST skip cleanly
 #              here; that skip path is itself part of the contract.
 #   temporal — the package with the [temporal] extra: the activity-wrapper
-#              suite runs for real. Exactly 4 sanctioned skips (see the
+#              suite runs for real. Exactly 2 sanctioned skips (see the
 #              grep below); any other count means the environment recipe
 #              silently broke.
 #
@@ -36,8 +36,7 @@ jobs:
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee core_output.txt
-          # The temporal suite (and the usage-parity live sweeps) must have
-          # SKIPPED, not silently run or erred.
+          # The temporal suite must have SKIPPED, not silently run or erred.
           grep -E 'OK \(skipped=[0-9]+\)$' core_output.txt
 
   temporal:
@@ -49,16 +48,15 @@ jobs:
           python-version: "3.13"
       - name: Install the package with the temporal extra
         run: pip install -e '.[temporal]'
-      - name: Run suite (exactly the 4 sanctioned skips)
+      - name: Run suite (exactly the 2 sanctioned skips)
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee temporal_output.txt
           # The ONLY sanctioned skips with the extra installed:
-          #   2x test_usage_parity live-capture sweeps (.local/runs never exists in CI)
           #   1x the core import sweep (meaningful only Temporal-less; runs in the core job)
           #   1x the missing-extra guidance path (needs temporalio absent)
-          grep -qxE 'OK \(skipped=4\)' temporal_output.txt || {
-            echo '::error::expected exactly OK (skipped=4) - the temporal test environment recipe broke'
+          grep -qxE 'OK \(skipped=2\)' temporal_output.txt || {
+            echo '::error::expected exactly OK (skipped=2) - the temporal test environment recipe broke'
             exit 1
           }
 

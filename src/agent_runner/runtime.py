@@ -13,7 +13,7 @@ returns a ``Verdict``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,8 @@ class RunnerError(Exception):
     ``missing_command``) when it is not. ``retryable`` False is terminal
     proof; ``alert`` marks an operator-worthy fact — the caller maps it onto
     its own alerting (agent-runner itself never notifies anyone).
+    ``resets_at`` is when a ``rate_limited`` failure lifts, when the CLI
+    said so.
     """
 
     def __init__(
@@ -104,7 +106,14 @@ class Verdict:
 
 @dataclass
 class Usage:
-    """Token and cost totals aggregated from the attempt's stream events."""
+    """Token and cost totals, read from the stream's typed usage events.
+
+    A stream reports usage one of two ways (``Capabilities.usage_cumulative``):
+    each event is its own invocation's spend, so events ADD; or each event is
+    the session's running total since it began, so the latest event REPLACES
+    and an attempt's own share is the total minus where the session stood
+    before it. ``Usage`` arithmetic covers both.
+    """
 
     tok_input: int = 0
     tok_cache_write: int = 0
@@ -113,13 +122,33 @@ class Usage:
     cost_usd: float = 0.0
 
     def add_event(self, event: Any) -> None:
-        for name in ("tok_input", "tok_cache_write", "tok_cache_read", "tok_output"):
+        for name in self.names():
             value = getattr(event, name, None)
             if value is not None:
                 setattr(self, name, getattr(self, name) + value)
-        cost = getattr(event, "cost_usd", None)
-        if cost is not None:
-            self.cost_usd += cost
+
+    def set_event(self, event: Any) -> None:
+        for name in self.names():
+            value = getattr(event, name, None)
+            if value is not None:
+                setattr(self, name, value)
+
+    def assign(self, other: Usage) -> None:
+        for name in self.names():
+            setattr(self, name, getattr(other, name))
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(*(getattr(self, n) + getattr(other, n) for n in self.names()))
+
+    def __sub__(self, other: Usage) -> Usage:
+        return Usage(*(getattr(self, n) - getattr(other, n) for n in self.names()))
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {name: getattr(self, name) for name in self.names()}
+
+    @classmethod
+    def names(cls) -> tuple[str, ...]:
+        return tuple(f.name for f in fields(cls))
 
 
 @dataclass
@@ -131,9 +160,11 @@ class AttemptReport:
     the handle a later attempt resumes. ``error`` is the operator-facing
     message for non-valid outcomes; ``detail`` the CLI-owned error text
     behind it. ``data`` is the validator's parsed output on ``valid``.
-    ``prior_attempts`` is the record of the failed attempts before this one
-    (``agent_runner.temporal`` fills it from heartbeat details; the core
-    runner leaves it empty) — a later success still names what it cost.
+    ``usage`` is what this attempt alone spent; ``session_usage`` is the
+    session's total at the end of it, every attempt on the session
+    included. ``prior_attempts`` is the record of the failed attempts
+    before this one (``agent_runner.temporal`` fills it from heartbeat
+    details; the core runner leaves it empty).
     """
 
     outcome: str
@@ -142,6 +173,7 @@ class AttemptReport:
     detail: str = ""
     data: dict[str, Any] | None = None
     usage: Usage = field(default_factory=Usage)
+    session_usage: Usage = field(default_factory=Usage)
     resumed: bool = False
     repair_rounds_used: int = 0
     workdir: Path | None = None
