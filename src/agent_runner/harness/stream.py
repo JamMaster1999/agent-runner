@@ -40,10 +40,8 @@ class StreamEvent:
     message: str
     current: int | None = None
     total: int | None = None
-    # Typed usage (migration 031): set ONLY on turn_completed/result_* events,
-    # mirroring EXACTLY the numbers the message text renders — the dashboard's
-    # message regexes stay the fallback for pre-031 rows, so typed and regex
-    # must agree by construction (None where the regex would find nothing).
+    # Typed usage: set only on turn_completed/result_* events, None where
+    # the CLI reported nothing. Messages never carry these numbers.
     tok_input: int | None = None
     tok_cache_write: int | None = None
     tok_cache_read: int | None = None

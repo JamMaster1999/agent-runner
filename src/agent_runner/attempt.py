@@ -26,6 +26,9 @@ What crosses the boundary from the project side:
 - ``on_session`` — called once with the CLI session ref as soon as the
   stream reveals it, so a caller can persist the resume handle before the
   attempt ends.
+- ``on_usage`` — called with the attempt's own running ``Usage`` and the
+  session's total each time the stream reports spend, so a caller can show
+  them before the attempt ends.
 - ``resources`` — registered providers for the spec's declared
   ``resource_specs`` (see ``agent_runner.resources``); their values arrive
   in the task as ``{{RESOURCE:*}}`` template substitutions.
@@ -231,16 +234,20 @@ def _spawn_report(spec: RunSpec, message: str, detail: str = "") -> AttemptRepor
     )
 
 
-def _classify_exit(
-    adapter: HarnessAdapter, spec: RunSpec, spawn, returncode: int
-) -> tuple[str, str, str]:
-    """(outcome, error, detail) for a nonzero CLI exit, from CLI-owned error
-    text only — never agent transcript tails."""
+def _classify_exit(adapter: HarnessAdapter, spawn, returncode: int) -> RunnerError:
+    """The failure behind a nonzero CLI exit, from CLI-owned error text
+    only — never agent transcript tails."""
     detail = adapter.error_report(spawn.stdout_path, spawn.stderr_path)
-    failure = adapter.classify_failure(
-        detail or f"{adapter.display_name} exited {returncode}."
-    )
-    return _outcome_for(failure.code), f"{spec.key}: {failure}", failure.details
+    return adapter.classify_failure(detail or f"{adapter.display_name} exited {returncode}.")
+
+
+def _apply(report: AttemptReport, spec: RunSpec, failure: RunnerError) -> AttemptReport:
+    """End the attempt with this failure's verdict."""
+    report.outcome = _outcome_for(failure.code)
+    report.error = f"{spec.key}: {failure}"
+    report.detail = failure.details
+    report.resets_at = failure.resets_at
+    return report
 
 
 def _repair(
@@ -249,6 +256,7 @@ def _repair(
     verdict: Verdict,
     workdir: Path,
     stdout_path: Path,
+    prompt_path: Path,
     env: dict[str, str],
     emit: Callable[[StreamEvent], None],
     poll_seconds: float,
@@ -285,27 +293,24 @@ def _repair(
             repair_tail.offset = followup.stdout_path.stat().st_size
         except FileNotFoundError:
             pass
+        write_text(prompt_path, message)
         # Append, not truncate: repair rounds share these paths, and a
         # multi-round failure must keep every round's log for debugging.
-        with followup.stdout_path.open("a") as stdout, followup.stderr_path.open("a") as stderr:
+        with (
+            prompt_path.open("rb") as stdin,
+            followup.stdout_path.open("a") as stdout,
+            followup.stderr_path.open("a") as stderr,
+        ):
             process = subprocess.Popen(
                 followup.command,
                 cwd=util.project_root(),
                 env=env,
-                stdin=subprocess.PIPE,
+                stdin=stdin,
                 preexec_fn=_preexec(),
                 stdout=stdout,
                 stderr=stderr,
-                text=True,
             )
             try:
-                if process.stdin is None:
-                    return False
-                try:
-                    process.stdin.write(message)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    return False
                 deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
                 while process.poll() is None:
                     if should_stop is not None and should_stop():
@@ -334,7 +339,9 @@ def run_attempt(
     validate: Callable[[Path], Verdict] | None = None,
     on_event: Callable[[StreamEvent], None] | None = None,
     on_session: Callable[[str], None] | None = None,
+    on_usage: Callable[[Usage, Usage], None] | None = None,
     session_ref: str | None = None,
+    session_usage: Usage | None = None,
     run_id: str = "",
     attempt: int = 1,
     variables: dict[str, str] | None = None,
@@ -350,9 +357,12 @@ def run_attempt(
     ``{{RESOURCE:*}}`` tokens — values that cannot exist until attempt
     start). ``session_ref`` resumes that session instead of starting fresh
     (the resume preamble is prepended; ``spec.policy.resume_preamble``
-    overrides the default text). ``should_stop`` polled true terminates the
-    CLI and raises ``AttemptCancelled``. A CLI that stops producing for the
-    stall window is terminated too, ending the attempt ``stalled``.
+    overrides the default text); ``session_usage`` is where that session
+    stood before this attempt (the prior attempt's ``report.session_usage``),
+    so ``report.session_usage`` can carry the session's whole total.
+    ``should_stop`` polled true terminates the CLI and raises
+    ``AttemptCancelled``. A CLI that stops producing for the stall window
+    is terminated too, ending the attempt ``stalled``.
 
     Configuration errors (an unknown harness, an unrenderable agent, a
     malformed template) RAISE — they are caller bugs, not attempt outcomes.
@@ -363,9 +373,18 @@ def run_attempt(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     usage = Usage()
+    session_total = Usage()
+    before = Usage()
 
     def emit(event: StreamEvent) -> None:
-        usage.add_event(event)
+        if any(getattr(event, name) is not None for name in Usage.names()):
+            usage.add_event(event)
+            session_total.assign(before + usage)
+            if on_usage is not None:
+                try:
+                    on_usage(dataclasses.replace(usage), dataclasses.replace(session_total))
+                except Exception:
+                    pass
         if on_event is not None:
             try:
                 on_event(event)
@@ -407,6 +426,9 @@ def run_attempt(
         if session_ref:
             preamble = spec.policy.resume_preamble
             prompt = (RESUME_PREAMBLE if preamble is None else preamble) + prompt
+            if session_usage is not None:
+                before.assign(session_usage)
+                session_total.assign(session_usage)
 
         try:
             if session_ref:
@@ -418,7 +440,10 @@ def run_attempt(
                 return _spawn_report(spec, str(exc), exc.details)
             raise
 
-        write_text(workdir / "prompt.md", prompt)
+        # Runner-private files live under .runner/, outside the agent's
+        # output namespace, so a prompt file can never shadow an artifact.
+        prompt_path = workdir / ".runner" / "prompt.md"
+        write_text(prompt_path, prompt)
         env = agent_env(adapter, spec, run_id, attempt, workdir)
         env.update(adapter.bind_credentials())
         env.update(adapter.env_overrides())
@@ -427,6 +452,7 @@ def run_attempt(
             outcome=outcomes.INFRA,
             session_ref=session_ref,
             usage=usage,
+            session_usage=session_total,
             resumed=bool(session_ref),
             workdir=workdir,
         )
@@ -453,6 +479,11 @@ def run_attempt(
                         live_ref = adapter.session_ref_from_event(payload)
                         if live_ref and live_ref != report.session_ref:
                             report.session_ref = live_ref
+                            if live_ref != session_ref:
+                                # The CLI opened a session other than the one
+                                # asked for: its usage starts from nothing.
+                                before.assign(Usage())
+                                session_total.assign(usage)
                             if on_session is not None:
                                 try:
                                     on_session(live_ref)
@@ -465,17 +496,22 @@ def run_attempt(
                 emit(event)
             return bool(lines or hook_events)
 
-        with spawn.stdout_path.open("w") as stdout, spawn.stderr_path.open("w") as stderr:
+        # The prompt reaches the CLI as a file on stdin: the kernel feeds it,
+        # so a CLI that never drains stdin wedges nothing on this side.
+        with (
+            prompt_path.open("rb") as stdin,
+            spawn.stdout_path.open("w") as stdout,
+            spawn.stderr_path.open("w") as stderr,
+        ):
             try:
                 process = subprocess.Popen(
                     spawn.command,
                     cwd=util.project_root(),
                     env=env,
-                    stdin=subprocess.PIPE,
+                    stdin=stdin,
                     preexec_fn=_preexec(),
                     stdout=stdout,
                     stderr=stderr,
-                    text=True,
                 )
             except OSError as exc:
                 # The OS refused the fork/exec, or the binary vanished: no
@@ -484,20 +520,6 @@ def run_attempt(
                     spec, f"failed to spawn {adapter.display_name}: {exc}"
                 )
             try:
-                if process.stdin is None:
-                    return _spawn_report(
-                        spec, f"{adapter.display_name} stdin was not available"
-                    )
-                try:
-                    process.stdin.write(prompt)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    drain_streams()
-                    return _spawn_report(
-                        spec,
-                        f"{adapter.display_name} exited before receiving the prompt",
-                        adapter.error_report(spawn.stdout_path, spawn.stderr_path),
-                    )
                 timeout = float(
                     timeout_minutes
                     if timeout_minutes is not None
@@ -516,11 +538,7 @@ def run_attempt(
                         # waiting out its own retry ladder buys nothing. The
                         # first typed fatal decides the outcome.
                         _terminate(process)
-                        failure = fatal_errors[0]
-                        report.outcome = _outcome_for(failure.code)
-                        report.error = f"{spec.key}: {failure}"
-                        report.detail = failure.details
-                        return report
+                        return _apply(report, spec, fatal_errors[0])
                     if should_stop is not None and should_stop():
                         _terminate(process)
                         raise AttemptCancelled(
@@ -579,15 +597,11 @@ def run_attempt(
                 report.outcome = outcomes.VALID
                 report.data = verdict.data
                 return report
-            if zero_exit_error:
-                report.outcome = _outcome_for(zero_exit_error.code)
-                report.error = f"{spec.key}: {zero_exit_error}"
-                report.detail = zero_exit_error.details
-                return report
-            report.outcome, report.error, report.detail = _classify_exit(
-                adapter, spec, spawn, process.returncode
+            return _apply(
+                report,
+                spec,
+                zero_exit_error or _classify_exit(adapter, spawn, process.returncode),
             )
-            return report
 
         if verdict is None or verdict.valid:
             report.outcome = outcomes.VALID
@@ -598,9 +612,10 @@ def run_attempt(
         # message into the still-open session. Fixing one defect can surface
         # the next, so rounds iterate up to the spec's budget.
         if adapter.capabilities.followup and spec.repair_rounds > 0:
-            for _ in range(spec.repair_rounds):
+            for round_number in range(1, spec.repair_rounds + 1):
                 repaired = _repair(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
+                    workdir / ".runner" / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
                 )
                 if not repaired:

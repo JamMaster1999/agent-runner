@@ -2,9 +2,9 @@
 """Characterization tests for the stream-dialect parser modules.
 
 Pins the two stream-dialect parsers (Codex `codex exec --json` JSONL, Claude
-`--print --output-format stream-json` JSONL) on fixture lines before the code
-moved beside the harness adapters (agent_runner/harness/*_stream.py). The usage message strings are load-bearing: the
-dashboard parses token/cost numbers back out of them.
+`--print --output-format stream-json` JSONL) on fixture lines. The typed
+usage fields are the consumer contract; messages are display only and carry
+no usage numbers.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class CodexStreamParserTest(unittest.TestCase):
         self.assertEqual(events[0].event, "session_started")
         self.assertEqual(events[0].message, "Codex thread started: th_abc123")
 
-    def test_turn_completed_usage_message_exact(self) -> None:
+    def test_turn_completed_usage_is_typed(self) -> None:
         events = self.parse(
             {
                 "type": "turn.completed",
@@ -56,23 +56,38 @@ class CodexStreamParserTest(unittest.TestCase):
         )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event, "turn_completed")
-        # Exact string: the dashboard parses these numbers back out.
-        self.assertEqual(
-            events[0].message,
-            "Codex turn completed (input 1200, cached 300, output 450 tokens)",
-        )
-        # Typed mirror (migration 031) of exactly the rendered numbers.
+        self.assertEqual(events[0].message, "Codex turn completed")
         self.assertEqual(events[0].tok_input, 1200)
         self.assertEqual(events[0].tok_cache_read, 300)
         self.assertEqual(events[0].tok_output, 450)
-        # Never typed on codex: the message renders no cache write and the
-        # stream carries no dollars — regex parity by construction.
+        # Absent from the payload -> untyped; the codex stream carries no dollars.
         self.assertIsNone(events[0].tok_cache_write)
         self.assertIsNone(events[0].cost_usd)
 
+    def test_turn_completed_events_are_deltas_of_the_running_total(self) -> None:
+        # One process reports its running total on every turn.completed;
+        # the parser hands out what each turn added, so adding events back
+        # up ends at the last total.
+        parser = CodexStreamParser()
+        first = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}}))[0]
+        second = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1600, "output_tokens": 80}}))[0]
+        third = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1700, "cached_input_tokens": 900, "output_tokens": 90}}))[0]
+        self.assertEqual((first.tok_input, first.tok_cache_read, first.tok_output), (1000, 400, 50))
+        self.assertEqual((second.tok_input, second.tok_cache_read, second.tok_output), (600, None, 30))
+        self.assertEqual((third.tok_input, third.tok_cache_read, third.tok_output), (100, 500, 10))
+
+    def test_a_regressing_total_is_a_new_baseline(self) -> None:
+        # A total lower than the last one is a count that started over;
+        # the turn's share is the whole new total, never a negative that
+        # would pull a consumer's sum down.
+        parser = CodexStreamParser()
+        parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "output_tokens": 50}}))
+        fallen = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 80}}))[0]
+        self.assertEqual((fallen.tok_input, fallen.tok_output), (300, 30))
+        later = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 450, "output_tokens": 90}}))[0]
+        self.assertEqual((later.tok_input, later.tok_output), (150, 10))
+
     def test_turn_completed_cache_write_is_typed(self) -> None:
-        # Typed fields are the consumer contract; the message renders no
-        # cache-write number (display only), but the typed column carries it.
         events = self.parse(
             {
                 "type": "turn.completed",
@@ -85,17 +100,11 @@ class CodexStreamParserTest(unittest.TestCase):
             }
         )
         self.assertEqual(events[0].tok_cache_write, 999)
-        self.assertNotIn("999", events[0].message)
         self.assertEqual(events[0].tok_input, 10)
 
     def test_turn_completed_missing_usage_key_stays_untyped(self) -> None:
         events = self.parse(
             {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 2}}
-        )
-        # The message renders "cached None" (regex finds nothing) -> NULL.
-        self.assertEqual(
-            events[0].message,
-            "Codex turn completed (input 7, cached None, output 2 tokens)",
         )
         self.assertIsNone(events[0].tok_cache_read)
         self.assertEqual(events[0].tok_input, 7)
@@ -174,46 +183,58 @@ class ClaudeStreamParserTest(unittest.TestCase):
         self.assertEqual(events[0].event, "session_started")
         self.assertEqual(events[0].message, "Claude session started: claude-opus-4-6 (sess-123)")
 
-    def test_result_success_usage_and_cost_message_exact(self) -> None:
+    def test_result_success_usage_and_cost_are_typed(self) -> None:
         events = self.parse(
             {
                 "type": "result",
                 "subtype": "success",
                 "duration_ms": 1000,
                 "num_turns": 4,
+                # The main loop's block: not read. Tokens come from the
+                # per-model table, which also counts the subagent's calls —
+                # the same scope as total_cost_usd.
                 "usage": {
                     "input_tokens": 10,
                     "cache_creation_input_tokens": 20,
                     "cache_read_input_tokens": 30,
                     "output_tokens": 40,
                 },
+                "modelUsage": {
+                    "claude-opus-4-6": {"inputTokens": 10, "cacheCreationInputTokens": 20, "cacheReadInputTokens": 30, "outputTokens": 40, "costUSD": 1.0},
+                    "claude-haiku-4-5": {"inputTokens": 1, "cacheCreationInputTokens": 2, "cacheReadInputTokens": 3, "outputTokens": 4, "costUSD": 0.2345},
+                },
                 "total_cost_usd": 1.2345,
             }
         )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event, "result_success")
-        # Exact string: the dashboard parses these numbers back out.
-        self.assertEqual(
-            events[0].message,
-            "Claude result: success (1000 ms, 4 turns) "
-            "(input 10, cache write 20, cache read 30, output 40 tokens) (cost $1.2345)",
-        )
-        # Typed mirror (migration 031) of exactly the rendered numbers.
-        self.assertEqual(events[0].tok_input, 10)
-        self.assertEqual(events[0].tok_cache_write, 20)
-        self.assertEqual(events[0].tok_cache_read, 30)
-        self.assertEqual(events[0].tok_output, 40)
+        self.assertEqual(events[0].message, "Claude result: success (1000 ms, 4 turns)")
+        self.assertEqual(events[0].tok_input, 11)
+        self.assertEqual(events[0].tok_cache_write, 22)
+        self.assertEqual(events[0].tok_cache_read, 33)
+        self.assertEqual(events[0].tok_output, 44)
         self.assertEqual(events[0].cost_usd, 1.2345)
 
-    def test_result_cost_typed_at_full_precision(self) -> None:
-        # The message rounds to 4 places; the typed column keeps the float.
+    def test_result_cost_typed_without_usage_block(self) -> None:
         events = self.parse(
             {"type": "result", "subtype": "success", "total_cost_usd": 0.123456789}
         )
-        self.assertIn("(cost $0.1235)", events[0].message)
         self.assertEqual(events[0].cost_usd, 0.123456789)
-        # No usage block -> token fields stay untyped even though cost is set.
+        # Neither table nor block -> token fields stay untyped even though cost is set.
         self.assertIsNone(events[0].tok_input)
+
+    def test_result_without_model_table_reads_the_usage_block(self) -> None:
+        events = self.parse(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "modelUsage": {},
+                "usage": {"input_tokens": 7, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2, "output_tokens": 3},
+                "total_cost_usd": 0.5,
+            }
+        )
+        self.assertEqual(events[0].event, "result_error")
+        self.assertEqual((events[0].tok_input, events[0].tok_cache_write, events[0].tok_cache_read, events[0].tok_output), (7, 1, 2, 3))
 
     def test_result_error_appends_detail(self) -> None:
         events = self.parse(

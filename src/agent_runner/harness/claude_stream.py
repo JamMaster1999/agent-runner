@@ -2,9 +2,16 @@
 JSONL -> StreamEvents.
 
 Lands beside its adapter (extraction step 6, plan §1); pure line-in/
-events-out so captured ``claude.stdout.log`` files replay offline. The
-usage message strings are load-bearing: the dashboard parses token/cost
-numbers back out of them (typed==regex parity, tests/test_usage_parity.py).
+events-out so captured ``claude.stdout.log`` files replay offline.
+
+Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
+consumer API — event messages are display-only. The ``result`` event
+covers that invocation alone (a resumed run reports its own spend, never
+the session's). Tokens are summed from ``modelUsage``, the per-model
+table that spans the main loop, subagents, and compaction — the same
+scope as ``total_cost_usd``; a result without that table (an aborted
+turn, ``error_max_turns``) falls back to its ``usage`` block, which
+counts the main loop only.
 """
 
 from __future__ import annotations
@@ -17,6 +24,30 @@ from agent_runner.harness.stream import (
     progress_events,
     typed_token,
 )
+
+
+# StreamEvent field -> (modelUsage key, usage-block key)
+TOKEN_KEYS = {
+    "tok_input": ("inputTokens", "input_tokens"),
+    "tok_cache_write": ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+    "tok_cache_read": ("cacheReadInputTokens", "cache_read_input_tokens"),
+    "tok_output": ("outputTokens", "output_tokens"),
+}
+
+
+def result_tokens(payload: dict[str, Any]) -> dict[str, int | None]:
+    """The result's token counts by StreamEvent field: summed across the
+    per-model table when the result carries one, else read from the
+    main-loop ``usage`` block. A field is None where nothing reported it."""
+    models = [m for m in (payload.get("modelUsage") or {}).values() if isinstance(m, dict)]
+    if models:
+        tokens: dict[str, int | None] = {}
+        for field, (model_key, _) in TOKEN_KEYS.items():
+            counts = [c for c in (typed_token(m.get(model_key)) for m in models) if c is not None]
+            tokens[field] = sum(counts) if counts else None
+        return tokens
+    usage = payload.get("usage") or {}
+    return {field: typed_token(usage.get(usage_key)) for field, (_, usage_key) in TOKEN_KEYS.items()}
 
 
 class ClaudeStreamParser:
@@ -113,32 +144,14 @@ class ClaudeStreamParser:
             detail = f"Claude result: {subtype}"
             if duration is not None:
                 detail += f" ({duration} ms, {turns} turns)"
-            usage = payload.get("usage") or {}
-            if usage:
-                # Same message-text convention as the Codex turn_completed
-                # event — the dashboard parses these numbers back out.
-                detail += (
-                    f" (input {usage.get('input_tokens')}, "
-                    f"cache write {usage.get('cache_creation_input_tokens')}, "
-                    f"cache read {usage.get('cache_read_input_tokens')}, "
-                    f"output {usage.get('output_tokens')} tokens)"
-                )
             cost = payload.get("total_cost_usd")
-            if cost is not None:
-                detail += f" (cost ${cost:.4f})"
             if subtype != "success" and payload.get("result"):
                 detail += f" — {clip(str(payload.get('result')), 160)}"
-            # Typed mirror of the rendered numbers: cost keeps full float
-            # precision (the message rounds to 4 places) and is set even when
-            # usage is empty, matching the message branch above.
             return [
                 StreamEvent(
                     event,
                     detail,
-                    tok_input=typed_token(usage.get("input_tokens")),
-                    tok_cache_write=typed_token(usage.get("cache_creation_input_tokens")),
-                    tok_cache_read=typed_token(usage.get("cache_read_input_tokens")),
-                    tok_output=typed_token(usage.get("output_tokens")),
+                    **result_tokens(payload),
                     cost_usd=cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
                 )
             ]

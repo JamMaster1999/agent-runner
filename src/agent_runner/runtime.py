@@ -13,7 +13,8 @@ returns a ``Verdict``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ class RunnerError(Exception):
     ``missing_command``) when it is not. ``retryable`` False is terminal
     proof; ``alert`` marks an operator-worthy fact — the caller maps it onto
     its own alerting (agent-runner itself never notifies anyone).
+    ``resets_at`` is when a ``rate_limited`` failure lifts, when the CLI
+    said so.
     """
 
     def __init__(
@@ -36,12 +39,14 @@ class RunnerError(Exception):
         retryable: bool = True,
         alert: bool = False,
         details: str = "",
+        resets_at: datetime | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.alert = alert
         self.details = details
+        self.resets_at = resets_at
 
 
 @dataclass(frozen=True)
@@ -104,7 +109,9 @@ class Verdict:
 
 @dataclass
 class Usage:
-    """Token and cost totals aggregated from the attempt's stream events."""
+    """Token and cost totals, read from the stream's typed usage events.
+    Every usage event is one CLI invocation's own spend (both CLIs report
+    per process, a resumed run included), so events add."""
 
     tok_input: int = 0
     tok_cache_write: int = 0
@@ -113,13 +120,30 @@ class Usage:
     cost_usd: float = 0.0
 
     def add_event(self, event: Any) -> None:
-        for name in ("tok_input", "tok_cache_write", "tok_cache_read", "tok_output"):
+        for name in self.names():
             value = getattr(event, name, None)
             if value is not None:
                 setattr(self, name, getattr(self, name) + value)
-        cost = getattr(event, "cost_usd", None)
-        if cost is not None:
-            self.cost_usd += cost
+
+    def assign(self, other: Usage) -> None:
+        for name in self.names():
+            setattr(self, name, getattr(other, name))
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(*(getattr(self, n) + getattr(other, n) for n in self.names()))
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {name: getattr(self, name) for name in self.names()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Usage:
+        """The mirror of ``as_dict`` over data that may be older or newer
+        than this code: unknown keys are ignored, missing ones default."""
+        return cls(**{name: data[name] for name in cls.names() if name in data})
+
+    @classmethod
+    def names(cls) -> tuple[str, ...]:
+        return tuple(f.name for f in fields(cls))
 
 
 @dataclass
@@ -130,19 +154,24 @@ class AttemptReport:
     ``session_ref`` is the CLI session this attempt opened (or resumed) —
     the handle a later attempt resumes. ``error`` is the operator-facing
     message for non-valid outcomes; ``detail`` the CLI-owned error text
-    behind it. ``data`` is the validator's parsed output on ``valid``.
-    ``prior_attempts`` is the record of the failed attempts before this one
-    (``agent_runner.temporal`` fills it from heartbeat details; the core
-    runner leaves it empty) — a later success still names what it cost.
+    behind it; ``resets_at`` when a ``rate_limited`` outcome lifts, if the
+    CLI said. ``data`` is the validator's parsed output on ``valid``.
+    ``usage`` is what this attempt alone spent; ``session_usage`` is the
+    session's total at the end of it, every attempt on the session
+    included. ``attempts`` is the record of every attempt of this activity,
+    this one last (``agent_runner.temporal`` fills it from heartbeat
+    details; the core runner leaves it empty).
     """
 
     outcome: str
     session_ref: str | None = None
     error: str = ""
     detail: str = ""
+    resets_at: datetime | None = None
     data: dict[str, Any] | None = None
     usage: Usage = field(default_factory=Usage)
+    session_usage: Usage = field(default_factory=Usage)
     resumed: bool = False
     repair_rounds_used: int = 0
     workdir: Path | None = None
-    prior_attempts: tuple[dict[str, Any], ...] = ()
+    attempts: tuple[dict[str, Any], ...] = ()

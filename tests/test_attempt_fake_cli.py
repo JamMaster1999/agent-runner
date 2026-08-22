@@ -40,7 +40,7 @@ from agent_runner.attempt import (  # noqa: E402
     run_attempt,
 )
 from agent_runner.harness.base import AgentDef  # noqa: E402
-from agent_runner.runtime import Policy, RunSpec, Verdict  # noqa: E402
+from agent_runner.runtime import Policy, RunSpec, Usage, Verdict  # noqa: E402
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 
@@ -169,11 +169,33 @@ class ValidRunTest(FakeCliCase):
         self.assertEqual((progress[0].current, progress[0].total), (2, 5))
         # The delivered prompt is the task with the closed variable set
         # substituted — and it is what the CLI actually received on stdin.
-        prompt = (self.workdir / "prompt.md").read_text()
+        prompt = (self.workdir / ".runner" / "prompt.md").read_text()
         self.assertIn(f"Write to {self.workdir}/out.json (attempt 1).", prompt)
         self.assertEqual(self.recorded_call(0)["stdin"], prompt)
         # Fresh session: a plain exec, no resume.
         self.assertNotIn("resume", self.recorded_call(0)["argv"])
+
+    def test_prompt_arrives_as_a_file_even_when_the_cli_never_reads_it(self) -> None:
+        # The doorway bug: a blocking stdin write to a CLI that never drains
+        # it wedged the attempt for the whole timeout, and a CLI that exited
+        # first failed it as spawn_failure. The prompt is a file on stdin
+        # now — the kernel feeds it, nothing on this side can block.
+        deaf = self.tmp / "deaf-cli"
+        deaf.write_text(
+            "#!/bin/sh\n"
+            f"mkdir -p {self.workdir}\n"
+            f"echo '{{\"ok\": true}}' > {self.out_path()}\n"
+            "exit 0\n"
+        )
+        deaf.chmod(0o755)
+        prompt = "x" * (4 << 20)  # far past any pipe buffer
+        with mock.patch.dict(_os.environ, {"RUNNER_CODEX_CLI": str(deaf)}):
+            report = run_attempt(
+                codex_spec(), prompt, self.workdir,
+                validate=self.json_validator(), poll_seconds=0.05, timeout_minutes=0.5,
+            )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual((self.workdir / ".runner" / "prompt.md").read_text(), prompt)
 
     def test_valid_output_beats_nonzero_exit(self) -> None:
         self.scenario(
@@ -443,11 +465,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "success",
-                            "usage": {
-                                "input_tokens": 10,
-                                "cache_creation_input_tokens": 20,
-                                "cache_read_input_tokens": 30,
-                                "output_tokens": 40,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 10,
+                                    "cacheCreationInputTokens": 20,
+                                    "cacheReadInputTokens": 30,
+                                    "outputTokens": 40,
+                                }
                             },
                             "total_cost_usd": 0.1,
                         }
@@ -460,11 +484,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "success",
-                            "usage": {
-                                "input_tokens": 1,
-                                "cache_creation_input_tokens": 2,
-                                "cache_read_input_tokens": 3,
-                                "output_tokens": 4,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 1,
+                                    "cacheCreationInputTokens": 2,
+                                    "cacheReadInputTokens": 3,
+                                    "outputTokens": 4,
+                                }
                             },
                             "total_cost_usd": 0.02,
                         }
@@ -518,11 +544,13 @@ class RepairTest(FakeCliCase):
                         {
                             "type": "result",
                             "subtype": "error_during_execution",
-                            "usage": {
-                                "input_tokens": 5,
-                                "cache_creation_input_tokens": 6,
-                                "cache_read_input_tokens": 7,
-                                "output_tokens": 8,
+                            "modelUsage": {
+                                "m": {
+                                    "inputTokens": 5,
+                                    "cacheCreationInputTokens": 6,
+                                    "cacheReadInputTokens": 7,
+                                    "outputTokens": 8,
+                                }
                             },
                             "total_cost_usd": 0.03,
                         }
@@ -638,6 +666,106 @@ class RepairTest(FakeCliCase):
         self.assertEqual(report.outcome, outcomes.INVALID_SCHEMA)
         # Identical verdict after the first repair ends the loop early.
         self.assertEqual(report.repair_rounds_used, 1)
+
+
+class UsageTest(FakeCliCase):
+    """One report, two figures: ``usage`` is what this attempt spent,
+    ``session_usage`` where the session stands after it. Both CLIs report
+    each invocation's own spend (a resumed run included), so a resumed
+    attempt adds onto the baseline its caller passes."""
+
+    def test_every_invocation_adds_its_own_spend(self) -> None:
+        # Codex turn.completed is the process's own turn, on a fresh thread
+        # and on `exec resume` alike (measured 2026-08-22, see
+        # codex_stream.py): the run and its repair round add up, on top of
+        # where the thread stood before this attempt.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "thread.started", "thread_id": "th_9"},
+                        {"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 600, "output_tokens": 100}},
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                },
+                {
+                    "emit": [
+                        {"type": "turn.completed", "usage": {"input_tokens": 1500, "cached_input_tokens": 900, "output_tokens": 160}},
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                },
+            ]
+        )
+        seen: list[tuple[Usage, Usage]] = []
+        report = run_attempt(
+            codex_spec(repair_rounds=1), "task", self.workdir,
+            validate=self.json_validator(),
+            session_ref="th_9",
+            session_usage=Usage(tok_input=400, tok_cache_read=200, tok_output=40),
+            on_usage=lambda usage, total: seen.append((usage, total)),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(report.usage, Usage(tok_input=2500, tok_cache_read=1500, tok_output=260))
+        self.assertEqual(report.session_usage, Usage(tok_input=2900, tok_cache_read=1700, tok_output=300))
+        # The running figures reached the caller at each step: this
+        # attempt's own share, and the session's total.
+        self.assertEqual([(u.tok_input, t.tok_input) for u, t in seen], [(1000, 1400), (2500, 2900)])
+        self.assertEqual((self.workdir / ".runner" / "repair-1.md").read_text(), "REPAIR: set ok=true in out.json")
+
+    def test_baseline_is_dropped_when_the_attempt_runs_fresh(self) -> None:
+        self.scenario(
+            [
+                {
+                    "emit": [{"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 1}}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        report = run_attempt(
+            codex_spec(), "task", self.workdir,
+            validate=self.json_validator(),
+            session_usage=Usage(tok_input=400),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.usage, Usage(tok_input=10, tok_output=1))
+        self.assertEqual(report.session_usage, report.usage)
+
+    def test_a_resumed_claude_result_adds_onto_the_session_baseline(self) -> None:
+        # A Claude result covers its invocation alone; tokens come from the
+        # per-model table, the same scope as total_cost_usd.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "system", "subtype": "init", "session_id": "sess-1", "model": "m"},
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "modelUsage": {"m": {"inputTokens": 10, "cacheCreationInputTokens": 0, "cacheReadInputTokens": 5, "outputTokens": 2}},
+                            "total_cost_usd": 0.25,
+                        },
+                    ],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        agent = AgentDef(name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n")
+        report = run_attempt(
+            RunSpec(key="fixture__claude", harness="claude", required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS")),
+            "task", self.workdir,
+            agent=agent,
+            validate=self.json_validator(),
+            session_ref="sess-1",
+            session_usage=Usage(tok_input=100, tok_cache_read=50, tok_output=20, cost_usd=1.0),
+            poll_seconds=0.05,
+        )
+        self.assertEqual(report.usage, Usage(tok_input=10, tok_cache_read=5, tok_output=2, cost_usd=0.25))
+        self.assertEqual(report.session_usage, Usage(tok_input=110, tok_cache_read=55, tok_output=22, cost_usd=1.25))
 
 
 class ResumeTest(FakeCliCase):
@@ -842,6 +970,7 @@ class StreamFatalAbortTest(FakeCliCase):
         self.assertIn("five_hour rejected", report.detail)
         self.assertIn("resets 2026-08-21T20:50:00+00:00", report.detail)
         self.assertIn("out_of_credits", report.detail)
+        self.assertEqual(report.resets_at.isoformat(), "2026-08-21T20:50:00+00:00")
 
     def test_claude_rate_limit_allowed_event_is_not_fatal(self) -> None:
         # The CLI also emits rate_limit_event with status "allowed" as a

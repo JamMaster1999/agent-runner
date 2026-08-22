@@ -75,12 +75,18 @@ def _resume_recalls_codeword(spec_factory, agent, project_root: Path) -> None:
         second_dir,
         agent=agent,
         session_ref=first.session_ref,
+        session_usage=first.session_usage,
         validate=file_check("codeword.txt", CODEWORD),
         timeout_minutes=6,
     )
     assert second.outcome == outcomes.VALID, second.error
     assert second.resumed
     assert CODEWORD.lower() in (second.data or {}).get("text", "").lower()
+    # The second attempt's own spend, measured from the first's total: a
+    # resumed run pays for its own turn, never again for the first.
+    assert second.usage.tok_output > 0, "usage telemetry recorded nothing for the resumed attempt"
+    assert second.session_usage.tok_output > first.session_usage.tok_output
+    assert second.session_usage.tok_output - first.session_usage.tok_output == second.usage.tok_output
 
 
 @require_claude

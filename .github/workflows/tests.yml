@@ -36,7 +36,7 @@ jobs:
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee core_output.txt
-          # The temporal suite (and the usage-parity live sweeps) must have
+          # The temporal suite (and the live-capture sweeps) must have
           # SKIPPED, not silently run or erred.
           grep -E 'OK \(skipped=[0-9]+\)$' core_output.txt
 
@@ -54,7 +54,7 @@ jobs:
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee temporal_output.txt
           # The ONLY sanctioned skips with the extra installed:
-          #   2x test_usage_parity live-capture sweeps (.local/runs never exists in CI)
+          #   2x test_stream_fixtures live-capture sweeps (.local/runs never exists in CI)
           #   1x the core import sweep (meaningful only Temporal-less; runs in the core job)
           #   1x the missing-extra guidance path (needs temporalio absent)
           grep -qxE 'OK \(skipped=4\)' temporal_output.txt || {
