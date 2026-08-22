@@ -51,6 +51,7 @@ if HAVE_TEMPORALIO:
     from agent_runner.temporal import retry as retry_module
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
+CAP = timedelta(hours=6)
 
 
 @unittest.skipUnless(HAVE_TEMPORALIO, "temporalio not installed (core CI is Temporal-less)")
@@ -59,35 +60,31 @@ class RetryMappingTest(unittest.TestCase):
 
     def test_rate_limited_backs_off_long_and_free(self) -> None:
         report = AttemptReport(outcome=outcomes.RATE_LIMITED, error="throttled")
-        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=45))
+        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=45), reset_cap=CAP)
         self.assertEqual(error.type, outcomes.RATE_LIMITED)
         self.assertFalse(error.non_retryable)
         self.assertEqual(error.next_retry_delay, timedelta(minutes=45))
 
     def test_failure_details_carry_the_whole_report(self) -> None:
         # The error that reaches history is the report, not its first line:
-        # the outcome word, the CLI-owned text, the session to resume, and
-        # the attempts before it (the b51 lesson, 2026-08-21 — the session
-        # limit text never left the worker).
+        # this attempt's full record (outcome, the CLI-owned text, the
+        # session to resume, timing, spend) and the attempts before it (the
+        # b51 lesson, 2026-08-21 — the session limit text never left the
+        # worker). Two explicit keys, nothing stated twice.
+        own = {"attempt": 2, "outcome": "infra", "detail": "You've hit your session limit", "session_ref": "sess-1"}
         report = AttemptReport(
             outcome=outcomes.INFRA,
             error="k: claude attempt failed",
-            detail="claude result success: You've hit your session limit",
-            session_ref="sess-1",
-            attempts=({"attempt": 1, "outcome": "stalled"}, {"attempt": 2, "outcome": "infra"}),
+            attempts=({"attempt": 1, "outcome": "stalled"}, own),
         )
-        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
-        # The failing attempt is the error itself; its own record (last) is
-        # not repeated beside the outcome/detail/session_ref that describe it.
+        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1), reset_cap=CAP)
         self.assertEqual(
             error.details[0],
-            {
-                "outcome": outcomes.INFRA,
-                "detail": "claude result success: You've hit your session limit",
-                "session_ref": "sess-1",
-                "attempts": [{"attempt": 1, "outcome": "stalled"}],
-            },
+            {"attempt": own, "attempts": [{"attempt": 1, "outcome": "stalled"}]},
         )
+        # A report the core runner built carries no record yet.
+        bare = application_error_for(AttemptReport(outcome=outcomes.INFRA), rate_limit_backoff=timedelta(minutes=1), reset_cap=CAP)
+        self.assertEqual(bare.details[0], {"attempt": None, "attempts": []})
 
     def test_rate_limited_waits_for_the_reset_when_the_cli_named_one(self) -> None:
         # A known reset time beats the flat backoff: the retry lands just
@@ -108,33 +105,42 @@ class RetryMappingTest(unittest.TestCase):
             error="capped",
             resets_at=datetime.now(timezone.utc) + timedelta(hours=2),
         )
-        error = application_error_for(report, rate_limit_backoff=default)
+        error = application_error_for(report, rate_limit_backoff=default, reset_cap=cap)
         self.assertFalse(error.non_retryable)
         self.assertGreater(error.next_retry_delay, timedelta(hours=1, minutes=59))
         self.assertLessEqual(error.next_retry_delay, timedelta(hours=2))
 
-    def test_a_reset_past_the_activity_deadline_fails_at_once(self) -> None:
-        # The retry could never start before schedule-to-close fires, so
-        # idling until then only holds the slot: fail now, non-retryable,
-        # naming both times.
+    def test_a_reset_past_the_retry_window_fails_at_once(self) -> None:
+        # The retry could never start and finish before schedule-to-close
+        # fires, so idling until then only holds the slot: fail now,
+        # non-retryable, naming both times.
+        now = datetime(2026, 8, 22, 8, 0, tzinfo=timezone.utc)
         resets_at = datetime(2026, 8, 22, 9, 0, tzinfo=timezone.utc)
         report = AttemptReport(outcome=outcomes.RATE_LIMITED, error="k: capped", resets_at=resets_at)
         error = application_error_for(
-            report,
-            rate_limit_backoff=timedelta(minutes=15),
-            deadline=resets_at - timedelta(minutes=1),
+            report, rate_limit_backoff=timedelta(minutes=15), reset_cap=CAP,
+            retry_by=resets_at - timedelta(minutes=1), now=now,
         )
         self.assertEqual(error.type, outcomes.RATE_LIMITED)
         self.assertTrue(error.non_retryable)
         self.assertIsNone(error.next_retry_delay)
         self.assertIn("2026-08-22T09:00:00+00:00", error.message)
-        self.assertIn("deadline 2026-08-22T08:59:00+00:00", error.message)
-        # A reset inside the deadline waits as usual.
+        self.assertIn("(2026-08-22T08:59:00+00:00)", error.message)
+        # A reset inside the window waits as usual.
         error = application_error_for(
-            report, rate_limit_backoff=timedelta(minutes=15), deadline=resets_at + timedelta(hours=1)
+            report, rate_limit_backoff=timedelta(minutes=15), reset_cap=CAP,
+            retry_by=resets_at + timedelta(hours=1), now=now,
         )
         self.assertFalse(error.non_retryable)
-        self.assertIsNotNone(error.next_retry_delay)
+        self.assertEqual(error.next_retry_delay, timedelta(hours=1))
+        # A window already closed is the server's timeout to report: a bare
+        # ActivityEnvironment (epoch scheduled_time, 1s schedule-to-close)
+        # must never turn a rate limit non-retryable.
+        error = application_error_for(
+            report, rate_limit_backoff=timedelta(minutes=15), reset_cap=CAP,
+            retry_by=now - timedelta(days=1), now=now,
+        )
+        self.assertFalse(error.non_retryable)
 
     def test_activity_deadline_is_scheduled_time_plus_schedule_to_close(self) -> None:
         import dataclasses
@@ -143,8 +149,9 @@ class RetryMappingTest(unittest.TestCase):
         scheduled = datetime(2026, 8, 22, 8, 0, tzinfo=timezone.utc)
         info = dataclasses.replace(info, scheduled_time=scheduled, schedule_to_close_timeout=timedelta(hours=8))
         self.assertEqual(activity_module.activity_deadline(info), scheduled + timedelta(hours=8))
-        info = dataclasses.replace(info, schedule_to_close_timeout=None)
-        self.assertIsNone(activity_module.activity_deadline(info))
+        for absent in (None, timedelta(0)):
+            info = dataclasses.replace(info, schedule_to_close_timeout=absent)
+            self.assertIsNone(activity_module.activity_deadline(info))
 
     def test_heartbeat_with_ten_maximal_records_stays_small(self) -> None:
         # Temporal caps heartbeat details at 2 MB; the record bounds its own
@@ -153,30 +160,29 @@ class RetryMappingTest(unittest.TestCase):
             outcome=outcomes.INFRA,
             error="é" * 10_000,
             detail="x" * 100_000,
-            session_ref="s" * 64,
+            session_ref="s" * 4000,
             resets_at=datetime.now(timezone.utc),
         )
-        state = activity_module._HeartbeatState(session_ref="s" * 64, progress={"message": "m" * 300})
+        state = activity_module._HeartbeatState(session_ref="s" * 4000, progress={"message": "m" * 300})
         for number in range(1, 30):
             state.record(activity_module.attempt_record(number, loud, "2026-08-22T08:00:00+00:00", "2026-08-22T09:00:00+00:00"))
         payload = state.payload()
         self.assertEqual(len(payload["attempts"]), activity_module.ATTEMPTS_KEPT)
         record = payload["attempts"][-1]
+        # error keeps its head (the key and the cause), detail its tail (the
+        # CLI's last words), the ref is bounded too.
         self.assertLessEqual(len(record["error"].encode()), activity_module.RECORD_TEXT_LIMIT)
+        self.assertTrue(record["error"].startswith("é"))
         self.assertLessEqual(len(record["detail"].encode()), activity_module.RECORD_TEXT_LIMIT)
+        self.assertTrue(record["detail"].endswith("x"))
+        self.assertLessEqual(len(record["session_ref"].encode()), activity_module.RECORD_REF_LIMIT)
         self.assertLess(len(json.dumps(payload).encode()), 32_000)
         # A worker that died at attempt 1000 names only the newest gap.
         self.assertEqual(len(activity_module.vanished_attempts(1000, [], None)), activity_module.ATTEMPTS_KEPT)
 
-    def test_failure_detail_is_bounded(self) -> None:
-        report = AttemptReport(outcome=outcomes.INFRA, error="k", detail="x" * 5000 + "END")
-        details = application_error_for(report, rate_limit_backoff=timedelta(minutes=1)).details[0]
-        self.assertEqual(len(details["detail"]), 2000)
-        self.assertTrue(details["detail"].endswith("END"))
-
     def test_auth_fails_fast(self) -> None:
         report = AttemptReport(outcome=outcomes.AUTH, error="not logged in")
-        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
+        error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1), reset_cap=CAP)
         self.assertEqual(error.type, outcomes.AUTH)
         self.assertTrue(error.non_retryable)
 
@@ -184,7 +190,7 @@ class RetryMappingTest(unittest.TestCase):
         for outcome in (outcomes.INFRA, outcomes.SPAWN_FAILURE, outcomes.TIMEOUT,
                         outcomes.INVALID_SCHEMA):
             error = application_error_for(
-                AttemptReport(outcome=outcome), rate_limit_backoff=timedelta(minutes=1)
+                AttemptReport(outcome=outcome), rate_limit_backoff=timedelta(minutes=1), reset_cap=CAP
             )
             self.assertEqual(error.type, outcome)
             self.assertFalse(error.non_retryable)
@@ -254,6 +260,7 @@ class ActivityRunTest(unittest.TestCase):
             {
                 "AGENT_RUNNER_PROJECT_ROOT": str(self.tmp),
                 "RUNNER_CODEX_CLI": str(FAKE_CLI),
+                "RUNNER_CLAUDE_CLI": str(FAKE_CLI),
                 "FAKE_CLI_SCENARIO": str(self.scenario_path),
                 "FAKE_CLI_CALLS": str(self.calls),
             },
@@ -280,8 +287,10 @@ class ActivityRunTest(unittest.TestCase):
 
         return validate
 
-    def run_activity(self, coro_fn, *args, heartbeats: list | None = None, **kwargs):
+    def run_activity(self, coro_fn, *args, heartbeats: list | None = None, info=None, **kwargs):
         env = ActivityEnvironment()
+        if info is not None:
+            env.info = info
         heartbeats = [] if heartbeats is None else heartbeats
         env.on_heartbeat = lambda *details: heartbeats.append(details)
         result = asyncio.run(env.run(coro_fn, *args, **kwargs))
@@ -414,15 +423,14 @@ class ActivityRunTest(unittest.TestCase):
             with self.assertRaises(ApplicationError) as caught:
                 self.run_activity(act, heartbeats=heartbeats)
         details = caught.exception.details[0]
-        self.assertEqual(details["outcome"], outcomes.INFRA)
-        # The failure's details name the attempts before it; the failing
-        # one is described by the error itself.
+        # This attempt's full record under one key, the ones before it
+        # under the other; the heartbeat carries them all, this one last.
         self.assertEqual(details["attempts"], prior["attempts"])
-        # The heartbeat carries the whole list, the failing attempt last.
-        own = heartbeats[-1][0]["attempts"][-1]
+        own = details["attempt"]
         self.assertEqual(own["outcome"], outcomes.INFRA)
         self.assertTrue(own["resumed"])
         self.assertEqual(own["session_ref"], "th_1")
+        self.assertEqual(heartbeats[-1][0]["attempts"][-1], own)
 
     def test_vanished_attempts_are_named_from_the_attempt_number(self) -> None:
         # A worker killed mid-attempt reports nothing; attempt 4 arriving
@@ -433,7 +441,10 @@ class ActivityRunTest(unittest.TestCase):
         self.assertEqual(gap["outcome"], outcomes.INFRA)
         self.assertIn("worker died", gap["error"])
         self.assertEqual(set(gap), set(activity_module.RECORD_KEYS))
-        self.assertIsNone(gap["usage"])
+        self.assertEqual(set(activity_module.attempt_record(1, AttemptReport(outcome="infra"), "t", "t")), set(activity_module.RECORD_KEYS))
+        # One shape: an unknown spend is zeros, the same dict as a reported one.
+        self.assertEqual(gap["usage"], Usage().as_dict())
+        self.assertIsNone(gap["session_ref"])
         self.assertEqual(activity_module.vanished_attempts(1, [], None), [])
         self.assertEqual(activity_module.vanished_attempts(3, recorded[:1] + [{"attempt": 2}], None), [])
 
@@ -459,8 +470,118 @@ class ActivityRunTest(unittest.TestCase):
         # A heartbeat from an earlier attempt (the dead one never beat) says
         # nothing about the gap.
         (gap,) = activity_module.vanished_attempts(3, [one], {**prior, "attempt": 1})
-        self.assertIsNone(gap["usage"])
+        self.assertIsNone(gap["session_ref"])
         self.assertEqual(activity_module.session_usage_before("th_1", [one, gap]), Usage(1000))
+
+    def test_a_fresh_session_fallback_starts_its_usage_from_nothing(self) -> None:
+        # Attempt 2 asked to resume th_old (baseline 1000) but the CLI
+        # opened th_new: the session total is th_new's alone, in the
+        # heartbeat and in the record — so a worker that dies after this
+        # point leaves attempt 3 a baseline of th_new's own spend, never
+        # th_old's.
+        self.scenario_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "emit": [
+                            {"type": "thread.started", "thread_id": "th_new"},
+                            {"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 5}},
+                        ],
+                        "write": [{"path": str(self.workdir / "out.json"), "text": '{"ok": true}'}],
+                        "exit": 0,
+                    }
+                ]
+            )
+        )
+
+        async def act():
+            return await run_agent_attempt(
+                self.spec(), "task", self.workdir,
+                validate=self.validator(), config=TemporalRunConfig(heartbeat_seconds=0.05),
+            )
+
+        old = {"attempt": 1, "outcome": "stalled", "session_ref": "th_old",
+               "usage": Usage(1000).as_dict(), "session_usage": Usage(1000).as_dict()}
+        with mock.patch.object(
+            activity_module, "prior_heartbeat_details",
+            return_value={"session_ref": "th_old", "resume_count": 0, "attempts": [old]},
+        ):
+            report, heartbeats = self.run_activity(act)
+        own = report.attempts[-1]
+        self.assertEqual(own["session_ref"], "th_new")
+        self.assertEqual(own["usage"], Usage(50, 0, 0, 5).as_dict())
+        self.assertEqual(own["session_usage"], Usage(50, 0, 0, 5).as_dict())
+        final = heartbeats[-1][0]
+        self.assertEqual(final["session_ref"], "th_new")
+        self.assertEqual(final["session_usage"], Usage(50, 0, 0, 5).as_dict())
+        # Had the worker died right after thread.started, the heartbeat
+        # would already have said th_new stood at nothing.
+        self.assertEqual(
+            activity_module.session_usage_before("th_new", [old] + activity_module.vanished_attempts(3, [old], {"attempt": 2, "session_ref": "th_new", "usage": Usage().as_dict(), "session_usage": Usage().as_dict()})),
+            Usage(),
+        )
+
+    def test_rate_limited_with_a_reset_time_end_to_end(self) -> None:
+        # The whole path under the activity: the typed rate_limit_event
+        # decides the outcome, its resetsAt reaches the record and the
+        # retry delay, and the activity's own window (scheduled_time +
+        # schedule_to_close − margin) decides whether waiting is worth it.
+        import dataclasses
+
+        resets_at = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=3)
+        self.scenario_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "emit": [
+                            {"type": "system", "subtype": "init", "session_id": "sess-cap", "model": "m"},
+                            {
+                                "type": "rate_limit_event",
+                                "rate_limit_info": {"status": "rejected", "resetsAt": int(resets_at.timestamp()), "rateLimitType": "five_hour"},
+                                "session_id": "sess-cap",
+                            },
+                        ],
+                        "sleep": 30,
+                        "exit": 0,
+                    }
+                ]
+            )
+        )
+        from agent_runner.harness.base import AgentDef
+
+        agent = AgentDef(name="fixture-claude-agent", description="f", config={}, body="Fixture body.\n")
+        spec = RunSpec(key="fixture__claude", harness="claude", required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"))
+
+        async def act():
+            return await run_agent_attempt(
+                spec, "task", self.workdir, agent=agent, timeout_minutes=0.5,
+                config=TemporalRunConfig(heartbeat_seconds=0.05, rate_limit_reset_margin=timedelta(minutes=15)),
+            )
+
+        def info(window: timedelta):
+            return dataclasses.replace(
+                ActivityEnvironment().info,
+                scheduled_time=datetime.now(timezone.utc),
+                schedule_to_close_timeout=window,
+            )
+
+        heartbeats: list = []
+        with self.assertRaises(ApplicationError) as caught:
+            self.run_activity(act, heartbeats=heartbeats, info=info(timedelta(hours=8)))
+        error = caught.exception
+        self.assertEqual(error.type, outcomes.RATE_LIMITED)
+        self.assertFalse(error.non_retryable)
+        self.assertGreater(error.next_retry_delay, timedelta(hours=2, minutes=59))
+        self.assertLessEqual(error.next_retry_delay, timedelta(hours=3))
+        self.assertEqual(error.details[0]["attempt"]["resets_at"], resets_at.isoformat(timespec="seconds"))
+        self.assertEqual(heartbeats[-1][0]["attempts"][-1]["outcome"], outcomes.RATE_LIMITED)
+
+        (self.calls / "count").unlink()
+        with self.assertRaises(ApplicationError) as caught:
+            self.run_activity(act, info=info(timedelta(hours=3)))
+        self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
+        self.assertTrue(caught.exception.non_retryable)
+        self.assertIn("past the last retry window", caught.exception.message)
 
     def test_session_usage_baseline_survives_a_newer_record_shape(self) -> None:
         # A mid-run redeploy may replay a record written by a newer Usage:

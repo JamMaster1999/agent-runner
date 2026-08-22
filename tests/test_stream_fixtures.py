@@ -63,14 +63,21 @@ class FixtureReplayTest(UsageContractMixin, unittest.TestCase):
         self.assertEqual(completed[0].tok_cache_read, 2113536)
         self.assertEqual(completed[0].tok_cache_write, 0)
         self.assertEqual(completed[0].tok_output, 11021)
+        # Each event is the delta since the last running total, so an
+        # attempt that adds them ends at the last total the process reported.
+        self.assertEqual((completed[2].tok_input, completed[2].tok_output), (48213, 902))
         self.assertIsNone(completed[2].tok_cache_read)
+        summed = Usage()
+        for event in events:
+            summed.add_event(event)
+        self.assertEqual((summed.tok_input, summed.tok_output, summed.tok_cache_read), (2283043, 11923, 2113536))
         self.assertTrue(all(e.cost_usd is None for e in completed))
 
     def test_claude_fixture(self) -> None:
         events = replay(FIXTURES / "claude_stdout_usage.jsonl", ClaudeStreamParser())
         self.assert_usage_only_on_usage_events(events)
         success = next(e for e in events if e.event == "result_success")
-        error = next(e for e in events if e.event == "result_error")
+        error, capped = [e for e in events if e.event == "result_error"]
         self.assertEqual(success.cost_usd, 0.326606)
         # Summed over the per-model table (opus + the haiku subagent), not
         # the main-loop usage block.
@@ -80,6 +87,10 @@ class FixtureReplayTest(UsageContractMixin, unittest.TestCase):
         )
         self.assertEqual(error.cost_usd, 1.3731999999999998)
         self.assertEqual(error.tok_output, 2486)
+        # A result without the per-model table (error_max_turns here) still
+        # types its tokens, from the main-loop usage block.
+        self.assertEqual(capped.cost_usd, 0.21)
+        self.assertEqual((capped.tok_input, capped.tok_cache_write, capped.tok_cache_read, capped.tok_output), (12, 3100, 52000, 1900))
 
 
 class LiveCaptureTest(UsageContractMixin, unittest.TestCase):

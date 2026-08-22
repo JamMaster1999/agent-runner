@@ -64,6 +64,18 @@ class CodexStreamParserTest(unittest.TestCase):
         self.assertIsNone(events[0].tok_cache_write)
         self.assertIsNone(events[0].cost_usd)
 
+    def test_turn_completed_events_are_deltas_of_the_running_total(self) -> None:
+        # One process reports its running total on every turn.completed;
+        # the parser hands out what each turn added, so adding events back
+        # up ends at the last total.
+        parser = CodexStreamParser()
+        first = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}}))[0]
+        second = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1600, "output_tokens": 80}}))[0]
+        third = parser.parse_line(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1700, "cached_input_tokens": 900, "output_tokens": 90}}))[0]
+        self.assertEqual((first.tok_input, first.tok_cache_read, first.tok_output), (1000, 400, 50))
+        self.assertEqual((second.tok_input, second.tok_cache_read, second.tok_output), (600, None, 30))
+        self.assertEqual((third.tok_input, third.tok_cache_read, third.tok_output), (100, 500, 10))
+
     def test_turn_completed_cache_write_is_typed(self) -> None:
         events = self.parse(
             {
@@ -197,8 +209,21 @@ class ClaudeStreamParserTest(unittest.TestCase):
             {"type": "result", "subtype": "success", "total_cost_usd": 0.123456789}
         )
         self.assertEqual(events[0].cost_usd, 0.123456789)
-        # No per-model table -> token fields stay untyped even though cost is set.
+        # Neither table nor block -> token fields stay untyped even though cost is set.
         self.assertIsNone(events[0].tok_input)
+
+    def test_result_without_model_table_reads_the_usage_block(self) -> None:
+        events = self.parse(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "modelUsage": {},
+                "usage": {"input_tokens": 7, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2, "output_tokens": 3},
+                "total_cost_usd": 0.5,
+            }
+        )
+        self.assertEqual(events[0].event, "result_error")
+        self.assertEqual((events[0].tok_input, events[0].tok_cache_write, events[0].tok_cache_read, events[0].tok_output), (7, 1, 2, 3))
 
     def test_result_error_appends_detail(self) -> None:
         events = self.parse(

@@ -6,11 +6,11 @@ events-out so captured ``codex.stdout.jsonl`` files replay offline.
 Usage contract: the TYPED StreamEvent fields (tok_*, cost_usd) are the
 consumer API — event messages are display-only. ``turn.completed.usage``
 is the process's running total (``TokenUsageInfo.total_token_usage``:
-every API call of the turn added up), and one ``codex exec`` process runs
-one turn, so it is that invocation's own spend. The source seeds the
-total from the rollout on resume (core/src/session/mod.rs), but measured
-on codex-cli 0.149.0-alpha.4 an ``exec resume`` process reports its own
-turn only (2026-08-22: three runs on one thread reported 17102, 20918,
+every API call so far added up), so the parser emits the delta since the
+last ``turn.completed`` it saw and a consumer may add events. The source
+seeds the total from the rollout on resume (core/src/session/mod.rs), but
+measured on codex-cli 0.149.0-alpha.4 an ``exec resume`` process starts
+from zero (2026-08-22: three runs on one thread reported 17102, 20918,
 23128 input tokens with ``total == last`` in the rollout). The stream
 carries no dollars.
 """
@@ -38,6 +38,17 @@ class CodexStreamParser:
 
     def __init__(self) -> None:
         self._seen: set[tuple[str, str, str]] = set()
+        self._total: dict[str, int] = {}
+
+    def _delta(self, usage: dict[str, Any], key: str) -> int | None:
+        """This turn's share of a running total; None when the total did
+        not report the key."""
+        value = typed_token(usage.get(key))
+        if value is None:
+            return None
+        delta = value - self._total.get(key, 0)
+        self._total[key] = value
+        return delta
 
     def parse_line(self, line: str) -> list[StreamEvent]:
         payload = parse_json_dict(line)
@@ -55,10 +66,10 @@ class CodexStreamParser:
                 StreamEvent(
                     "turn_completed",
                     "Codex turn completed",
-                    tok_input=typed_token(usage.get("input_tokens")),
-                    tok_cache_write=typed_token(usage.get("cache_write_input_tokens")),
-                    tok_cache_read=typed_token(usage.get("cached_input_tokens")),
-                    tok_output=typed_token(usage.get("output_tokens")),
+                    tok_input=self._delta(usage, "input_tokens"),
+                    tok_cache_write=self._delta(usage, "cache_write_input_tokens"),
+                    tok_cache_read=self._delta(usage, "cached_input_tokens"),
+                    tok_output=self._delta(usage, "output_tokens"),
                 )
             ]
         if kind == "turn.failed":

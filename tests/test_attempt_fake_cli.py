@@ -169,7 +169,7 @@ class ValidRunTest(FakeCliCase):
         self.assertEqual((progress[0].current, progress[0].total), (2, 5))
         # The delivered prompt is the task with the closed variable set
         # substituted — and it is what the CLI actually received on stdin.
-        prompt = (self.workdir / "prompt.md").read_text()
+        prompt = (self.workdir / ".runner" / "prompt.md").read_text()
         self.assertIn(f"Write to {self.workdir}/out.json (attempt 1).", prompt)
         self.assertEqual(self.recorded_call(0)["stdin"], prompt)
         # Fresh session: a plain exec, no resume.
@@ -195,7 +195,7 @@ class ValidRunTest(FakeCliCase):
                 validate=self.json_validator(), poll_seconds=0.05, timeout_minutes=0.5,
             )
         self.assertEqual(report.outcome, outcomes.VALID)
-        self.assertEqual((self.workdir / "prompt.md").read_text(), prompt)
+        self.assertEqual((self.workdir / ".runner" / "prompt.md").read_text(), prompt)
 
     def test_valid_output_beats_nonzero_exit(self) -> None:
         self.scenario(
@@ -713,7 +713,7 @@ class UsageTest(FakeCliCase):
         # The running figures reached the caller at each step: this
         # attempt's own share, and the session's total.
         self.assertEqual([(u.tok_input, t.tok_input) for u, t in seen], [(1000, 1400), (2500, 2900)])
-        self.assertEqual((self.workdir / "repair-1.md").read_text(), "REPAIR: set ok=true in out.json")
+        self.assertEqual((self.workdir / ".runner" / "repair-1.md").read_text(), "REPAIR: set ok=true in out.json")
 
     def test_baseline_is_dropped_when_the_attempt_runs_fresh(self) -> None:
         self.scenario(

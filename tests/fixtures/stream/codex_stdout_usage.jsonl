@@ -7,7 +7,7 @@
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Continuing the sweep."}}
 {"type":"turn.completed"}
-{"type":"turn.completed","usage":{"input_tokens":48213,"output_tokens":902,"reasoning_output_tokens":331}}
+{"type":"turn.completed","usage":{"input_tokens":2283043,"output_tokens":11923,"reasoning_output_tokens":3126}}
 not json noise line
 {"type":"turn.completed","usage":{}}
 {"type":"error","message":"transient stream hiccup (recovered)"}

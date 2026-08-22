@@ -440,7 +440,9 @@ def run_attempt(
                 return _spawn_report(spec, str(exc), exc.details)
             raise
 
-        prompt_path = workdir / "prompt.md"
+        # Runner-private files live under .runner/, outside the agent's
+        # output namespace, so a prompt file can never shadow an artifact.
+        prompt_path = workdir / ".runner" / "prompt.md"
         write_text(prompt_path, prompt)
         env = agent_env(adapter, spec, run_id, attempt, workdir)
         env.update(adapter.bind_credentials())
@@ -477,6 +479,11 @@ def run_attempt(
                         live_ref = adapter.session_ref_from_event(payload)
                         if live_ref and live_ref != report.session_ref:
                             report.session_ref = live_ref
+                            if live_ref != session_ref:
+                                # The CLI opened a session other than the one
+                                # asked for: its usage starts from nothing.
+                                before.assign(Usage())
+                                session_total.assign(usage)
                             if on_session is not None:
                                 try:
                                     on_session(live_ref)
@@ -608,7 +615,7 @@ def run_attempt(
             for round_number in range(1, spec.repair_rounds + 1):
                 repaired = _repair(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
-                    workdir / f"repair-{round_number}.md",
+                    workdir / ".runner" / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
                 )
                 if not repaired:

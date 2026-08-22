@@ -24,6 +24,7 @@ Temporal-facing mechanics of one CLI attempt:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import threading
 from dataclasses import dataclass, field
@@ -52,9 +53,12 @@ class TemporalRunConfig:
     rate_limit_backoff: timedelta = timedelta(minutes=15)
     # The longest a rate_limited retry waits on the CLI's reset time. A
     # waiting retry holds whatever slot the caller gated the activity
-    # behind, so the cap is the caller's call; a reset past the activity's
-    # own deadline fails at once instead (retry.application_error_for).
+    # behind, so the cap is the caller's call. A reset that leaves less
+    # than the margin before the activity's schedule-to-close fails at
+    # once instead (retry.application_error_for): the retry could not
+    # finish anyway.
     rate_limit_reset_cap: timedelta = timedelta(hours=6)
+    rate_limit_reset_margin: timedelta = timedelta(minutes=15)
 
 
 @dataclass
@@ -105,38 +109,51 @@ class _HeartbeatState:
                 "attempts": list(self.attempts),
             }
 
-    def record(self, entry: dict[str, Any]) -> None:
+    def record(self, entry: dict[str, Any]) -> list[dict[str, Any]]:
         """One record per attempt, carried to the next attempt by the
         heartbeat and into history by the final result or failure. Bounded:
-        the retry policy caps attempts, the slice caps a runaway one."""
+        the retry policy caps attempts, the slice caps a runaway one.
+        Returns the list as it now stands."""
         with self.lock:
             self.attempts.append(entry)
             del self.attempts[:-ATTEMPTS_KEPT]
+            return list(self.attempts)
 
 
 ATTEMPTS_KEPT = 10
 RECORD_TEXT_LIMIT = 500  # bytes, for each of error and detail
+RECORD_REF_LIMIT = 128   # bytes, for the CLI-supplied session_ref
 
-# What one attempt leaves behind, success or not: how it ended, the session
-# it ran in, when, what it alone spent, and where that left the session's
-# total. One shape for reported and vanished attempts alike.
-RECORD_KEYS = (
-    "attempt",
-    "outcome",
-    "error",
-    "detail",
-    "session_ref",
-    "resumed",
-    "resets_at",
-    "started_at",
-    "ended_at",
-    "usage",
-    "session_usage",
-)
+
+@dataclass
+class AttemptRecord:
+    """What one attempt leaves behind, success or not: how it ended, the
+    session it ran in, when, what it alone spent, and where that left the
+    session's total. The one shape for reported and vanished attempts
+    alike; the defaults are what a vanished attempt can say."""
+
+    attempt: int
+    outcome: str
+    error: str
+    detail: str = ""
+    session_ref: str | None = None
+    resumed: bool | None = None
+    resets_at: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
+    session_usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
+
+
+RECORD_KEYS = tuple(f.name for f in dataclasses.fields(AttemptRecord))
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _head(text: str, limit: int) -> str:
+    return text.encode()[:limit].decode(errors="ignore")
 
 
 def _tail(text: str, limit: int) -> str:
@@ -146,21 +163,23 @@ def _tail(text: str, limit: int) -> str:
 def attempt_record(
     attempt: int, report: AttemptReport, started_at: str, ended_at: str
 ) -> dict[str, Any]:
-    return {
-        "attempt": attempt,
-        "outcome": report.outcome,
-        "error": _tail(report.error, RECORD_TEXT_LIMIT),
-        "detail": _tail(report.detail, RECORD_TEXT_LIMIT),
-        "session_ref": report.session_ref,
-        "resumed": report.resumed,
-        "resets_at": (
-            report.resets_at.isoformat(timespec="seconds") if report.resets_at else None
-        ),
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "usage": report.usage.as_dict(),
-        "session_usage": report.session_usage.as_dict(),
-    }
+    """``error`` keeps its head (the key and the cause come first), ``detail``
+    its tail (the CLI's last words)."""
+    return dataclasses.asdict(
+        AttemptRecord(
+            attempt=attempt,
+            outcome=report.outcome,
+            error=_head(report.error, RECORD_TEXT_LIMIT),
+            detail=_tail(report.detail, RECORD_TEXT_LIMIT),
+            session_ref=_head(report.session_ref, RECORD_REF_LIMIT) if report.session_ref else None,
+            resumed=report.resumed,
+            resets_at=report.resets_at.isoformat(timespec="seconds") if report.resets_at else None,
+            started_at=started_at,
+            ended_at=ended_at,
+            usage=report.usage.as_dict(),
+            session_usage=report.session_usage.as_dict(),
+        )
+    )
 
 
 def session_usage_before(session_ref: str | None, attempts: list[dict[str, Any]]) -> Usage:
@@ -201,20 +220,16 @@ def vanished_attempts(
     for number in range(max(1, attempt - ATTEMPTS_KEPT), attempt):
         if number in seen:
             continue
-        entry = dict.fromkeys(RECORD_KEYS)
-        entry.update(
+        record = AttemptRecord(
             attempt=number,
             outcome=outcomes.INFRA,
             error="attempt ended without a report — the worker died mid-attempt",
-            detail="",
         )
         if prior.get("attempt") == number:
-            entry.update(
-                session_ref=prior.get("session_ref"),
-                usage=prior.get("usage"),
-                session_usage=prior.get("session_usage"),
-            )
-        entries.append(entry)
+            record.session_ref = prior.get("session_ref")
+            record.usage = Usage.from_dict(prior.get("usage") or {}).as_dict()
+            record.session_usage = Usage.from_dict(prior.get("session_usage") or {}).as_dict()
+        entries.append(dataclasses.asdict(record))
     return entries
 
 
@@ -266,30 +281,8 @@ async def run_agent_attempt(
     the CLI child is reaped."""
     config = config or TemporalRunConfig()
     info = activity.info()
-
-    prior = prior_heartbeat_details()
-    # The attempt record outlives the session it came from: a prompt change
-    # or an exhausted resume budget starts a fresh session, not a fresh
-    # history.
-    attempts = list((prior or {}).get("attempts") or [])
-    attempts.extend(vanished_attempts(info.attempt, attempts, prior))
-    del attempts[:-ATTEMPTS_KEPT]
-    current_fp = agent_fingerprint(agent)
-    if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
-        activity.logger.warning(
-            "%s: the agent prompt changed since the prior session started; "
-            "its transcript belongs to a prompt that no longer exists — running fresh",
-            spec.key,
-        )
-        prior = None
-    session_ref, resume_count, fresh_fallback = resume_decision(prior, config.resume_budget)
-    if fresh_fallback:
-        activity.logger.warning(
-            "%s: resume budget (%d) exhausted for the prior session; "
-            "falling back to a fresh session",
-            spec.key,
-            config.resume_budget,
-        )
+    state = starting_state(spec.key, info, prior_heartbeat_details(), agent, config)
+    session_ref = state.session_ref
 
     if checkpoint is not None:
         # Prepared before spawn; verified before ANY resume of work in it.
@@ -299,16 +292,6 @@ async def run_agent_attempt(
         # the attempts that ran on other hosts.
         workdirs.pull_checkpoints(checkpoint.directory)
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
-
-    before = session_usage_before(session_ref, attempts)
-    state = _HeartbeatState(
-        attempt=info.attempt,
-        session_ref=session_ref,
-        resume_count=resume_count,
-        agent_fp=current_fp,
-        session_usage=before.as_dict(),
-        attempts=attempts,
-    )
 
     def on_event(event: StreamEvent) -> None:
         with state.lock:
@@ -325,8 +308,9 @@ async def run_agent_attempt(
         with state.lock:
             if ref != session_ref:
                 # A fresh session opened: the budget is the session's, so the
-                # count restarts with it.
+                # count restarts with it, and so does its usage.
                 state.resume_count = 0
+                state.session_usage = dict(state.usage)
             state.session_ref = ref
 
     def on_usage(usage: Usage, session_usage: Usage) -> None:
@@ -354,7 +338,7 @@ async def run_agent_attempt(
             on_session=on_session,
             on_usage=on_usage,
             session_ref=session_ref,
-            session_usage=before,
+            session_usage=Usage.from_dict(state.session_usage),
             run_id=info.workflow_run_id or "",
             attempt=info.attempt,
             variables=variables,
@@ -365,8 +349,9 @@ async def run_agent_attempt(
     )
     try:
         report = await asyncio.shield(inner)
-        state.record(attempt_record(info.attempt, report, started_at, _now_iso()))
-        report.attempts = tuple(state.attempts)
+        report.attempts = tuple(
+            state.record(attempt_record(info.attempt, report, started_at, _now_iso()))
+        )
     except asyncio.CancelledError:
         # Graceful cancel: terminate and reap the CLI before propagating.
         stop.set()
@@ -392,17 +377,60 @@ async def run_agent_attempt(
 
     if report.outcome == outcomes.VALID:
         return report
+    deadline = activity_deadline(info)
     raise application_error_for(
         report,
         rate_limit_backoff=config.rate_limit_backoff,
         reset_cap=config.rate_limit_reset_cap,
-        deadline=activity_deadline(info),
+        retry_by=deadline - config.rate_limit_reset_margin if deadline else None,
+    )
+
+
+def starting_state(
+    key: str,
+    info: activity.Info,
+    prior: dict[str, Any] | None,
+    agent: AgentDef | None,
+    config: TemporalRunConfig,
+) -> _HeartbeatState:
+    """The prior attempt's last heartbeat folded into this attempt's
+    starting state: the record so far with the vanished attempts named,
+    the session to resume when the prompt is unchanged and the budget
+    allows, and where that session's usage stood. The record outlives the
+    session it came from: a prompt change or an exhausted budget starts a
+    fresh session, not a fresh history."""
+    attempts = list((prior or {}).get("attempts") or [])
+    attempts.extend(vanished_attempts(info.attempt, attempts, prior))
+    del attempts[:-ATTEMPTS_KEPT]
+    current_fp = agent_fingerprint(agent)
+    if prior and prior.get("agent_fp") and current_fp and prior["agent_fp"] != current_fp:
+        activity.logger.warning(
+            "%s: the agent prompt changed since the prior session started; "
+            "its transcript belongs to a prompt that no longer exists — running fresh",
+            key,
+        )
+        prior = None
+    session_ref, resume_count, fresh_fallback = resume_decision(prior, config.resume_budget)
+    if fresh_fallback:
+        activity.logger.warning(
+            "%s: resume budget (%d) exhausted for the prior session; "
+            "falling back to a fresh session",
+            key,
+            config.resume_budget,
+        )
+    return _HeartbeatState(
+        attempt=info.attempt,
+        session_ref=session_ref,
+        resume_count=resume_count,
+        agent_fp=current_fp,
+        session_usage=session_usage_before(session_ref, attempts).as_dict(),
+        attempts=attempts,
     )
 
 
 def activity_deadline(info: activity.Info) -> datetime | None:
     """When this activity's schedule-to-close runs out, or None when the
     caller set no such backstop."""
-    if info.schedule_to_close_timeout is None:
+    if not info.schedule_to_close_timeout:
         return None
     return info.scheduled_time + info.schedule_to_close_timeout
