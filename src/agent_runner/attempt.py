@@ -249,6 +249,7 @@ def _repair(
     verdict: Verdict,
     workdir: Path,
     stdout_path: Path,
+    prompt_path: Path,
     env: dict[str, str],
     emit: Callable[[StreamEvent], None],
     poll_seconds: float,
@@ -285,27 +286,24 @@ def _repair(
             repair_tail.offset = followup.stdout_path.stat().st_size
         except FileNotFoundError:
             pass
+        write_text(prompt_path, message)
         # Append, not truncate: repair rounds share these paths, and a
         # multi-round failure must keep every round's log for debugging.
-        with followup.stdout_path.open("a") as stdout, followup.stderr_path.open("a") as stderr:
+        with (
+            prompt_path.open("rb") as stdin,
+            followup.stdout_path.open("a") as stdout,
+            followup.stderr_path.open("a") as stderr,
+        ):
             process = subprocess.Popen(
                 followup.command,
                 cwd=util.project_root(),
                 env=env,
-                stdin=subprocess.PIPE,
+                stdin=stdin,
                 preexec_fn=_preexec(),
                 stdout=stdout,
                 stderr=stderr,
-                text=True,
             )
             try:
-                if process.stdin is None:
-                    return False
-                try:
-                    process.stdin.write(message)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    return False
                 deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
                 while process.poll() is None:
                     if should_stop is not None and should_stop():
@@ -418,7 +416,8 @@ def run_attempt(
                 return _spawn_report(spec, str(exc), exc.details)
             raise
 
-        write_text(workdir / "prompt.md", prompt)
+        prompt_path = workdir / "prompt.md"
+        write_text(prompt_path, prompt)
         env = agent_env(adapter, spec, run_id, attempt, workdir)
         env.update(adapter.bind_credentials())
         env.update(adapter.env_overrides())
@@ -465,17 +464,22 @@ def run_attempt(
                 emit(event)
             return bool(lines or hook_events)
 
-        with spawn.stdout_path.open("w") as stdout, spawn.stderr_path.open("w") as stderr:
+        # The prompt reaches the CLI as a file on stdin: the kernel feeds it,
+        # so a CLI that never drains stdin wedges nothing on this side.
+        with (
+            prompt_path.open("rb") as stdin,
+            spawn.stdout_path.open("w") as stdout,
+            spawn.stderr_path.open("w") as stderr,
+        ):
             try:
                 process = subprocess.Popen(
                     spawn.command,
                     cwd=util.project_root(),
                     env=env,
-                    stdin=subprocess.PIPE,
+                    stdin=stdin,
                     preexec_fn=_preexec(),
                     stdout=stdout,
                     stderr=stderr,
-                    text=True,
                 )
             except OSError as exc:
                 # The OS refused the fork/exec, or the binary vanished: no
@@ -484,20 +488,6 @@ def run_attempt(
                     spec, f"failed to spawn {adapter.display_name}: {exc}"
                 )
             try:
-                if process.stdin is None:
-                    return _spawn_report(
-                        spec, f"{adapter.display_name} stdin was not available"
-                    )
-                try:
-                    process.stdin.write(prompt)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    drain_streams()
-                    return _spawn_report(
-                        spec,
-                        f"{adapter.display_name} exited before receiving the prompt",
-                        adapter.error_report(spawn.stdout_path, spawn.stderr_path),
-                    )
                 timeout = float(
                     timeout_minutes
                     if timeout_minutes is not None
@@ -598,9 +588,10 @@ def run_attempt(
         # message into the still-open session. Fixing one defect can surface
         # the next, so rounds iterate up to the spec's budget.
         if adapter.capabilities.followup and spec.repair_rounds > 0:
-            for _ in range(spec.repair_rounds):
+            for round_number in range(1, spec.repair_rounds + 1):
                 repaired = _repair(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
+                    workdir / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
                 )
                 if not repaired:

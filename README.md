@@ -39,7 +39,7 @@ Every call to `run_attempt` walks through the same lifecycle:
 
 | Stage        | What happens                                                                                                                                                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Spawn**    | Build the CLI command from a `RunSpec` and an `AgentDef`, start it as a subprocess, and write the task prompt to its stdin. The command shape is provider-specific, but your code never branches on a provider name. |
+| **Spawn**    | Build the CLI command from a `RunSpec` and an `AgentDef`, start it as a subprocess, and hand it the task prompt as a file on stdin (`prompt.md` in the working folder, so the kernel feeds it and a CLI that never reads stdin cannot wedge the attempt). The command shape is provider-specific, but your code never branches on a provider name. |
 | **Stream**   | Read the CLI's JSON output line by line as it runs. `StreamEvent`s surface progress, tool calls, token usage, and cost in real time via an `on_event` callback.                          |
 | **Validate** | When the CLI exits, call your `validate` function. You decide what a correct result looks like. agent-runner never parses or judges the agent's output.                                  |
 | **Classify** | End the attempt with exactly one of eight outcome words (`valid`, `invalid_schema`, `rate_limited`, `infra`, `auth`, `timeout`, `stalled`, `spawn_failure`). Uses only CLI-owned error evidence, never the agent's transcript. |

@@ -175,6 +175,28 @@ class ValidRunTest(FakeCliCase):
         # Fresh session: a plain exec, no resume.
         self.assertNotIn("resume", self.recorded_call(0)["argv"])
 
+    def test_prompt_arrives_as_a_file_even_when_the_cli_never_reads_it(self) -> None:
+        # The doorway bug: a blocking stdin write to a CLI that never drains
+        # it wedged the attempt for the whole timeout, and a CLI that exited
+        # first failed it as spawn_failure. The prompt is a file on stdin
+        # now — the kernel feeds it, nothing on this side can block.
+        deaf = self.tmp / "deaf-cli"
+        deaf.write_text(
+            "#!/bin/sh\n"
+            f"mkdir -p {self.workdir}\n"
+            f"echo '{{\"ok\": true}}' > {self.out_path()}\n"
+            "exit 0\n"
+        )
+        deaf.chmod(0o755)
+        prompt = "x" * (4 << 20)  # far past any pipe buffer
+        with mock.patch.dict(_os.environ, {"RUNNER_CODEX_CLI": str(deaf)}):
+            report = run_attempt(
+                codex_spec(), prompt, self.workdir,
+                validate=self.json_validator(), poll_seconds=0.05, timeout_minutes=0.5,
+            )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual((self.workdir / "prompt.md").read_text(), prompt)
+
     def test_valid_output_beats_nonzero_exit(self) -> None:
         self.scenario(
             [
