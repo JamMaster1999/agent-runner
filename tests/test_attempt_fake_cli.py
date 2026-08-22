@@ -962,6 +962,7 @@ class StreamFatalAbortTest(FakeCliCase):
         self.assertIn("five_hour rejected", report.detail)
         self.assertIn("resets 2026-08-21T20:50:00+00:00", report.detail)
         self.assertIn("out_of_credits", report.detail)
+        self.assertEqual(report.resets_at.isoformat(), "2026-08-21T20:50:00+00:00")
 
     def test_claude_rate_limit_allowed_event_is_not_fatal(self) -> None:
         # The CLI also emits rate_limit_event with status "allowed" as a

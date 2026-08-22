@@ -535,6 +535,7 @@ def run_attempt(
                         report.outcome = _outcome_for(failure.code)
                         report.error = f"{spec.key}: {failure}"
                         report.detail = failure.details
+                        report.resets_at = failure.resets_at
                         return report
                     if should_stop is not None and should_stop():
                         _terminate(process)
@@ -598,6 +599,7 @@ def run_attempt(
                 report.outcome = _outcome_for(zero_exit_error.code)
                 report.error = f"{spec.key}: {zero_exit_error}"
                 report.detail = zero_exit_error.details
+                report.resets_at = zero_exit_error.resets_at
                 return report
             report.outcome, report.error, report.detail = _classify_exit(
                 adapter, spec, spawn, process.returncode

@@ -14,7 +14,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -39,7 +39,7 @@ if HAVE_TEMPORALIO:
     from temporalio.testing import ActivityEnvironment
 
     from agent_runner import outcomes
-    from agent_runner.runtime import AttemptReport, RunSpec, Verdict
+    from agent_runner.runtime import AttemptReport, RunSpec, Usage, Verdict
     from agent_runner.temporal import (
         CheckpointSpec,
         TemporalRunConfig,
@@ -48,6 +48,7 @@ if HAVE_TEMPORALIO:
         run_agent_attempt,
     )
     from agent_runner.temporal import activity as activity_module
+    from agent_runner.temporal import retry as retry_module
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 
@@ -73,7 +74,7 @@ class RetryMappingTest(unittest.TestCase):
             error="k: claude attempt failed",
             detail="claude result success: You've hit your session limit",
             session_ref="sess-1",
-            prior_attempts=({"attempt": 1, "outcome": "stalled"},),
+            attempts=({"attempt": 1, "outcome": "stalled"},),
         )
         error = application_error_for(report, rate_limit_backoff=timedelta(minutes=1))
         self.assertEqual(
@@ -82,9 +83,32 @@ class RetryMappingTest(unittest.TestCase):
                 "outcome": outcomes.INFRA,
                 "detail": "claude result success: You've hit your session limit",
                 "session_ref": "sess-1",
-                "prior_attempts": [{"attempt": 1, "outcome": "stalled"}],
+                "attempts": [{"attempt": 1, "outcome": "stalled"}],
             },
         )
+
+    def test_rate_limited_waits_for_the_reset_when_the_cli_named_one(self) -> None:
+        # A known reset time beats the flat backoff: the retry lands just
+        # after the limit lifts instead of probing every quarter hour.
+        now = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)
+        delay = retry_module.rate_limit_delay
+        default = timedelta(minutes=15)
+        self.assertEqual(delay(None, default, now), default)
+        self.assertEqual(delay(now + timedelta(minutes=50), default, now), timedelta(minutes=50))
+        # Already past (or a few seconds out): retry promptly, not instantly.
+        self.assertEqual(delay(now - timedelta(hours=1), default, now), retry_module.RESET_DELAY_FLOOR)
+        # A weekly cap's reset is days away; the wait is capped so the
+        # caller's schedule-to-close backstop, not this delay, ends the run.
+        self.assertEqual(delay(now + timedelta(days=3), default, now), retry_module.RESET_DELAY_CAP)
+
+        report = AttemptReport(
+            outcome=outcomes.RATE_LIMITED,
+            error="capped",
+            resets_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+        error = application_error_for(report, rate_limit_backoff=default)
+        self.assertGreater(error.next_retry_delay, timedelta(hours=1, minutes=59))
+        self.assertLessEqual(error.next_retry_delay, timedelta(hours=2))
 
     def test_failure_detail_is_bounded(self) -> None:
         report = AttemptReport(outcome=outcomes.INFRA, error="k", detail="x" * 5000 + "END")
@@ -332,7 +356,12 @@ class ActivityRunTest(unittest.TestCase):
                 self.run_activity(act)
         details = caught.exception.details[0]
         self.assertEqual(details["outcome"], outcomes.INFRA)
-        self.assertEqual(details["prior_attempts"], prior["attempts"])
+        # Every attempt's record, this one last.
+        self.assertEqual(details["attempts"][0], prior["attempts"][0])
+        own = details["attempts"][1]
+        self.assertEqual(own["outcome"], outcomes.INFRA)
+        self.assertTrue(own["resumed"])
+        self.assertEqual(own["session_ref"], "th_1")
 
     def test_vanished_attempts_are_named_from_the_attempt_number(self) -> None:
         # A worker killed mid-attempt reports nothing; attempt 4 arriving
@@ -342,14 +371,27 @@ class ActivityRunTest(unittest.TestCase):
         self.assertEqual(gap["attempt"], 2)
         self.assertEqual(gap["outcome"], outcomes.INFRA)
         self.assertIn("worker died", gap["error"])
+        self.assertIsNone(gap["usage"])
+        # One record shape: a vanished entry carries every field, as null.
+        full = activity_module.attempt_record(1, AttemptReport(outcome="infra"), "t0", "t1")
+        self.assertEqual(set(gap), set(full))
         self.assertEqual(activity_module.vanished_attempts(1, []), [])
         self.assertEqual(activity_module.vanished_attempts(3, recorded[:1] + [{"attempt": 2}]), [])
 
-    def test_success_names_the_attempts_before_it(self) -> None:
+    def test_every_attempt_leaves_a_typed_record(self) -> None:
+        # Success included: the record names what the attempt spent, when,
+        # and where that left the session's total.
         self.scenario_path.write_text(
             json.dumps(
                 [
                     {
+                        "emit": [
+                            {"type": "thread.started", "thread_id": "th_1"},
+                            {
+                                "type": "turn.completed",
+                                "usage": {"input_tokens": 500, "cached_input_tokens": 100, "output_tokens": 50},
+                            },
+                        ],
                         "write": [
                             {"path": str(self.workdir / "out.json"), "text": '{"ok": true}'}
                         ],
@@ -368,7 +410,7 @@ class ActivityRunTest(unittest.TestCase):
                 config=TemporalRunConfig(heartbeat_seconds=0.05),
             )
 
-        attempts = [{"attempt": 1, "outcome": "infra", "error": "died"}]
+        attempts = [{"attempt": 1, "outcome": "infra", "error": "died", "session_ref": None}]
         with mock.patch.object(
             activity_module,
             "prior_heartbeat_details",
@@ -376,8 +418,76 @@ class ActivityRunTest(unittest.TestCase):
         ):
             report, heartbeats = self.run_activity(act)
         self.assertEqual(report.outcome, outcomes.VALID)
-        self.assertEqual(list(report.prior_attempts), attempts)
-        self.assertEqual(heartbeats[-1][0]["attempts"], attempts)
+        self.assertEqual(list(report.attempts)[0], attempts[0])
+        own = report.attempts[-1]
+        self.assertEqual(own["attempt"], 1)
+        self.assertEqual(own["outcome"], outcomes.VALID)
+        self.assertEqual(own["session_ref"], "th_1")
+        self.assertFalse(own["resumed"])
+        self.assertIsNone(own["resets_at"])
+        self.assertLessEqual(own["started_at"], own["ended_at"])
+        datetime.fromisoformat(own["ended_at"])
+        self.assertEqual(own["usage"]["tok_input"], 500)
+        self.assertEqual(own["usage"]["tok_output"], 50)
+        self.assertEqual(own["usage"]["cost_usd"], 0.0)
+        self.assertEqual(own["session_usage"], own["usage"])
+        # The heartbeat carried the running attempt's usage, typed, before
+        # the record existed; the final one carries both.
+        final = heartbeats[-1][0]
+        self.assertEqual(final["usage"]["tok_input"], 500)
+        self.assertEqual(final["attempts"], list(report.attempts))
+
+    def test_resumed_attempt_records_its_own_spend_and_the_session_total(self) -> None:
+        # The codex stream reports the thread's running total; attempt 2's
+        # record must carry only what it added, measured from where the
+        # prior record left the session.
+        self.scenario_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "emit": [
+                            {"type": "thread.started", "thread_id": "th_1"},
+                            {
+                                "type": "turn.completed",
+                                "usage": {"input_tokens": 800, "cached_input_tokens": 300, "output_tokens": 80},
+                            },
+                        ],
+                        "write": [
+                            {"path": str(self.workdir / "out.json"), "text": '{"ok": true}'}
+                        ],
+                        "exit": 0,
+                    }
+                ]
+            )
+        )
+
+        async def act():
+            return await run_agent_attempt(
+                self.spec(),
+                "task",
+                self.workdir,
+                validate=self.validator(),
+                config=TemporalRunConfig(heartbeat_seconds=0.05),
+            )
+
+        first = {
+            "attempt": 1,
+            "outcome": "stalled",
+            "session_ref": "th_1",
+            "usage": Usage(500, 0, 100, 50).as_dict(),
+            "session_usage": Usage(500, 0, 100, 50).as_dict(),
+        }
+        with mock.patch.object(
+            activity_module,
+            "prior_heartbeat_details",
+            return_value={"session_ref": "th_1", "resume_count": 0, "attempts": [first]},
+        ):
+            report, _ = self.run_activity(act)
+        own = report.attempts[-1]
+        self.assertTrue(own["resumed"])
+        self.assertEqual(own["usage"], Usage(300, 0, 200, 30).as_dict())
+        self.assertEqual(own["session_usage"], Usage(800, 0, 300, 80).as_dict())
+        self.assertEqual(report.usage, Usage(300, 0, 200, 30))
 
     def test_resume_budget_exhausted_falls_back_fresh(self) -> None:
         # Matrix C4: budget spent -> fresh session, recorded.

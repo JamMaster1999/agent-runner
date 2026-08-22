@@ -270,8 +270,8 @@ class ClaudeCodeAdapter(HarnessAdapter):
         A ``rate_limit_event`` with status ``rejected`` is the subscription
         cap (live tier, 2026-08-21: the CLI then prints a synthetic "You've
         hit your session limit" turn, exits 0, and the result carries
-        ``is_error``); it classifies ``rate_limited`` with the reset time in
-        the detail. A 401/403 ``api_retry`` event is a dead credential the
+        ``is_error``); it classifies ``rate_limited`` with the reset time
+        typed on the error, so the retry can wait exactly that long. A 401/403 ``api_retry`` event is a dead credential the
         CLI will retry ~10 times over ~20 minutes of exponential backoff
         (2026-08-09); the attempt must fail as auth now, not as timeout after
         the ladder runs out."""
@@ -289,7 +289,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
             if info.get("overageDisabledReason"):
                 message += f" ({info['overageDisabledReason']})"
             return RunnerError(
-                message, code=outcomes.RATE_LIMITED, retryable=True, alert=False, details=message
+                message,
+                code=outcomes.RATE_LIMITED,
+                retryable=True,
+                alert=False,
+                details=message,
+                resets_at=resets_at,
             )
         if payload.get("type") == "system" and payload.get("subtype") == "api_retry":
             try:

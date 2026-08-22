@@ -14,6 +14,7 @@ returns a ``Verdict``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,12 +39,14 @@ class RunnerError(Exception):
         retryable: bool = True,
         alert: bool = False,
         details: str = "",
+        resets_at: datetime | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.alert = alert
         self.details = details
+        self.resets_at = resets_at
 
 
 @dataclass(frozen=True)
@@ -159,11 +162,12 @@ class AttemptReport:
     ``session_ref`` is the CLI session this attempt opened (or resumed) —
     the handle a later attempt resumes. ``error`` is the operator-facing
     message for non-valid outcomes; ``detail`` the CLI-owned error text
-    behind it. ``data`` is the validator's parsed output on ``valid``.
+    behind it; ``resets_at`` when a ``rate_limited`` outcome lifts, if the
+    CLI said. ``data`` is the validator's parsed output on ``valid``.
     ``usage`` is what this attempt alone spent; ``session_usage`` is the
     session's total at the end of it, every attempt on the session
-    included. ``prior_attempts`` is the record of the failed attempts
-    before this one (``agent_runner.temporal`` fills it from heartbeat
+    included. ``attempts`` is the record of every attempt of this activity,
+    this one last (``agent_runner.temporal`` fills it from heartbeat
     details; the core runner leaves it empty).
     """
 
@@ -171,10 +175,11 @@ class AttemptReport:
     session_ref: str | None = None
     error: str = ""
     detail: str = ""
+    resets_at: datetime | None = None
     data: dict[str, Any] | None = None
     usage: Usage = field(default_factory=Usage)
     session_usage: Usage = field(default_factory=Usage)
     resumed: bool = False
     repair_rounds_used: int = 0
     workdir: Path | None = None
-    prior_attempts: tuple[dict[str, Any], ...] = ()
+    attempts: tuple[dict[str, Any], ...] = ()

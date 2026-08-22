@@ -7,7 +7,11 @@ Temporal-facing mechanics of one CLI attempt:
 - the heartbeat pump while the CLI runs (the heartbeat says the attempt is
   still running; whether the agent is still PRODUCING is the attempt loop's
   stall watchdog, which fails the attempt so the retry lands here)
-- session_ref + progress in heartbeat details (a retry resumes the session)
+- session_ref, progress, and the running attempt's usage in heartbeat
+  details (a retry resumes the session; a dashboard shows spend live)
+- one typed record per attempt, success included (``attempt_record``),
+  carried by the heartbeat and landing in the final result and in failure
+  details as ``attempts``
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
   resume (mismatch: discard, log loudly, run fresh), and mirrored after
@@ -33,7 +37,7 @@ from agent_runner import outcomes, workdirs
 from agent_runner.attempt import AttemptCancelled, run_attempt
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
-from agent_runner.runtime import AttemptReport, RunSpec, Verdict
+from agent_runner.runtime import AttemptReport, RunSpec, Usage, Verdict
 from agent_runner.temporal.retry import application_error_for
 
 
@@ -77,6 +81,7 @@ class _HeartbeatState:
     resume_count: int = 0
     agent_fp: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     attempts: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -87,29 +92,58 @@ class _HeartbeatState:
                 "resume_count": self.resume_count,
                 "agent_fp": self.agent_fp,
                 "progress": dict(self.progress),
+                "usage": dict(self.usage),
                 "attempts": list(self.attempts),
             }
 
-    def record_failure(self, attempt: int, report: AttemptReport) -> None:
-        """One line per failed attempt, carried to the next attempt by the
+    def record(self, entry: dict[str, Any]) -> None:
+        """One record per attempt, carried to the next attempt by the
         heartbeat and into history by the final result or failure. Bounded:
         the retry policy caps attempts, the slice caps a runaway one."""
         with self.lock:
-            self.attempts.append(
-                {
-                    "attempt": attempt,
-                    "outcome": report.outcome,
-                    "error": report.error,
-                    "detail": report.detail[-ATTEMPT_DETAIL_LIMIT:],
-                    "session_ref": report.session_ref,
-                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }
-            )
+            self.attempts.append(entry)
             del self.attempts[:-ATTEMPTS_KEPT]
 
 
 ATTEMPTS_KEPT = 10
 ATTEMPT_DETAIL_LIMIT = 500
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def attempt_record(
+    attempt: int, report: AttemptReport, started_at: str, ended_at: str
+) -> dict[str, Any]:
+    """What one attempt leaves behind, success or not: how it ended, the
+    session it ran in, when, what it alone spent, and where that left the
+    session's total."""
+    return {
+        "attempt": attempt,
+        "outcome": report.outcome,
+        "error": report.error,
+        "detail": report.detail[-ATTEMPT_DETAIL_LIMIT:],
+        "session_ref": report.session_ref,
+        "resumed": report.resumed,
+        "resets_at": (
+            report.resets_at.isoformat(timespec="seconds") if report.resets_at else None
+        ),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "usage": report.usage.as_dict(),
+        "session_usage": report.session_usage.as_dict(),
+    }
+
+
+def session_usage_before(session_ref: str | None, attempts: list[dict[str, Any]]) -> Usage:
+    """Where the session stood when its latest recorded attempt ended —
+    the baseline this attempt's own spend is measured from."""
+    if session_ref:
+        for entry in reversed(attempts):
+            if entry.get("session_ref") == session_ref and entry.get("session_usage"):
+                return Usage(**entry["session_usage"])
+    return Usage()
 
 
 def agent_fingerprint(agent: AgentDef | None) -> str | None:
@@ -136,7 +170,12 @@ def vanished_attempts(attempt: int, recorded: list[dict[str, Any]]) -> list[dict
             "error": "attempt ended without a report — the worker died mid-attempt",
             "detail": "",
             "session_ref": None,
-            "at": None,
+            "resumed": None,
+            "resets_at": None,
+            "started_at": None,
+            "ended_at": None,
+            "usage": None,
+            "session_usage": None,
         }
         for number in range(1, attempt)
         if number not in seen
@@ -193,9 +232,9 @@ async def run_agent_attempt(
     info = activity.info()
 
     prior = prior_heartbeat_details()
-    # The failed-attempt record outlives the session it came from: a prompt
-    # change or an exhausted resume budget starts a fresh session, not a
-    # fresh history.
+    # The attempt record outlives the session it came from: a prompt change
+    # or an exhausted resume budget starts a fresh session, not a fresh
+    # history.
     attempts = list((prior or {}).get("attempts") or [])
     attempts.extend(vanished_attempts(info.attempt, attempts))
     current_fp = agent_fingerprint(agent)
@@ -250,6 +289,10 @@ async def run_agent_attempt(
                 state.resume_count = 0
             state.session_ref = ref
 
+    def on_usage(usage: Usage) -> None:
+        with state.lock:
+            state.usage = usage.as_dict()
+
     async def pump() -> None:
         while True:
             activity.heartbeat(state.payload())
@@ -257,6 +300,7 @@ async def run_agent_attempt(
 
     stop = threading.Event()
     pump_task = asyncio.create_task(pump())
+    started_at = _now_iso()
     inner = asyncio.create_task(
         asyncio.to_thread(
             run_attempt,
@@ -267,7 +311,9 @@ async def run_agent_attempt(
             validate=validate,
             on_event=on_event,
             on_session=on_session,
+            on_usage=on_usage,
             session_ref=session_ref,
+            session_usage=session_usage_before(session_ref, attempts),
             run_id=info.workflow_run_id or "",
             attempt=info.attempt,
             variables=variables,
@@ -278,9 +324,8 @@ async def run_agent_attempt(
     )
     try:
         report = await asyncio.shield(inner)
-        report.prior_attempts = tuple(attempts)
-        if report.outcome != outcomes.VALID:
-            state.record_failure(info.attempt, report)
+        state.record(attempt_record(info.attempt, report, started_at, _now_iso()))
+        report.attempts = tuple(state.attempts)
     except asyncio.CancelledError:
         # Graceful cancel: terminate and reap the CLI before propagating.
         stop.set()
