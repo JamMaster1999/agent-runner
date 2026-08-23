@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -36,6 +37,7 @@ from agent_runner import outcomes  # noqa: E402
 from agent_runner.attempt import (  # noqa: E402
     DEFAULT_STALL_SECONDS,
     AttemptCancelled,
+    _StampedCapture,
     _stall_seconds,
     run_attempt,
 )
@@ -212,6 +214,68 @@ class ValidRunTest(FakeCliCase):
             validate=self.json_validator(), poll_seconds=0.05,
         )
         self.assertEqual(report.outcome, outcomes.VALID)
+
+
+class StampedCaptureTest(FakeCliCase):
+    def test_capture_file_stamps_every_line_as_it_arrives(self) -> None:
+        # The CLIs write no per-line times, so the dashboard used to guess.
+        # The runner now sits between the pipe and the capture file and
+        # stamps each JSON line with its arrival — the file keeps its shape,
+        # and a repair round's appended lines are stamped the same way.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "thread.started", "thread_id": "th_1"},
+                        {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "a"}},
+                    ],
+                    "emit_every": 0.05,
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                    "exit": 0,
+                },
+                {
+                    "emit": [{"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "b"}}],
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                },
+            ]
+        )
+        started = datetime.now(timezone.utc)
+        report = run_attempt(
+            codex_spec(repair_rounds=1), "task", self.workdir,
+            validate=self.json_validator(), poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        lines = [
+            json.loads(line)
+            for name in ("codex.stdout.jsonl", "codex.repair.stdout.jsonl")
+            for line in (self.workdir / name).read_text().splitlines()
+        ]
+        self.assertEqual([l["type"] for l in lines], ["thread.started", "item.completed", "item.completed"])
+        stamps = [datetime.fromisoformat(l["timestamp"].replace("Z", "+00:00")) for l in lines]
+        self.assertTrue(all(started <= t <= datetime.now(timezone.utc) for t in stamps))
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertGreater(stamps[1] - stamps[0], timedelta(seconds=0.04))
+
+    def test_stamping_keeps_the_cli_own_timestamp_and_passes_text_through(self) -> None:
+        read_fd, write_fd = _os.pipe()
+        out = self.tmp / "capture.jsonl"
+        with out.open("wb") as sink, _os.fdopen(read_fd, "rb") as pipe:
+            capture = _StampedCapture(pipe, sink)
+            with _os.fdopen(write_fd, "wb") as writer:
+                writer.write(b'{"type": "x", "timestamp": "2026-01-01T00:00:00Z"}\n')
+                writer.write("plain text, not JSON — caf\u00e9\n".encode())
+                writer.write(b'["a list"]\n')
+                writer.write(b'{"type": "lone", "text": "\\ud800"}\n')  # a surrogate json.loads accepts
+                writer.write(b'{"type": "y"}')  # no trailing newline
+            capture.join()
+        lines = out.read_bytes().split(b"\n")
+        self.assertEqual(json.loads(lines[0])["timestamp"], "2026-01-01T00:00:00Z")
+        self.assertEqual(lines[1].decode(), "plain text, not JSON — café")
+        self.assertEqual(lines[2], b'["a list"]')
+        self.assertEqual(json.loads(lines[3])["text"], "\ud800")
+        self.assertIn("timestamp", json.loads(lines[4]))
+        self.assertEqual(lines[5], b"")
 
 
 class ClassificationTest(FakeCliCase):

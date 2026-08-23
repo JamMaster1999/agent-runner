@@ -37,13 +37,16 @@ What crosses the boundary from the project side:
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable
 
 from agent_runner import outcomes, util
 from agent_runner.harness import get_adapter
@@ -188,6 +191,56 @@ def _terminate(process: subprocess.Popen) -> None:
         process.wait()
 
 
+class _StampedCapture:
+    """The CLI's stdout, copied into the capture file one line at a time
+    with the wall clock of its arrival: every JSON line gets a
+    ``timestamp`` (the rollout transcripts' key, left alone where the CLI
+    already wrote one), everything else passes through verbatim. The
+    capture file keeps its shape — the tail, the replay fixtures, and the
+    log scanners read it exactly as before — and the dashboard no longer
+    has to guess when a line happened.
+
+    The reader always drains the pipe to EOF, so the CLI can never block on
+    a full pipe: once the capture file is closed under it (the attempt is
+    over, a grandchild still holds stdout) it discards what follows."""
+
+    def __init__(self, pipe: IO[bytes], out: IO[bytes]) -> None:
+        self._pipe = pipe
+        self._out: IO[bytes] | None = out
+        self._thread = threading.Thread(target=self._copy, name="stamped-capture", daemon=True)
+        self._thread.start()
+
+    def _copy(self) -> None:
+        with self._pipe:
+            for raw in self._pipe:
+                out = self._out
+                if out is None:
+                    continue
+                line = raw.rstrip(b"\n")
+                payload = parse_json_dict(line.decode("utf-8", errors="replace"))
+                if payload is not None:
+                    payload.setdefault(
+                        "timestamp",
+                        datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    )
+                    line = json.dumps(payload).encode()
+                try:
+                    out.write(line + b"\n")
+                    out.flush()
+                except ValueError:
+                    self._out = None
+
+    def join(self) -> None:
+        """Wait for the pipe to drain after the CLI exits — bounded, since a
+        grandchild that inherited stdout can hold the pipe open after it,
+        and waited for once: a second call after a timeout returns at once."""
+        if self._out is None:
+            return
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            self._out = None
+
+
 class _HookDrain:
     """Tail the harness hook log and convert this attempt's newly captured
     events to StreamEvents. The log is shared O_APPEND across parallel
@@ -298,7 +351,7 @@ def _repair(
         # multi-round failure must keep every round's log for debugging.
         with (
             prompt_path.open("rb") as stdin,
-            followup.stdout_path.open("a") as stdout,
+            followup.stdout_path.open("ab") as stdout,
             followup.stderr_path.open("a") as stderr,
         ):
             process = subprocess.Popen(
@@ -307,9 +360,10 @@ def _repair(
                 env=env,
                 stdin=stdin,
                 preexec_fn=_preexec(),
-                stdout=stdout,
+                stdout=subprocess.PIPE,
                 stderr=stderr,
             )
+            capture = _StampedCapture(process.stdout, stdout)
             try:
                 deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
                 while process.poll() is None:
@@ -320,6 +374,7 @@ def _repair(
                     time.sleep(poll_seconds)
             finally:
                 _terminate(process)
+                capture.join()
     except OSError:
         return False
     finally:
@@ -500,7 +555,7 @@ def run_attempt(
         # so a CLI that never drains stdin wedges nothing on this side.
         with (
             prompt_path.open("rb") as stdin,
-            spawn.stdout_path.open("w") as stdout,
+            spawn.stdout_path.open("wb") as stdout,
             spawn.stderr_path.open("w") as stderr,
         ):
             try:
@@ -510,7 +565,7 @@ def run_attempt(
                     env=env,
                     stdin=stdin,
                     preexec_fn=_preexec(),
-                    stdout=stdout,
+                    stdout=subprocess.PIPE,
                     stderr=stderr,
                 )
             except OSError as exc:
@@ -519,6 +574,7 @@ def run_attempt(
                 return _spawn_report(
                     spec, f"failed to spawn {adapter.display_name}: {exc}"
                 )
+            capture = _StampedCapture(process.stdout, stdout)
             try:
                 timeout = float(
                     timeout_minutes
@@ -570,11 +626,13 @@ def run_attempt(
                         )
                         return report
                     time.sleep(poll_seconds)
-                drain_streams()
             finally:
                 # Never leak a live agent child: any exit from this block —
                 # cancellation, telemetry crash, KeyboardInterrupt — reaps it.
+                # Then let its last lines land and read them, on every path.
                 _terminate(process)
+                capture.join()
+                drain_streams()
 
         verdict = validate(workdir) if validate is not None else None
 
