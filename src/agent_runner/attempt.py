@@ -198,17 +198,24 @@ class _StampedCapture:
     already wrote one), everything else passes through verbatim. The
     capture file keeps its shape — the tail, the replay fixtures, and the
     log scanners read it exactly as before — and the dashboard no longer
-    has to guess when a line happened."""
+    has to guess when a line happened.
+
+    The reader always drains the pipe to EOF, so the CLI can never block on
+    a full pipe: once the capture file is closed under it (the attempt is
+    over, a grandchild still holds stdout) it discards what follows."""
 
     def __init__(self, pipe: IO[bytes], out: IO[bytes]) -> None:
         self._pipe = pipe
-        self._out = out
+        self._out: IO[bytes] | None = out
         self._thread = threading.Thread(target=self._copy, name="stamped-capture", daemon=True)
         self._thread.start()
 
     def _copy(self) -> None:
-        try:
+        with self._pipe:
             for raw in self._pipe:
+                out = self._out
+                if out is None:
+                    continue
                 line = raw.rstrip(b"\n")
                 payload = parse_json_dict(line.decode("utf-8", errors="replace"))
                 if payload is not None:
@@ -216,18 +223,22 @@ class _StampedCapture:
                         "timestamp",
                         datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     )
-                    line = json.dumps(payload, ensure_ascii=False).encode()
-                self._out.write(line + b"\n")
-                self._out.flush()
-        except ValueError:
-            # The capture file closed under us: the attempt is over and a
-            # grandchild is still holding the pipe. Nothing left to keep.
-            return
+                    line = json.dumps(payload).encode()
+                try:
+                    out.write(line + b"\n")
+                    out.flush()
+                except ValueError:
+                    self._out = None
 
     def join(self) -> None:
         """Wait for the pipe to drain after the CLI exits — bounded, since a
-        grandchild that inherited stdout can hold the pipe open after it."""
+        grandchild that inherited stdout can hold the pipe open after it,
+        and waited for once: a second call after a timeout returns at once."""
+        if self._out is None:
+            return
         self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            self._out = None
 
 
 class _HookDrain:
@@ -615,14 +626,13 @@ def run_attempt(
                         )
                         return report
                     time.sleep(poll_seconds)
-                # The CLI is gone; let its last lines land before the last read.
-                capture.join()
-                drain_streams()
             finally:
                 # Never leak a live agent child: any exit from this block —
                 # cancellation, telemetry crash, KeyboardInterrupt — reaps it.
+                # Then let its last lines land and read them, on every path.
                 _terminate(process)
                 capture.join()
+                drain_streams()
 
         verdict = validate(workdir) if validate is not None else None
 

@@ -266,14 +266,16 @@ class StampedCaptureTest(FakeCliCase):
                 writer.write(b'{"type": "x", "timestamp": "2026-01-01T00:00:00Z"}\n')
                 writer.write("plain text, not JSON — caf\u00e9\n".encode())
                 writer.write(b'["a list"]\n')
+                writer.write(b'{"type": "lone", "text": "\\ud800"}\n')  # a surrogate json.loads accepts
                 writer.write(b'{"type": "y"}')  # no trailing newline
             capture.join()
         lines = out.read_bytes().split(b"\n")
         self.assertEqual(json.loads(lines[0])["timestamp"], "2026-01-01T00:00:00Z")
         self.assertEqual(lines[1].decode(), "plain text, not JSON — café")
         self.assertEqual(lines[2], b'["a list"]')
-        self.assertIn("timestamp", json.loads(lines[3]))
-        self.assertEqual(lines[4], b"")
+        self.assertEqual(json.loads(lines[3])["text"], "\ud800")
+        self.assertIn("timestamp", json.loads(lines[4]))
+        self.assertEqual(lines[5], b"")
 
 
 class ClassificationTest(FakeCliCase):
