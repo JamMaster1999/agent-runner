@@ -12,20 +12,15 @@ before any resume the caller verifies each stamp against the run's term —
 match resumes, mismatch discards loudly and runs fresh. Any failure costs
 time, never correctness.
 
-A folder lives on one worker's disk, so the optional state mirror
-(``agent_runner.state``) carries it between hosts: ``pull_checkpoints``
-before the stamps are verified, ``push_checkpoints`` after an attempt
-stamped them. With no mirror configured both are no-ops.
+A folder lives under the sandbox's workspace, so ``agent_runner.workspace``
+carries it between sandboxes with everything else the child wrote.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
-
-from agent_runner import state
 
 TERM_STAMP_KEY = "term"
 
@@ -104,46 +99,3 @@ def verify_or_discard(directory: Path, term: str) -> list[Path]:
                 file=sys.stderr,
             )
     return matching
-
-
-def checkpoint_group(directory: Path) -> str:
-    """One checkpoint folder's key prefix in the state mirror: its own
-    absolute path. The path already carries every scope its caller gave the
-    folder (run, child, term) and every worker mounts the volume at the same
-    place, so the path IS the identity — there is no second naming scheme to
-    keep in sync with the first."""
-    parts = [
-        state.key_segment(part)
-        for part in Path(directory).parts
-        if part not in (os.sep, "/")
-    ]
-    return "/".join(["checkpoints", *parts])
-
-
-def push_checkpoints(directory: Path) -> None:
-    """Mirror a checkpoint folder after the attempt that stamped it. Files
-    only, one key each, top level only — exactly the set the term-stamp gate
-    verifies."""
-    mirror = state.active_mirror()
-    if mirror is None:
-        return
-    directory = Path(directory)
-    if not directory.is_dir():
-        return
-    mirror.push(
-        checkpoint_group(directory),
-        directory,
-        [path for path in sorted(directory.iterdir()) if path.is_file()],
-    )
-
-
-def pull_checkpoints(directory: Path) -> None:
-    """Bring other workers' stamps here before the term-stamp gate reads
-    them, so verification judges the run's whole progress and not just this
-    host's share of it."""
-    mirror = state.active_mirror()
-    if mirror is None:
-        return
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    mirror.pull(checkpoint_group(directory), directory)

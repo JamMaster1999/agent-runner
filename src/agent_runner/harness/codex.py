@@ -2,7 +2,7 @@
 Binary fallbacks, the `-c dotted.key=value` agent-config flattening,
 exec/resume/followup command shapes, thread extraction, the exec-v1
 subagent hook quirk, the error-report dialect, terminal markers, and the
-volume-backed credential model — the runner core never spells this CLI's
+credential-file model — the runner core never spells this CLI's
 name.
 
 Agent configuration is DATA (``spec.agent_config``): the adapter never
@@ -168,6 +168,31 @@ def codex_exec_command(
     return parts
 
 
+def sandbox_credential(auth_json: str) -> str:
+    """The credential a sandbox receives: the operator's ``auth.json`` with
+    the refresh token blanked. The CLI's parser demands all four token
+    fields and validates the id_token's shape, so both real tokens ship;
+    an empty ``refresh_token`` is accepted and cannot rotate anything —
+    fifty sandboxes on one login can no longer log each other out
+    (``codex exec`` never refreshes; spikes 4 and 9)."""
+    try:
+        data = json.loads(auth_json)
+        tokens = data["tokens"]
+        for name in ("id_token", "access_token", "account_id"):
+            if not tokens[name]:
+                raise KeyError(name)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RunnerError(
+            f"CODEX_AUTH_JSON is not a ChatGPT-login auth.json (tokens.id_token, "
+            f"access_token, account_id required): {exc}",
+            code="auth",
+            retryable=False,
+            alert=True,
+        ) from exc
+    tokens["refresh_token"] = ""
+    return json.dumps(data)
+
+
 class CodexAdapter(HarnessAdapter):
     """The Codex CLI (`codex exec --json`, prompt on stdin)."""
 
@@ -190,11 +215,10 @@ class CodexAdapter(HarnessAdapter):
         COMMON_TERMINAL_MARKERS
     )
 
-    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
-        """CODEX_HOME on the volume; auth.json seeded once from the
-        CODEX_AUTH_JSON environment value (a Modal-style secret), mode 0600.
-        Refreshed tokens the CLI writes back land on the volume."""
-        home = Path(volume_root) / "codex-home"
+    def prepare_home(self, root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """CODEX_HOME under the workspace root; auth.json seeded once from
+        the CODEX_AUTH_JSON environment value, mode 0600."""
+        home = Path(root) / "codex-home"
         home.mkdir(parents=True, exist_ok=True)
         seed = env.get("CODEX_AUTH_JSON")
         if seed:
@@ -259,21 +283,20 @@ class CodexAdapter(HarnessAdapter):
         # CLI auth/home names the filtered agent env must inherit.
         return ("CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "RUNNER_CODEX_CLI")
 
-    def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
-        if payload.get("type") == "thread.started":
-            return payload.get("thread_id") or None
-        return None
-
-    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
+    def session_present(self, session_ref: str) -> bool:
         """Rollout transcripts live date-nested under CODEX_HOME:
         ``sessions/YYYY/MM/DD/rollout-<timestamp>-<thread>.jsonl``. The date
         is the CLI's, not ours, so the thread is matched by glob."""
         home = os.environ.get("CODEX_HOME")
         if not home:
-            return None
-        home_path = Path(home)
+            return True
         pattern = f"sessions/*/*/*/rollout-*{glob.escape(session_ref)}*.jsonl"
-        return home_path, sorted(home_path.glob(pattern))
+        return any(Path(home).glob(pattern))
+
+    def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
+        if payload.get("type") == "thread.started":
+            return payload.get("thread_id") or None
+        return None
 
     def stream_parser(self) -> CodexStreamParser:
         return CodexStreamParser()
@@ -326,6 +349,3 @@ class CodexAdapter(HarnessAdapter):
         if kind == "error":
             return f"codex error: {payload.get('message') or ''}".strip()
         return None
-
-    def orphan_patterns(self) -> list[str]:
-        return ["codex exec"]

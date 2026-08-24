@@ -14,8 +14,7 @@ Temporal-facing mechanics of one CLI attempt:
   details as ``attempts``
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
-  resume (mismatch: discard, log loudly, run fresh), and mirrored after
-  the attempt when a state mirror is configured
+  resume (mismatch: discard, log loudly, run fresh)
 - graceful cancellation: a cancelled activity terminates and reaps the CLI
   before the cancellation propagates
 - the ruled outcome-to-retry mapping on the way out (retry.py)
@@ -94,6 +93,7 @@ class _HeartbeatState:
     usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     session_usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    sandbox: str | None = None      # the sandbox the attempt runs in (the sandboxed wrapper)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
@@ -107,6 +107,7 @@ class _HeartbeatState:
                 "usage": dict(self.usage),
                 "session_usage": dict(self.session_usage),
                 "attempts": list(self.attempts),
+                "sandbox": self.sandbox,
             }
 
     def record(self, entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -287,10 +288,7 @@ async def run_agent_attempt(
     if checkpoint is not None:
         # Prepared before spawn; verified before ANY resume of work in it.
         # A stamp from another term is discarded loudly and the run is fresh
-        # for whatever was lost — time, never correctness. The mirror pull
-        # runs first so the gate judges the run's whole progress, including
-        # the attempts that ran on other hosts.
-        workdirs.pull_checkpoints(checkpoint.directory)
+        # for whatever was lost — time, never correctness.
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
 
     def on_event(event: StreamEvent) -> None:
@@ -345,6 +343,7 @@ async def run_agent_attempt(
             resources=resources,
             timeout_minutes=timeout_minutes,
             should_stop=stop.is_set,
+            watch_dirs=(checkpoint.directory,) if checkpoint is not None else (),
         )
     )
     try:
@@ -369,11 +368,6 @@ async def run_agent_attempt(
         # The last word always lands: the final state (session_ref for the
         # next attempt's resume) is heartbeat-recorded even on failure.
         activity.heartbeat(state.payload())
-        if checkpoint is not None:
-            # A failed attempt still stamped whatever it finished; mirroring
-            # here is what lets the next attempt claim that work from any
-            # host.
-            workdirs.push_checkpoints(checkpoint.directory)
 
     if report.outcome == outcomes.VALID:
         return report

@@ -1,7 +1,7 @@
 """Claude Code harness adapter: every claude-CLI-specific behavior in one
 module. Spawn/resume command shapes, session extraction, the 5-hook map,
 the error-report dialect, terminal markers, env quirks, and the
-volume-backed credential model — the runner core never spells this CLI's
+credential-file model — the runner core never spells this CLI's
 name.
 
 The Claude dialect is file-based: agents spawn by name from a rendered
@@ -76,13 +76,13 @@ class ClaudeCodeAdapter(HarnessAdapter):
         COMMON_TERMINAL_MARKERS
     )
 
-    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
-        """CLAUDE_CONFIG_DIR on the volume (config, credentials, and session
-        transcripts live under it); the credentials file seeded once from
+    def prepare_home(self, root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """CLAUDE_CONFIG_DIR under the workspace root (config, credentials,
+        and session transcripts live under it); the credentials file seeded once from
         the CLAUDE_CREDENTIALS_JSON environment value when supplied. A
         CLAUDE_CODE_OAUTH_TOKEN riding the environment is re-exported
         normalized so a wrapped paste never reaches the CLI."""
-        home = Path(volume_root) / "claude-home"
+        home = Path(root) / "claude-home"
         home.mkdir(parents=True, exist_ok=True)
         seed = env.get("CLAUDE_CREDENTIALS_JSON")
         if seed:
@@ -221,23 +221,19 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "RUNNER_CLAUDE_CLI",
         )
 
+    def session_present(self, session_ref: str) -> bool:
+        """One transcript per session under CLAUDE_CONFIG_DIR, in a folder
+        named after the cwd it ran in:
+        ``projects/<escaped-project-path>/<session_id>.jsonl``."""
+        home = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not home:
+            return True
+        return any(Path(home).glob(f"projects/*/{glob.escape(session_ref)}.jsonl"))
+
     def session_ref_from_event(self, payload: dict[str, Any]) -> str | None:
         # Every claude --print stream-json event carries session_id.
         session_id = payload.get("session_id")
         return str(session_id) if session_id else None
-
-    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
-        """One transcript per session under CLAUDE_CONFIG_DIR, in a folder
-        named after the cwd it ran in:
-        ``projects/<escaped-project-path>/<session_id>.jsonl``. The folder
-        name is the CLI's own escaping, so it is matched by glob and
-        restored under the name it was written with."""
-        home = os.environ.get("CLAUDE_CONFIG_DIR")
-        if not home:
-            return None
-        home_path = Path(home)
-        pattern = f"projects/*/{glob.escape(session_ref)}.jsonl"
-        return home_path, sorted(home_path.glob(pattern))
 
     def stream_parser(self) -> ClaudeStreamParser:
         return ClaudeStreamParser()
@@ -320,6 +316,3 @@ class ClaudeCodeAdapter(HarnessAdapter):
             detail = str(payload.get("result") or payload.get("error") or "")
             return f"claude result {subtype}: {detail}".strip()
         return None
-
-    def orphan_patterns(self) -> list[str]:
-        return ["claude"]

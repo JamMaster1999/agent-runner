@@ -12,9 +12,12 @@ timeout, on a stall, on cancellation, and on any exception crossing the
 loop — so a dead attempt can never leave a live agent burning provider
 budget, and heavy memory dies with the process.
 
-Liveness is measured as OUTPUT, not as a running process: a CLI that goes
-silent for the stall window is terminated and the attempt ends ``stalled``
-(see ``_stall_seconds``).
+Liveness is measured as WORK, not as a running process: a CLI that
+neither streams a line nor writes a file under the watched folders for the
+stall window is terminated and the attempt ends ``stalled`` (see
+``_stall_seconds``). A CLI tree whose resident memory crosses the fuse
+(``Policy.rss_limit_mb``) is terminated too — one runaway must never take
+the sandbox and every sibling in it.
 
 What crosses the boundary from the project side:
 
@@ -46,7 +49,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Any, Callable
+from typing import IO, Any, Callable, Sequence
 
 from agent_runner import outcomes, util
 from agent_runner.harness import get_adapter
@@ -54,12 +57,7 @@ from agent_runner.harness.base import AgentDef, HarnessAdapter
 from agent_runner.harness.stream import JsonlTail, StreamEvent, parse_json_dict
 from agent_runner.isolation import agent_env
 from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Verdict
-from agent_runner.sessions import (
-    RESUME_PREAMBLE,
-    LiveSessionMirror,
-    ensure_session_local,
-    push_session,
-)
+from agent_runner.sessions import RESUME_PREAMBLE
 from agent_runner.templates import substitute
 from agent_runner.util import write_text
 
@@ -70,6 +68,10 @@ REPAIR_TIMEOUT_MINUTES = 15.0
 # about 3.6 minutes, so the window is 4x the typical worst: wide enough for
 # a slow model call, narrow enough to catch a wedge inside a quarter hour.
 DEFAULT_STALL_SECONDS = 900.0
+# The file-activity walk is bounded so a huge folder can never turn the
+# watchdog into the stall; a Chrome profile alone is thousands of files.
+SCAN_CAP = 4096
+RSS_CHECK_SECONDS = 10.0
 
 # Adapter evidence codes -> the outcome vocabulary: one alias, outcome words
 # pass through, anything unproven is infra by definition.
@@ -131,27 +133,6 @@ def _pdeathsig() -> Callable[[], None] | None:
     return _set
 
 
-def _cpu_affinity() -> Callable[[], None] | None:
-    """Linux: AGENT_RUNNER_AGENT_CPUS=N pins the spawned CLI to cores
-    0..N-1, so its runtime sizes thread pools to N instead of every
-    visible core. The workload is network-bound; on a big host each CLI
-    otherwise idles 40+ threads, and a container's task cap dies at a few
-    dozen agents. Unset, invalid, or elsewhere: None — behavior unchanged."""
-    if sys.platform != "linux":
-        return None
-    try:
-        cpus = int(os.environ.get("AGENT_RUNNER_AGENT_CPUS", ""))
-    except ValueError:
-        return None
-    if cpus <= 0:
-        return None
-
-    def _set() -> None:
-        os.sched_setaffinity(0, range(cpus))
-
-    return _set
-
-
 def _stall_seconds(spec: RunSpec) -> float:
     """The stall window: how long the CLI may produce NOTHING before the
     runner calls it dead. The spec's policy when the caller said, else
@@ -170,17 +151,70 @@ def _stall_seconds(spec: RunSpec) -> float:
 
 
 def _preexec() -> Callable[[], None] | None:
-    """Everything the CLI child runs between fork and exec: PDEATHSIG,
-    then the optional CPU clamp."""
-    hooks = [hook for hook in (_pdeathsig(), _cpu_affinity()) if hook is not None]
-    if not hooks:
+    """What the CLI child runs between fork and exec: PDEATHSIG."""
+    return _pdeathsig()
+
+
+def newest_mtime(roots: Sequence[Path]) -> float | None:
+    """The newest mtime under ``roots`` (bounded walk), or None when the
+    trees are empty or unreadable."""
+    newest: float | None = None
+    seen = 0
+    frontier = [Path(root) for root in roots]
+    while frontier and seen < SCAN_CAP:
+        folder = frontier.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen >= SCAN_CAP:
+                        break
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if newest is None or mtime > newest:
+                        newest = mtime
+                    if entry.is_dir(follow_symlinks=False):
+                        frontier.append(Path(entry.path))
+        except OSError:
+            continue
+    return newest
+
+
+def tree_rss_mb(pid: int) -> float | None:
+    """Resident memory of ``pid`` and every descendant, from ``/proc``;
+    None where ``/proc`` says nothing (not Linux, or a kernel that reports
+    no VmRSS) — never a zero that reads as "fine"."""
+    proc = Path("/proc")
+    if not proc.is_dir():
         return None
-
-    def _run() -> None:
-        for hook in hooks:
-            hook()
-
-    return _run
+    parents: dict[int, int] = {}
+    rss: dict[int, int] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        fields = dict(
+            line.split(":", 1) for line in status.splitlines() if ":" in line
+        )
+        try:
+            parents[int(entry.name)] = int(fields.get("PPid", "0").strip())
+            rss[int(entry.name)] = int(fields["VmRSS"].split()[0])
+        except (KeyError, ValueError, IndexError):
+            continue
+    if pid not in rss:
+        return None
+    total = 0
+    frontier = [pid]
+    while frontier:
+        current = frontier.pop()
+        total += rss.get(current, 0)
+        frontier.extend(child for child, parent in parents.items() if parent == current)
+    return total / 1024
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -268,7 +302,7 @@ class _HookDrain:
                 continue
             if (
                 event.get("run_id") != self.run_id
-                or event.get("job_stable_id") != self.spec.key
+                or event.get("key") != self.spec.key
             ):
                 continue
             try:
@@ -409,6 +443,7 @@ def run_attempt(
     timeout_minutes: float | None = None,
     poll_seconds: float = 2.0,
     should_stop: Callable[[], bool] | None = None,
+    watch_dirs: Sequence[Path] = (),
 ) -> AttemptReport:
     """Run one CLI attempt and end it with exactly one outcome.
 
@@ -421,8 +456,9 @@ def run_attempt(
     stood before this attempt (the prior attempt's ``report.session_usage``),
     so ``report.session_usage`` can carry the session's whole total.
     ``should_stop`` polled true terminates the CLI and raises
-    ``AttemptCancelled``. A CLI that stops producing for the stall window
-    is terminated too, ending the attempt ``stalled``.
+    ``AttemptCancelled``. A CLI that neither streams nor writes a file
+    under the workdir or ``watch_dirs`` for the stall window is terminated
+    too, ending the attempt ``stalled``.
 
     Configuration errors (an unknown harness, an unrenderable agent, a
     malformed template) RAISE — they are caller bugs, not attempt outcomes.
@@ -461,12 +497,6 @@ def run_attempt(
     resources = resources or {}
     process: subprocess.Popen | None = None
     report: AttemptReport | None = None
-    # Whichever session the CLI is actually in: the one it opened, else
-    # the one it was asked to resume.
-    live_mirror = LiveSessionMirror(
-        adapter, lambda: report.session_ref if report is not None else session_ref
-    )
-    live_mirror.start()
     try:
         for resource_spec in spec.resource_specs:
             provider = resources.get(resource_spec.get("kind"))
@@ -484,10 +514,14 @@ def run_attempt(
         prompt = substitute(
             task, runner_variables(run_id, spec.key, attempt, workdir, resource_variables)
         )
-        if session_ref and not ensure_session_local(adapter, session_ref):
-            # The transcript exists on no worker and in no mirror, so the
-            # CLI has nothing to reopen: run fresh rather than spend the
-            # attempt on a resume that cannot land.
+        if session_ref and not adapter.session_present(session_ref):
+            # Nothing to reopen on this host: run fresh rather than spend
+            # the attempt on a resume that cannot land.
+            print(
+                f"WARNING: {adapter.session_noun} {session_ref} is not in this "
+                f"host's {adapter.display_name} home; running fresh.",
+                file=sys.stderr,
+            )
             session_ref = None
         if session_ref:
             preamble = spec.policy.resume_preamble
@@ -597,6 +631,9 @@ def run_attempt(
                 deadline = time.monotonic() + timeout * 60
                 stall_seconds = _stall_seconds(spec)
                 last_output = time.monotonic()
+                watched = (workdir, *watch_dirs)
+                last_write = newest_mtime(watched)
+                next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                 while process.poll() is None:
                     if drain_streams():
                         last_output = time.monotonic()
@@ -619,7 +656,28 @@ def run_attempt(
                             f"waiting for {adapter.display_name}"
                         )
                         return report
+                    if spec.policy.rss_limit_mb and time.monotonic() > next_rss_check:
+                        next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
+                        resident = tree_rss_mb(process.pid)
+                        if resident is not None and resident > spec.policy.rss_limit_mb:
+                            _terminate(process)
+                            report.outcome = outcomes.INFRA
+                            report.error = (
+                                f"{spec.key}: memory fuse — the {adapter.display_name} "
+                                f"process tree reached {resident:.0f} MB "
+                                f"(limit {spec.policy.rss_limit_mb} MB)"
+                            )
+                            return report
                     if stall_seconds and time.monotonic() - last_output > stall_seconds:
+                        # Silent is not the same as dead: a long shell
+                        # command streams nothing and still writes files.
+                        # Any write under the watched folders since the
+                        # last look is proof of work and restarts the clock.
+                        written = newest_mtime(watched)
+                        if written is not None and (last_write is None or written > last_write):
+                            last_write = written
+                            last_output = time.monotonic()
+                            continue
                         # Alive is not producing: a CLI whose helper died
                         # under it holds its process open and streams
                         # nothing, and a heartbeat that watches the process
@@ -630,7 +688,7 @@ def run_attempt(
                         report.outcome = outcomes.STALLED
                         report.error = (
                             f"{spec.key}: {adapter.display_name} produced no output "
-                            f"for {stall_seconds:g} seconds while still running"
+                            f"and wrote no file for {stall_seconds:g} seconds while still running"
                         )
                         report.detail = adapter.error_report(
                             spawn.stdout_path, spawn.stderr_path
@@ -711,9 +769,3 @@ def run_attempt(
                 resource.close()
             except Exception:
                 pass
-        # The CLI is reaped, so its transcript is final: mirror it on every
-        # exit path (valid, failed, cancelled) — a lost attempt is exactly
-        # the one whose session the next attempt wants.
-        live_mirror.stop()
-        if report is not None and report.session_ref:
-            push_session(adapter, report.session_ref)

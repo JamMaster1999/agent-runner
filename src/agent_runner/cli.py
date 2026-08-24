@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The `agent-runner` CLI: the hook-capture shim.
+"""The `agent-runner` CLI: the hook-capture shim and the sandbox keeper.
 
-The platform verbs (emit / requeue / migrate) died with the platform half
-at the stage-3 carve-out — there is no job store to serve. What remains is
-the one process boundary the CLIs themselves call: committed hook configs
-run ``agent-runner hook <provider>`` (or ``python3 -m agent_runner hook
-<provider>``), which captures one provider hook event from stdin into the
-harness's local event log for the attempt loop to drain.
+Two process boundaries: committed hook configs run ``agent-runner hook
+<provider>`` (or ``python3 -m agent_runner hook <provider>``), which
+captures one provider hook event from stdin into the harness's local
+event log for the attempt loop to drain; and a sandbox's entrypoint runs
+``python3 -m agent_runner keeper``, which keeps the workspace in S3 for
+as long as the sandbox lives (``agent_runner.workspace``).
 
 ``hook`` is advisory at the process boundary: an internal failure (capture
 crash, unwritable state dir) logs to stderr and exits 0, because it runs
@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
+
+from agent_runner.workspace import DEFAULT_CHECKPOINT_SECONDS
 
 
 # The JSON hook-output contract: providers that parse hook stdout (the
@@ -49,6 +52,12 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_keeper(args: argparse.Namespace) -> int:
+    from agent_runner.workspace import main
+
+    return main(args.root, args.every)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-runner",
@@ -65,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Harness provider name; dispatches to agent_runner.harness.<provider>_hook_event",
     )
     hook.set_defaults(handler=cmd_hook)
+
+    keeper = subparsers.add_parser(
+        "keeper",
+        help="The sandbox entrypoint: prepare the workspace, checkpoint it to S3 until released.",
+    )
+    keeper.add_argument("--root", type=Path, default=None, help="the workspace root (default: AGENT_RUNNER_WORKSPACE)")
+    keeper.add_argument("--every", type=float, default=DEFAULT_CHECKPOINT_SECONDS, help="seconds between checkpoints")
+    keeper.set_defaults(handler=cmd_keeper)
     return parser
 
 

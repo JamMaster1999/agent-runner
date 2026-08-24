@@ -9,6 +9,7 @@ models behind ``sessions.prepare_session_homes``.
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -113,3 +114,39 @@ class PrepareSessionHomesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SandboxCredentialTest(unittest.TestCase):
+    """The credential a sandbox receives: the operator's login minus the
+    one token that could rotate it (spikes 4 and 9)."""
+
+    AUTH = {
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": "eyJ.id.token",
+            "access_token": "eyJ.access.token",
+            "refresh_token": "rt-ROTATES-EVERYONE",
+            "account_id": "acct_1",
+        },
+        "last_refresh": "2026-08-24T00:00:00Z",
+    }
+
+    def test_blanks_the_refresh_token_and_ships_the_rest(self) -> None:
+        from agent_runner.harness.codex import sandbox_credential
+
+        shipped = json.loads(sandbox_credential(json.dumps(self.AUTH)))
+        self.assertEqual(shipped["tokens"]["refresh_token"], "")
+        self.assertEqual(shipped["tokens"]["id_token"], "eyJ.id.token")
+        self.assertEqual(shipped["tokens"]["access_token"], "eyJ.access.token")
+        self.assertEqual(shipped["tokens"]["account_id"], "acct_1")
+        self.assertNotIn("ROTATES", sandbox_credential(json.dumps(self.AUTH)))
+
+    def test_rejects_anything_but_a_chatgpt_login(self) -> None:
+        from agent_runner.harness.codex import sandbox_credential
+        from agent_runner.runtime import RunnerError
+
+        for bad in ("not json", '{"OPENAI_API_KEY": "sk-x"}', '{"tokens": {"id_token": "", "access_token": "a", "account_id": "b"}}'):
+            with self.assertRaises(RunnerError) as caught:
+                sandbox_credential(bad)
+            self.assertEqual(caught.exception.code, "auth")
+            self.assertFalse(caught.exception.retryable)

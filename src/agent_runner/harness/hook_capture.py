@@ -60,14 +60,14 @@ def attribution() -> dict[str, Any] | None:
     fired inside; None for interactive sessions in the repo (not
     orchestrator-launched — the capture script ignores them)."""
     run_id = env_value("RUNNER_RUN_ID")
-    job_stable_id = env_value("RUNNER_JOB_KEY")
-    if not run_id or not job_stable_id:
+    key = env_value("RUNNER_JOB_KEY")
+    if not run_id or not key:
         return None
     return {
         "run_id": run_id,
-        "job_stable_id": job_stable_id,
+        "key": key,
         "attempt": env_int("RUNNER_ATTEMPT"),
-        "phase": env_value("RUNNER_PHASE"),
+        "task_type": env_value("RUNNER_TASK_TYPE"),
         "backend": env_value("RUNNER_BACKEND"),
         "output_path": env_value("RUNNER_OUTPUT_PATH"),
     }

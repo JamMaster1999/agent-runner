@@ -18,3 +18,9 @@ Provider contract (duck-typed, no base class needed):
 """
 
 from agent_runner.resources.cdp_browser import CdpBrowserProvider  # noqa: F401
+
+
+def providers() -> dict[str, type]:
+    """Every provider by resource kind — what a request's ``resources``
+    names resolve to inside a sandbox."""
+    return {CdpBrowserProvider.kind: CdpBrowserProvider}
