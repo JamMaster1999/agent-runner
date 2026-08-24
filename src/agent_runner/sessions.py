@@ -15,14 +15,19 @@ A volume makes a session survive its worker; the optional state mirror
 (``agent_runner.state``) makes it survive its HOST, so a retry that lands
 anywhere can resume. ``push_session`` mirrors a transcript once the attempt
 that wrote it ends, and ``ensure_session_local`` fetches one back before a
-resume is attempted. With no mirror configured both are no-ops.
+resume is attempted. ``LiveSessionMirror`` repeats the same copy on a
+timer while the attempt runs, so a reader on another host (a dashboard)
+can follow the conversation as it happens. With no mirror configured all
+three are no-ops.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
+from typing import Callable
 
 from agent_runner import state
 from agent_runner.harness import registered_adapters
@@ -120,3 +125,67 @@ def ensure_session_local(adapter: HarnessAdapter, session_ref: str) -> bool:
         file=sys.stderr,
     )
     return False
+
+
+LIVE_MIRROR_SECONDS = 20.0
+
+
+class LiveSessionMirror:
+    """The running attempt's transcript, re-mirrored while it grows.
+
+    Each pass is the whole-file copy ``push_session`` makes at the end,
+    made only when a session file changed since the last pass; the CLI's
+    own file on local disk stays the working copy and is never touched.
+    A daemon thread does the waiting, so the attempt loop never blocks on
+    S3. ``stop`` joins it — the in-flight copy lands before the caller's
+    final push, so an older snapshot can never overwrite the final one.
+    """
+
+    def __init__(
+        self,
+        adapter: HarnessAdapter,
+        current_ref: Callable[[], str | None],
+        interval: float = LIVE_MIRROR_SECONDS,
+    ) -> None:
+        self.adapter = adapter
+        self.current_ref = current_ref
+        self.interval = interval
+        self._seen: tuple[tuple[str, int, int], ...] = ()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if state.active_mirror() is None:
+            return
+        self._thread = threading.Thread(target=self._run, name="session-mirror", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.tick()
+            except Exception as exc:  # telemetry never ends an attempt
+                print(f"WARNING: state mirror: live push failed: {exc}", file=sys.stderr)
+
+    def tick(self) -> None:
+        """One pass: push when the transcript changed since the last one."""
+        ref = self.current_ref()
+        if not ref:
+            return
+        located = self.adapter.session_state(ref)
+        if located is None:
+            return
+        _, files = located
+        try:
+            signature = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files)
+        except OSError:
+            return  # a file moved under us; the next pass sees the new shape
+        if signature and signature != self._seen:
+            push_session(self.adapter, ref)
+            self._seen = signature

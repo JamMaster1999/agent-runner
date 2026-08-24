@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -459,3 +460,51 @@ class MissingDependencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveSessionMirrorTest(MirrorCase):
+    """A running attempt's transcript reaches the mirror while it grows —
+    the same whole-file copy as the final push, made only when the file
+    changed, and never before the CLI has named its session."""
+
+    KEY = "fleet/sessions/codex/th_live/" + ROLLOUT.format(ref="th_live")
+
+    def test_each_change_is_pushed_and_an_unchanged_file_is_not(self) -> None:
+        adapter = get_adapter("codex")
+        home = self.codex_home("worker-a")
+        path = self.write_rollout(home, "th_live", "turn 1\n")
+        live = sessions.LiveSessionMirror(adapter, lambda: "th_live")
+        with mock.patch.object(self.s3, "upload_file", wraps=self.s3.upload_file) as upload:
+            live.tick()
+            live.tick()
+            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(self.s3.objects[self.KEY][0], b"turn 1\n")
+            path.write_text("turn 1\nturn 2\n")
+            live.tick()
+            self.assertEqual(upload.call_count, 2)
+            self.assertEqual(self.s3.objects[self.KEY][0], b"turn 1\nturn 2\n")
+
+    def test_no_session_yet_pushes_nothing(self) -> None:
+        adapter = get_adapter("codex")
+        self.codex_home("worker-a")
+        sessions.LiveSessionMirror(adapter, lambda: None).tick()
+        self.assertFalse(self.s3.objects)
+
+    def test_the_thread_runs_only_with_a_mirror_configured(self) -> None:
+        adapter = get_adapter("codex")
+        home = self.codex_home("worker-a")
+        self.write_rollout(home, "th_live", "turn 1\n")
+        live = sessions.LiveSessionMirror(adapter, lambda: "th_live", interval=0.01)
+        live.start()
+        for _ in range(200):
+            if self.KEY in self.s3.objects:
+                break
+            time.sleep(0.01)
+        live.stop()
+        self.assertEqual(self.s3.objects[self.KEY][0], b"turn 1\n")
+
+        with mock.patch.dict(_os.environ, {state.STATE_S3_ENV: ""}):
+            idle = sessions.LiveSessionMirror(adapter, lambda: "th_live", interval=0.01)
+            idle.start()
+            self.assertIsNone(idle._thread)
+            idle.stop()
