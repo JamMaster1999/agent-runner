@@ -188,7 +188,9 @@ def serve(
             pid.parent.mkdir(parents=True, exist_ok=True)
             pid.write_text(str(os.getpid()))
         if request.checkpoint:
-            workdirs.verify_or_discard(Path(request.checkpoint["directory"]), request.checkpoint["term"])
+            directory = Path(request.checkpoint["directory"])
+            directory.mkdir(parents=True, exist_ok=True)
+            workdirs.verify_or_discard(directory, request.checkpoint["term"])
         threading.Thread(target=tick, name="attempt-tick", daemon=True).start()
         report = run_attempt(
             request.spec,

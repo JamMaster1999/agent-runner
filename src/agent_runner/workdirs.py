@@ -36,12 +36,11 @@ def attempt_workdir(root: Path, name: str, attempt: int) -> Path:
 def checkpoint_dir(root: Path, child: str, term: str) -> Path:
     """THE one function that builds a checkpoint folder path; ``term`` is a
     required argument, so a term-less checkpoint path is unrepresentable.
-    The folder is created on first touch."""
+    Pure: a supervisor names the folder from outside the sandbox that
+    holds it; the attempt side creates it (``remote.serve``)."""
     if not term:
         raise ValueError("checkpoint_dir requires a non-empty term")
-    path = Path(root) / "checkpoints" / child / term
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return Path(root) / "checkpoints" / child / term
 
 
 def checkpoint_term(path: Path) -> str | None:

@@ -47,11 +47,12 @@ class CheckpointDirTest(unittest.TestCase):
             spring = workdirs.checkpoint_dir(Path(tmp), "scrape", "2027SPRING")
             self.assertEqual(fall, Path(tmp) / "checkpoints" / "scrape" / "2026FALL")
             self.assertNotEqual(fall, spring)
-            self.assertTrue(fall.is_dir())
+            self.assertFalse(fall.exists())  # pure: named from outside, created by the attempt side
 
 
 class TermStampVerificationTest(unittest.TestCase):
     def write_checkpoint(self, directory: Path, name: str, term: str | None) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
         payload = {"pages_done": 12}
         if term is not None:

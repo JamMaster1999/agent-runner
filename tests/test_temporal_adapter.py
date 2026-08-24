@@ -747,6 +747,7 @@ class ActivityRunTest(unittest.TestCase):
         from agent_runner import workdirs
 
         stale_dir = workdirs.checkpoint_dir(self.tmp / "vol", "scrape", "2027SPRING")
+        stale_dir.mkdir(parents=True)
         (stale_dir / "progress.json").write_text(
             json.dumps({"term": "2026FALL", "pages": 9})
         )
