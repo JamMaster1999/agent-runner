@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from agent_runner.runtime import RunnerError
-from agent_runner.workspace import WORKSPACE_ENV
+from agent_runner.workspace import READY_MARKER, RELEASE_MARKER, WORKSPACE_ENV, marker
 
 SANDBOX_GONE = "sandbox_gone"
 # Modal bills the greater of reserved and used, so the request stays tiny
@@ -304,6 +304,11 @@ class LocalExecutor(Executor):
         home = self.root / spec.name
         home.mkdir(parents=True, exist_ok=True)
         workspace = home / "work"
+        # The name's workspace survives between sandboxes (that is the local
+        # resume story); the last keeper's markers must not, or the opener
+        # reads a stale ready and the new keeper a stale release.
+        for name in (READY_MARKER, RELEASE_MARKER):
+            marker(workspace, name).unlink(missing_ok=True)
         env = {**os.environ, **spec.env, **spec.secrets, WORKSPACE_ENV: str(workspace)}
         with (home / "keeper.log").open("ab") as log:
             process = subprocess.Popen(

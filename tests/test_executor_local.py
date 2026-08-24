@@ -119,6 +119,17 @@ class LocalExecutorTest(unittest.TestCase):
         self.assertEqual(sandbox.poll(), 0)
         self.assertIn("released", self.keeper_log(sandbox))
 
+    def test_a_name_reopened_after_release_starts_clean(self) -> None:
+        first = self.create()
+        marker(first.workspace, RELEASE_MARKER).touch()
+        wait_for(self, lambda: first.poll() is not None)
+        second = self.create()  # same name, same workspace on disk
+        self.assertIsNone(second.poll())
+        self.assertFalse(marker(second.workspace, RELEASE_MARKER).exists())
+        proc = second.exec("true")
+        self.assertEqual(proc.wait(), 0)
+        self.assertIsNone(second.poll())
+
     def test_the_ttl_terminates(self) -> None:
         sandbox = self.create(name="short", ttl=1)
         wait_for(self, lambda: sandbox.poll() is not None, seconds=10)

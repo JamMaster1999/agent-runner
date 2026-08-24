@@ -115,7 +115,7 @@ class Workspace:
             return "fresh"
         for relative in files:
             target = self.root / relative
-            if state.is_denied(target.name) or not _inside(self.root, target):
+            if not _travels(relative) or not _inside(self.root, target):
                 continue
             try:
                 self.mirror.get_file(self.key(relative), target)
@@ -147,6 +147,15 @@ class Workspace:
         except Exception as exc:
             state.warn(f"manifest upload failed: {exc}")
         return pushed
+
+def _travels(relative: str) -> bool:
+    """The upload rule, applied to a manifest entry on the way back: never
+    the runner's own folders, never a name that says credential — in any
+    path component, so a planted ``auth.json/x`` cannot squat on the file
+    the login is seeded into."""
+    parts = Path(relative).parts
+    return bool(parts) and parts[0] not in (RUNNER_DIR, ATTEMPTS_DIR) and not any(state.is_denied(p) for p in parts)
+
 
 def _inside(root: Path, target: Path) -> bool:
     try:
