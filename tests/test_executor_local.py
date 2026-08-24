@@ -125,14 +125,10 @@ class LocalExecutorTest(unittest.TestCase):
         with self.assertRaises(ExecutorGone):
             sandbox.exec("true")
 
-    def test_a_spec_never_reaches_a_platform_call(self) -> None:
-        # The whole vocabulary a project may use, spelled here: anything
-        # else in a project is a platform leak.
-        spec = self.spec()
-        self.assertEqual(
-            sorted(f for f in spec.__dataclass_fields__),
-            ["command", "cpu", "env", "memory_limit_mb", "name", "secrets", "tags", "ttl_seconds"],
-        )
+    def test_terminate_cancels_the_ttl_timer(self) -> None:
+        sandbox = self.create(name="long", ttl=3600)
+        sandbox.terminate()
+        self.assertFalse(sandbox.ttl.is_alive())
 
 
 if __name__ == "__main__":

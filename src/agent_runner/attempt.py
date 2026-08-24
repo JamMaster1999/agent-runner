@@ -60,6 +60,7 @@ from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Ver
 from agent_runner.sessions import RESUME_PREAMBLE
 from agent_runner.templates import substitute
 from agent_runner.util import write_text
+from agent_runner.workspace import RUNNER_DIR
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
 REPAIR_TIMEOUT_MINUTES = 15.0
@@ -70,7 +71,6 @@ REPAIR_TIMEOUT_MINUTES = 15.0
 DEFAULT_STALL_SECONDS = 900.0
 # The file-activity walk is bounded so a huge folder can never turn the
 # watchdog into the stall; a Chrome profile alone is thousands of files.
-SCAN_CAP = 4096
 RSS_CHECK_SECONDS = 10.0
 
 # Adapter evidence codes -> the outcome vocabulary: one alias, outcome words
@@ -150,25 +150,21 @@ def _stall_seconds(spec: RunSpec) -> float:
     return configured if configured > 0 else DEFAULT_STALL_SECONDS
 
 
-def _preexec() -> Callable[[], None] | None:
-    """What the CLI child runs between fork and exec: PDEATHSIG."""
-    return _pdeathsig()
-
-
-def newest_mtime(roots: Sequence[Path]) -> float | None:
-    """The newest mtime under ``roots`` (bounded walk), or None when the
-    trees are empty or unreadable."""
+def newest_mtime(roots: Sequence[Path], skip: Sequence[Path] = ()) -> float | None:
+    """The newest mtime under ``roots``, or None when the trees are empty
+    or unreadable. ``skip`` names folders whose churn is not the agent's
+    work (the runner's own files, a browser profile)."""
+    skipped = {Path(folder) for folder in skip}
     newest: float | None = None
-    seen = 0
-    frontier = [Path(root) for root in roots]
-    while frontier and seen < SCAN_CAP:
+    frontier = [Path(root) for root in roots if Path(root) not in skipped]
+    while frontier:
         folder = frontier.pop()
         try:
             with os.scandir(folder) as entries:
                 for entry in entries:
-                    seen += 1
-                    if seen >= SCAN_CAP:
-                        break
+                    path = Path(entry.path)
+                    if path in skipped:
+                        continue
                     try:
                         mtime = entry.stat(follow_symlinks=False).st_mtime
                     except OSError:
@@ -176,7 +172,7 @@ def newest_mtime(roots: Sequence[Path]) -> float | None:
                     if newest is None or mtime > newest:
                         newest = mtime
                     if entry.is_dir(follow_symlinks=False):
-                        frontier.append(Path(entry.path))
+                        frontier.append(path)
         except OSError:
             continue
     return newest
@@ -398,7 +394,7 @@ def _repair(
                 cwd=util.project_root(),
                 env=env,
                 stdin=stdin,
-                preexec_fn=_preexec(),
+                preexec_fn=_pdeathsig(),
                 stdout=subprocess.PIPE,
                 stderr=stderr,
             )
@@ -542,7 +538,7 @@ def run_attempt(
 
         # Runner-private files live under .runner/, outside the agent's
         # output namespace, so a prompt file can never shadow an artifact.
-        prompt_path = workdir / ".runner" / "prompt.md"
+        prompt_path = workdir / RUNNER_DIR / "prompt.md"
         write_text(prompt_path, prompt)
         env = agent_env(adapter, spec, run_id, attempt, workdir)
         env.update(adapter.bind_credentials())
@@ -609,7 +605,7 @@ def run_attempt(
                     cwd=util.project_root(),
                     env=env,
                     stdin=stdin,
-                    preexec_fn=_preexec(),
+                    preexec_fn=_pdeathsig(),
                     stdout=subprocess.PIPE,
                     stderr=stderr,
                 )
@@ -631,8 +627,11 @@ def run_attempt(
                 deadline = time.monotonic() + timeout * 60
                 stall_seconds = _stall_seconds(spec)
                 last_output = time.monotonic()
+                # The agent's work, not the runner's own files or a
+                # browser profile rewriting itself.
                 watched = (workdir, *watch_dirs)
-                last_write = newest_mtime(watched)
+                unwatched = (workdir / RUNNER_DIR, *(resource.scratch() for resource in provisioned))
+                last_write = newest_mtime(watched, unwatched)
                 next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                 while process.poll() is None:
                     if drain_streams():
@@ -673,7 +672,7 @@ def run_attempt(
                         # command streams nothing and still writes files.
                         # Any write under the watched folders since the
                         # last look is proof of work and restarts the clock.
-                        written = newest_mtime(watched)
+                        written = newest_mtime(watched, unwatched)
                         if written is not None and (last_write is None or written > last_write):
                             last_write = written
                             last_output = time.monotonic()
@@ -742,7 +741,7 @@ def run_attempt(
             for round_number in range(1, spec.repair_rounds + 1):
                 repaired = _repair(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
-                    workdir / ".runner" / f"repair-{round_number}.md",
+                    workdir / RUNNER_DIR / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
                 )
                 if not repaired:

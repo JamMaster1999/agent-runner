@@ -76,13 +76,18 @@ class Workspace:
         self._pushed: dict[str, tuple[int, int]] = {}
 
     def key(self, relative: str) -> str:
+        assert self.mirror is not None
         return self.mirror.key(self.group, relative)
 
     def files(self) -> dict[str, tuple[int, int]]:
-        """Every file that travels: ``relative -> (size, mtime_ns)``."""
+        """Every file that travels: ``relative -> (size, mtime_ns)``. A file
+        that vanishes mid-walk (the CLI homes churn) is simply not there."""
         found: dict[str, tuple[int, int]] = {}
         for path in _walk(self.root):
-            stat = path.stat()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
             found[path.relative_to(self.root).as_posix()] = (stat.st_size, stat.st_mtime_ns)
         return found
 
@@ -193,7 +198,7 @@ def keeper(root: Path, group: str, every: float, stop: threading.Event) -> int:
     return 0
 
 
-def main(root: Path | None, every: float) -> int:
+def keeper_main(root: Path | None, every: float) -> int:
     """``agent-runner keeper``: the process behind ``keeper``. The root
     defaults to what the executor handed this sandbox; SIGTERM releases."""
     group = os.environ.get(GROUP_ENV)

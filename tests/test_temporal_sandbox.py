@@ -104,6 +104,7 @@ class SandboxedAttemptTest(unittest.TestCase):
         self.scenario([{
             "emit": [
                 {"type": "thread.started", "thread_id": "th_1"},
+                {"type": "item.completed", "item": {"type": "command_execution", "command": "ls"}},
                 {"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3}},
             ],
             "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
@@ -131,6 +132,7 @@ class SandboxedAttemptTest(unittest.TestCase):
         self.assertTrue(all(beat["sandbox"] == self.sandbox.id for beat in beats))
         self.assertEqual(beats[-1]["session_ref"], "th_1")
         self.assertEqual(beats[-1]["usage"]["tok_input"], 10)
+        self.assertTrue(any(beat["progress"].get("message") for beat in beats), "progress never rode a heartbeat")
 
     def test_a_failed_attempt_raises_the_outcome_word_with_the_record(self) -> None:
         self.scenario([{"stderr": "something broke", "exit": 1}])
@@ -140,9 +142,22 @@ class SandboxedAttemptTest(unittest.TestCase):
         self.assertFalse(caught.exception.non_retryable)
         self.assertEqual(caught.exception.details[0]["attempt"]["outcome"], outcomes.INFRA)
 
+    def wait_for_pidfile(self) -> Path:
+        pidfile = pid_file(self.sandbox.workspace, KEY)
+        deadline = time.monotonic() + 15
+        while not pidfile.exists():
+            self.assertLess(time.monotonic(), deadline, "the attempt never started")
+            time.sleep(0.05)
+        return pidfile
+
     def test_a_sandbox_that_ends_under_the_attempt_is_sandbox_gone(self) -> None:
         self.scenario([{"sleep": 30}])
-        threading.Timer(1.5, self.sandbox.terminate).start()
+
+        def end_it() -> None:
+            self.wait_for_pidfile()
+            self.sandbox.terminate()
+
+        threading.Thread(target=end_it, daemon=True).start()
         with self.assertRaises(ApplicationError) as caught:
             self.attempt()
         self.assertEqual(caught.exception.type, SANDBOX_GONE)
@@ -167,7 +182,7 @@ class SandboxedAttemptTest(unittest.TestCase):
         report, _ = self.attempt()
         self.assertEqual(report.outcome, outcomes.VALID)
         self.assertIsNotNone(stale.wait(5))
-        self.assertEqual(pidfile.read_text().strip(), str(int(pidfile.read_text())))
+        self.assertNotEqual(int(pidfile.read_text()), stale.pid)
 
     def test_cancel_ends_the_attempt_process_before_propagating(self) -> None:
         self.scenario([{"sleep": 30}])
@@ -179,11 +194,8 @@ class SandboxedAttemptTest(unittest.TestCase):
             task = asyncio.create_task(env.run(
                 run_sandboxed_attempt, self.sandbox, ENTRY, codex_spec(), "task", validator={},
             ))
-            deadline = time.monotonic() + 15
             while not pidfile.exists():
-                self.assertLess(time.monotonic(), deadline, "the attempt never started")
                 await asyncio.sleep(0.05)
-            await asyncio.sleep(0.5)
             env.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task

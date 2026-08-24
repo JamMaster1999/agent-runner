@@ -34,7 +34,7 @@ try:
 except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
-from agent_runner import sessions, state  # noqa: E402
+from agent_runner import state  # noqa: E402
 from agent_runner.workspace import (  # noqa: E402
     MANIFEST,
     READY_MARKER,
@@ -387,16 +387,11 @@ class MissingDependencyTest(unittest.TestCase):
         absent.start()
         self.addCleanup(absent.stop)
 
-    def test_startup_refuses_with_install_guidance(self) -> None:
+    def test_the_keeper_refuses_to_start_with_install_guidance(self) -> None:
         with self.assertRaises(RuntimeError) as caught:
             state.mirror()
         self.assertIn("boto3", str(caught.exception))
         self.assertIn("agent-runner[s3]", str(caught.exception))
-
-    def test_prepare_session_homes_refuses_to_boot(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(RuntimeError):
-                sessions.prepare_session_homes(Path(tmp), apply=False)
 
 
 if __name__ == "__main__":

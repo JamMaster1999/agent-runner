@@ -101,6 +101,11 @@ class CdpBrowser:
     profile_dir: Path
     log_path: Path
 
+    def scratch(self) -> Path:
+        """The folder this resource churns on its own (Chrome rewrites its
+        profile constantly): never evidence that the agent is working."""
+        return self.profile_dir
+
     def variables(self) -> dict[str, str]:
         return cdp_variables(
             {

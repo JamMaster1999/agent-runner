@@ -130,13 +130,18 @@ class MemoryFuseTest(LivenessCase):
         self.assertGreater(tree_rss_mb(_os.getpid()), 1.0)
         self.assertIsNone(tree_rss_mb(2**22 - 1))
 
-    @unittest.skipUnless(LINUX, "/proc is Linux")
     def test_the_fuse_ends_the_attempt_infra(self) -> None:
         self.scenario([{"sleep": 20}])
-        with mock.patch.object(attempt_module, "RSS_CHECK_SECONDS", 0.1):
-            report = self.run_with(Policy(stall_seconds=30, rss_limit_mb=1))
+        started = time.monotonic()
+        with (
+            mock.patch.object(attempt_module, "RSS_CHECK_SECONDS", 0.1),
+            mock.patch.object(attempt_module, "tree_rss_mb", return_value=5000.0),
+        ):
+            report = self.run_with(Policy(stall_seconds=30, rss_limit_mb=4096))
         self.assertEqual(report.outcome, outcomes.INFRA)
         self.assertIn("memory fuse", report.error)
+        self.assertIn("5000 MB", report.error)
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_no_limit_means_no_check(self) -> None:
         self.scenario([{"write": [{"path": str(self.workdir / "out.json"), "text": '{"ok": true}'}]}])

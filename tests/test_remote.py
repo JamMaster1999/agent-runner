@@ -6,6 +6,7 @@ writes the event stream a supervisor beats on — the report last.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import signal
@@ -25,11 +26,11 @@ try:
 except ImportError:
     sys.path.insert(0, str(REPO / "src"))
 
-from agent_runner import outcomes, remote, state  # noqa: E402
+from agent_runner import outcomes, remote, state, workdirs  # noqa: E402
+from agent_runner.harness.stream import StreamEvent  # noqa: E402
 from agent_runner.remote import (  # noqa: E402
     AttemptRequest,
     attempt_workdir,
-    checkpoint_dir,
     pid_file,
     report_from_json,
     report_to_json,
@@ -117,6 +118,7 @@ class ServeTest(ServeCase):
         self.scenario([{
             "emit": [
                 {"type": "thread.started", "thread_id": "th_1"},
+                {"type": "item.completed", "item": {"type": "command_execution", "command": "ls"}},
                 {"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3}},
             ],
             "write": [{"path": str(self.workdir() / "out.json"), "text": '{"ok": true}'}],
@@ -127,6 +129,10 @@ class ServeTest(ServeCase):
         self.assertEqual(kinds[-1], "report")
         self.assertIn("session", kinds)
         self.assertIn("usage", kinds)
+        # Stream events cross the wire as the StreamEvent dataclass, whole.
+        stream = [e for e in events if e["e"] == "event"]
+        self.assertTrue(stream)
+        self.assertEqual(set(stream[0]) - {"e"}, {f.name for f in dataclasses.fields(StreamEvent)})
         self.assertEqual(next(e for e in events if e["e"] == "session")["ref"], "th_1")
         report = report_from_json(events[-1])
         self.assertEqual(report.outcome, outcomes.VALID)
@@ -160,7 +166,7 @@ class ServeTest(ServeCase):
         self.assertIn("tick", [event["e"] for event in events])
 
     def test_checkpoint_stamps_are_verified_before_the_attempt(self) -> None:
-        directory = checkpoint_dir(self.workspace, "scrape", "2026FALL")
+        directory = workdirs.checkpoint_dir(self.workspace, "scrape", "2026FALL")
         directory.mkdir(parents=True)
         (directory / "progress.json").write_text('{"term": "2025FALL"}')
         (directory / "kept.json").write_text('{"term": "2026FALL"}')

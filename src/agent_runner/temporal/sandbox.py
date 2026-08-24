@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from typing import Any, Sequence
+from typing import Sequence
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -32,6 +32,7 @@ from temporalio.exceptions import ApplicationError
 from agent_runner import outcomes
 from agent_runner.executor import SANDBOX_GONE, ExecutorGone, Sandbox
 from agent_runner.harness.base import AgentDef
+from agent_runner.harness.stream import StreamEvent
 from agent_runner.remote import (
     AttemptRequest,
     attempt_workdir,
@@ -40,14 +41,16 @@ from agent_runner.remote import (
 )
 from agent_runner.runtime import AttemptReport, RunSpec, Usage
 from agent_runner.temporal.activity import (
+    HeartbeatState,
     TemporalRunConfig,
-    _now_iso,
-    activity_deadline,
     attempt_record,
+    conclude,
+    heartbeat_callbacks,
+    now_iso,
     prior_heartbeat_details,
     starting_state,
 )
-from agent_runner.temporal.retry import application_error_for, failure_details
+from agent_runner.temporal.retry import failure_details
 
 CANCEL_GRACE_SECONDS = 30.0
 ENDED_POLLS = 3
@@ -102,9 +105,10 @@ async def run_sandboxed_attempt(
         watch_dirs=tuple(watch_dirs),
         pid_file=pidfile,
     )
+    on_event, on_session, on_usage = heartbeat_callbacks(state)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    started_at = _now_iso()
+    started_at = now_iso()
     try:
         await asyncio.to_thread(kill_stale, sandbox, pidfile)
         proc = await asyncio.to_thread(sandbox.exec, *command, stdin=request.to_json().encode())
@@ -133,23 +137,13 @@ async def run_sandboxed_attempt(
                 continue  # not ours: the entrypoint's own chatter
             if not isinstance(event, dict):
                 continue
-            kind = event.get("e")
+            kind = event.pop("e", None)
             if kind == "session":
-                _on_session(state, str(event.get("ref") or ""))
+                on_session(str(event.get("ref") or ""))
             elif kind == "usage":
-                with state.lock:
-                    state.usage = Usage.from_dict(event.get("usage") or {}).as_dict()
-                    state.session_usage = Usage.from_dict(event.get("session_usage") or {}).as_dict()
+                on_usage(Usage.from_dict(event.get("usage") or {}), Usage.from_dict(event.get("session_usage") or {}))
             elif kind == "event":
-                with state.lock:
-                    if "current" in event or "total" in event:
-                        state.progress = {
-                            "current": event.get("current"),
-                            "total": event.get("total"),
-                            "message": event.get("message"),
-                        }
-                    else:
-                        state.progress = {**state.progress, "message": event.get("message")}
+                on_event(StreamEvent(**event))
             elif kind == "report":
                 report = report_from_json(event)
             elif kind == "cancelled":
@@ -167,13 +161,12 @@ async def run_sandboxed_attempt(
         if not reader.is_alive():
             await asyncio.to_thread(proc.wait)  # the stream closed: reap, never leave a zombie
         raise
-    finally:
-        activity.heartbeat(state.payload())
 
+    if cancelled:
+        activity.heartbeat(state.payload())
+        raise ApplicationError(f"{spec.key}: the attempt process was cancelled under the activity", type=outcomes.INFRA)
+    rc = await asyncio.to_thread(proc.wait)
     if report is None:
-        if cancelled:
-            raise ApplicationError(f"{spec.key}: the attempt process was cancelled under the activity", type=outcomes.INFRA)
-        rc = await asyncio.to_thread(proc.wait)
         if await _ended(sandbox):
             raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
         report = AttemptReport(
@@ -182,17 +175,7 @@ async def run_sandboxed_attempt(
             error=f"{spec.key}: attempt process exited {rc} without a report",
             detail=(await asyncio.to_thread(proc.stderr))[-STDERR_TAIL:],
         )
-    report.attempts = tuple(state.record(attempt_record(info.attempt, report, started_at, _now_iso())))
-    activity.heartbeat(state.payload())
-    if report.outcome == outcomes.VALID:
-        return report
-    deadline = activity_deadline(info)
-    raise application_error_for(
-        report,
-        rate_limit_backoff=config.rate_limit_backoff,
-        reset_cap=config.rate_limit_reset_cap,
-        retry_by=deadline - config.rate_limit_reset_margin if deadline else None,
-    )
+    return conclude(state, info, report, started_at, config)
 
 
 async def _ended(sandbox: Sandbox) -> bool:
@@ -207,14 +190,6 @@ async def _ended(sandbox: Sandbox) -> bool:
     return False
 
 
-def _on_session(state: Any, ref: str) -> None:
-    with state.lock:
-        if ref and ref != state.session_ref:
-            state.resume_count = 0
-            state.session_usage = dict(state.usage)
-            state.session_ref = ref
-
-
 def _kill(sandbox: Sandbox, pidfile: str) -> None:
     try:
         sandbox.exec("sh", "-c", f'kill -TERM "$(cat "{pidfile}")" 2>/dev/null').wait()
@@ -222,11 +197,11 @@ def _kill(sandbox: Sandbox, pidfile: str) -> None:
         pass
 
 
-def _gone(state: Any, attempt: int, started_at: str, message: str) -> ApplicationError:
+def _gone(state: HeartbeatState, attempt: int, started_at: str, message: str) -> ApplicationError:
     """The sandbox ended under the attempt: recorded like any other
     failed attempt, raised as the one error type only a new sandbox can
     answer."""
     report = AttemptReport(outcome=outcomes.INFRA, session_ref=state.session_ref, error=message)
-    report.attempts = tuple(state.record(attempt_record(attempt, report, started_at, _now_iso())))
+    report.attempts = tuple(state.record(attempt_record(attempt, report, started_at, now_iso())))
     activity.heartbeat(state.payload())
     return ApplicationError(message, failure_details(report), type=SANDBOX_GONE, non_retryable=True)

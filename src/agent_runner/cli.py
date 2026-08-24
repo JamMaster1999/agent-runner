@@ -19,7 +19,7 @@ import argparse
 import json
 from pathlib import Path
 
-from agent_runner.workspace import DEFAULT_CHECKPOINT_SECONDS
+from agent_runner.workspace import DEFAULT_CHECKPOINT_SECONDS, keeper_main
 
 
 # The JSON hook-output contract: providers that parse hook stdout (the
@@ -53,9 +53,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 
 def cmd_keeper(args: argparse.Namespace) -> int:
-    from agent_runner.workspace import main
-
-    return main(args.root, args.every)
+    return keeper_main(args.root, args.every)
 
 
 def build_parser() -> argparse.ArgumentParser:

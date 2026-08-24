@@ -163,7 +163,7 @@ class RetryMappingTest(unittest.TestCase):
             session_ref="s" * 4000,
             resets_at=datetime.now(timezone.utc),
         )
-        state = activity_module._HeartbeatState(session_ref="s" * 4000, progress={"message": "m" * 300})
+        state = activity_module.HeartbeatState(session_ref="s" * 4000, progress={"message": "m" * 300})
         for number in range(1, 30):
             state.record(activity_module.attempt_record(number, loud, "2026-08-22T08:00:00+00:00", "2026-08-22T09:00:00+00:00"))
         payload = state.payload()

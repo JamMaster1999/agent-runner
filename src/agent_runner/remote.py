@@ -54,13 +54,6 @@ def attempt_workdir(root: str | Path, key: str, attempt: int) -> Path:
     return attempts_root(Path(root)) / key_segment(key) / f"attempt-{attempt:02d}"
 
 
-def checkpoint_dir(root: str | Path, child: str, term: str) -> Path:
-    """The term-scoped checkpoint folder inside the workspace — the one
-    builder, so the path is term-scoped by construction and travels with
-    the workspace."""
-    return workdirs.checkpoint_dir(Path(root), child, term)
-
-
 @dataclasses.dataclass(frozen=True)
 class AttemptRequest:
     """Everything one attempt needs, as data. ``validator`` is the
@@ -145,8 +138,8 @@ class _Emitter:
         self._out = out
         self._lock = threading.Lock()
 
-    def __call__(self, event: str, **fields: Any) -> None:
-        line = json.dumps({"e": event, **fields})
+    def __call__(self, kind: str, **fields: Any) -> None:
+        line = json.dumps({"e": kind, **fields})
         with self._lock:
             self._out.write(line + "\n")
             self._out.flush()
@@ -167,11 +160,7 @@ def serve(
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
     def on_event(event: StreamEvent) -> None:
-        fields: dict[str, Any] = {"kind": event.kind, "message": event.message}
-        if event.current is not None or event.total is not None:
-            fields["current"] = event.current
-            fields["total"] = event.total
-        emit("event", **fields)
+        emit("event", **dataclasses.asdict(event))
 
     def on_usage(usage: Usage, session_usage: Usage) -> None:
         emit("usage", usage=usage.as_dict(), session_usage=session_usage.as_dict())

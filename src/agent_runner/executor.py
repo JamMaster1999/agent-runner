@@ -179,6 +179,8 @@ class ModalExecutor(Executor):
             sandbox = self.modal.Sandbox.from_name(self.app_name, name)
         except self.modal.exception.NotFoundError:
             return None
+        if sandbox.poll() is not None:
+            return None
         return ModalSandbox(self, sandbox, name, sandbox.get_tags())
 
     def attach(self, sandbox_id: str) -> Sandbox:
@@ -194,6 +196,8 @@ class ModalExecutor(Executor):
     def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
         found = []
         for sandbox in self.modal.Sandbox.list(app_id=self.app().app_id, tags=dict(tags)):
+            if sandbox.poll() is not None:
+                continue
             all_tags = sandbox.get_tags()
             found.append(ModalSandbox(self, sandbox, all_tags.get("name", sandbox.object_id), all_tags))
         return found
@@ -262,10 +266,11 @@ class ModalProc(Proc):
 
 class LocalExecutor(Executor):
     """The same lifecycle as subprocesses on this host: a sandbox is a
-    directory under ``root`` plus its entrypoint process; ``exec`` runs
-    in the same environment; the TTL is a timer that kills it. Sandboxes
-    live in this process's registry, so a restarted worker finds none —
-    which is exactly ``ExecutorGone``, and the caller makes another."""
+    directory under ``root`` plus its entrypoint process, running in this
+    host's environment plus the spec's (a bare box IS the host); the TTL
+    is a timer that kills it. Sandboxes live in this process's registry,
+    so a restarted worker finds none — which is exactly ``ExecutorGone``,
+    and the caller makes another."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -280,8 +285,10 @@ class LocalExecutor(Executor):
         process = subprocess.Popen(
             list(spec.command), cwd=str(home), env=env, stdout=log, stderr=subprocess.STDOUT
         )
-        sandbox = LocalSandbox(spec.name, process, env, str(workspace), dict(spec.tags))
-        threading.Timer(spec.ttl_seconds, sandbox.terminate).start()
+        sandbox = LocalSandbox(spec.name, home, process, env, str(workspace), dict(spec.tags))
+        sandbox.ttl = threading.Timer(spec.ttl_seconds, sandbox.terminate)
+        sandbox.ttl.daemon = True
+        sandbox.ttl.start()
         self._sandboxes[sandbox.id] = sandbox
         return sandbox
 
@@ -307,12 +314,20 @@ class LocalExecutor(Executor):
 
 class LocalSandbox(Sandbox):
     def __init__(
-        self, name: str, process: subprocess.Popen, env: dict[str, str], workspace: str, tags: dict[str, str]
+        self,
+        name: str,
+        home: Path,
+        process: subprocess.Popen,
+        env: dict[str, str],
+        workspace: str,
+        tags: dict[str, str],
     ) -> None:
         self.id = f"local-{name}-{process.pid}"
         self.name = name
         self.workspace = workspace
         self.tags = tags
+        self.ttl: threading.Timer | None = None
+        self._home = home
         self._process = process
         self._env = env
         self._procs: list[LocalProc] = []
@@ -323,10 +338,11 @@ class LocalSandbox(Sandbox):
         if self.poll() is not None:
             raise ExecutorGone(f"sandbox {self.id} has ended (rc={self.poll()})")
         stderr = tempfile.TemporaryFile()
+        self._procs = [proc for proc in self._procs if proc.poll() is None]
         process = subprocess.Popen(
             list(command),
             env={**self._env, **(env or {})},
-            cwd=str(Path(self.workspace).parent),
+            cwd=str(self._home),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
@@ -342,6 +358,8 @@ class LocalSandbox(Sandbox):
         return self._process.poll()
 
     def terminate(self) -> None:
+        if self.ttl is not None:
+            self.ttl.cancel()
         # The keeper first: a supervisor that sees its exec die must find
         # the sandbox already ended, never a live keeper for one more poll.
         if self._process.poll() is None:
@@ -375,6 +393,9 @@ class LocalProc(Proc):
 
     def wait(self) -> int:
         return self._process.wait()
+
+    def poll(self) -> int | None:
+        return self._process.poll()
 
     def stderr(self) -> str:
         self._stderr.seek(0)

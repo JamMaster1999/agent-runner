@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from agent_runner import state
 from agent_runner.harness import registered_adapters
 
 # Default resume preamble, vocabulary-neutral: it names no project output
@@ -46,9 +45,6 @@ def prepare_session_homes(root: Path, *, apply: bool = True) -> dict[str, str]:
     written into ``os.environ`` so the adapters' ``env_passthrough`` carries
     them into every agent process.
     """
-    # Startup is where a broken state mirror must surface: a bucket this
-    # process cannot name is a deploy error, not a per-attempt warning.
-    state.mirror()
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     overrides: dict[str, str] = {}

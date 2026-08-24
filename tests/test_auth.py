@@ -112,10 +112,6 @@ class PrepareSessionHomesTest(unittest.TestCase):
                 self.assertEqual(_os.environ["CODEX_HOME"], applied["CODEX_HOME"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SandboxCredentialTest(unittest.TestCase):
     """The credential a sandbox receives: the operator's login minus the
     one token that could rotate it (spikes 4 and 9)."""
@@ -150,3 +146,7 @@ class SandboxCredentialTest(unittest.TestCase):
                 sandbox_credential(bad)
             self.assertEqual(caught.exception.code, "auth")
             self.assertFalse(caught.exception.retryable)
+
+
+if __name__ == "__main__":
+    unittest.main()
