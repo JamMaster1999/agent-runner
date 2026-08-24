@@ -13,6 +13,7 @@ import signal
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,7 @@ except ImportError:
 
 from agent_runner import outcomes, remote, state, workdirs  # noqa: E402
 from agent_runner.harness.stream import StreamEvent  # noqa: E402
+from agent_runner.workspace import READY_MARKER, marker  # noqa: E402
 from agent_runner.remote import (  # noqa: E402
     AttemptRequest,
     attempt_workdir,
@@ -85,6 +87,9 @@ class ServeCase(unittest.TestCase):
         self.addCleanup(env.stop)
         for name in (state.STATE_S3_ENV, "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
             _os.environ.pop(name, None)
+        # A prepared workspace, as the keeper leaves it.
+        marker(self.workspace, READY_MARKER).parent.mkdir(parents=True)
+        marker(self.workspace, READY_MARKER).write_text("fresh")
         handler = signal.getsignal(signal.SIGTERM)
         self.addCleanup(signal.signal, signal.SIGTERM, handler)
 
@@ -159,8 +164,7 @@ class ServeTest(ServeCase):
     def test_sigterm_cancels_the_attempt_and_says_so(self) -> None:
         self.scenario([{"sleep": 20}])
         threading.Timer(0.5, _os.kill, args=(_os.getpid(), signal.SIGTERM)).start()
-        with mock.patch.object(remote, "TICK_SECONDS", 0.1):
-            rc, events = self.serve(self.request().to_json())
+        rc, events = self.serve(self.request(tick_seconds=0.1).to_json())
         self.assertEqual(rc, 0)
         self.assertEqual(events[-1]["e"], "cancelled")
         self.assertIn("tick", [event["e"] for event in events])
@@ -178,6 +182,19 @@ class ServeTest(ServeCase):
         self.assertEqual(rc, 0)
         self.assertFalse((directory / "progress.json").exists())
         self.assertTrue((directory / "kept.json").exists())
+
+
+class ReadyGateTest(ServeCase):
+    def test_the_attempt_waits_for_the_keeper_before_touching_the_workspace(self) -> None:
+        marker(self.workspace, READY_MARKER).unlink()
+        self.scenario([{"write": [{"path": str(self.workdir() / "out.json"), "text": '{"ok": true}'}]}])
+        started = time.monotonic()
+        threading.Timer(1.0, marker(self.workspace, READY_MARKER).touch).start()
+        with mock.patch.object(remote, "READY_POLL_SECONDS", 0.05):
+            rc, events = self.serve(self.request().to_json())
+        self.assertEqual(rc, 0)
+        self.assertEqual(events[-1]["e"], "report")
+        self.assertGreaterEqual(time.monotonic() - started, 1.0)
 
 
 class WireShapeTest(unittest.TestCase):

@@ -630,7 +630,12 @@ def run_attempt(
                 # The agent's work, not the runner's own files or a
                 # browser profile rewriting itself.
                 watched = (workdir, *watch_dirs)
-                unwatched = (workdir / RUNNER_DIR, *(resource.scratch() for resource in provisioned))
+                unwatched = (
+                    workdir / RUNNER_DIR,
+                    spawn.stdout_path,
+                    spawn.stderr_path,
+                    *(resource.scratch() for resource in provisioned),
+                )
                 last_write = newest_mtime(watched, unwatched)
                 next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                 while process.poll() is None:

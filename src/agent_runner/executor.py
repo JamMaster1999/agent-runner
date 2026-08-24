@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -89,10 +90,16 @@ class Sandbox(ABC):
 
     @abstractmethod
     def exec(
-        self, *command: str, stdin: bytes | None = None, env: Mapping[str, str] | None = None
+        self,
+        *command: str,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
     ) -> Proc:
         """Run ``command`` in the sandbox; ``stdin`` is written whole and
-        closed. Raises ``ExecutorGone`` when the sandbox no longer exists."""
+        closed; ``timeout`` (seconds) ends it. Raises ``ExecutorGone`` when
+        the sandbox no longer exists — and so does any call on the
+        returned ``Proc`` once the sandbox has ended under it."""
 
     @abstractmethod
     def poll(self) -> int | None:
@@ -213,17 +220,33 @@ class ModalSandbox(Sandbox):
         self.tags = tags
 
     def exec(
-        self, *command: str, stdin: bytes | None = None, env: Mapping[str, str] | None = None
+        self,
+        *command: str,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
     ) -> Proc:
-        try:
-            process = self._sandbox.exec(*command, env=dict(env or {}))
+        if self.poll() is not None:
+            raise ExecutorGone(f"sandbox {self.id} has ended (rc={self.poll()})")
+        with self.gone_guard():
+            process = self._sandbox.exec(*command, env=dict(env or {}), timeout=timeout)
             if stdin is not None:
                 process.stdin.write(stdin)
             process.stdin.write_eof()
             process.stdin.drain()
-        except self._modal.exception.NotFoundError as exc:
-            raise ExecutorGone(f"sandbox {self.id} is gone: {exc}") from exc
-        return ModalProc(process)
+        return ModalProc(self, process)
+
+    @contextmanager
+    def gone_guard(self) -> Iterator[None]:
+        """Modal answers a dead sandbox with NotFoundError, ConflictError
+        ("already finished"), or a dropped connection, depending on which
+        call notices first. Any of them on an ended sandbox is one thing."""
+        try:
+            yield
+        except self._modal.exception.Error as exc:
+            if self.poll() is not None:
+                raise ExecutorGone(f"sandbox {self.id} is gone: {exc}") from exc
+            raise
 
     def poll(self) -> int | None:
         return self._sandbox.poll()
@@ -236,23 +259,26 @@ class ModalSandbox(Sandbox):
 
 
 class ModalProc(Proc):
-    def __init__(self, process: Any) -> None:
+    def __init__(self, sandbox: ModalSandbox, process: Any) -> None:
+        self._sandbox = sandbox
         self._process = process
 
     def lines(self) -> Iterator[str]:
         # The stream arrives in chunks, not lines; split here so a JSON
         # line is never handed over torn.
         buffer = ""
-        for chunk in self._process.stdout:
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                yield line
+        with self._sandbox.gone_guard():
+            for chunk in self._process.stdout:
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    yield line
         if buffer:
             yield buffer
 
     def wait(self) -> int:
-        return self._process.wait()
+        with self._sandbox.gone_guard():
+            return self._process.wait()
 
     def stderr(self) -> str:
         try:
@@ -333,7 +359,11 @@ class LocalSandbox(Sandbox):
         self._procs: list[LocalProc] = []
 
     def exec(
-        self, *command: str, stdin: bytes | None = None, env: Mapping[str, str] | None = None
+        self,
+        *command: str,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
     ) -> Proc:
         if self.poll() is not None:
             raise ExecutorGone(f"sandbox {self.id} has ended (rc={self.poll()})")
@@ -351,6 +381,8 @@ class LocalSandbox(Sandbox):
         # against a child that starts writing before it finishes reading.
         threading.Thread(target=_feed, args=(process, stdin), daemon=True).start()
         proc = LocalProc(process, stderr)
+        if timeout is not None:
+            threading.Timer(timeout, proc.kill).start()
         self._procs.append(proc)
         return proc
 

@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any, Callable
@@ -39,9 +40,10 @@ from agent_runner.harness.stream import StreamEvent
 from agent_runner.runtime import AttemptReport, Policy, RunSpec, Usage, Verdict
 from agent_runner.sessions import prepare_session_homes
 from agent_runner.state import key_segment
-from agent_runner.workspace import RUNNER_DIR, attempts_root, workspace_root
+from agent_runner.workspace import READY_MARKER, RUNNER_DIR, attempts_root, marker, workspace_root
 
 TICK_SECONDS = 15.0
+READY_POLL_SECONDS = 1.0
 
 
 def pid_file(root: str | Path, key: str) -> Path:
@@ -74,6 +76,7 @@ class AttemptRequest:
     resources: tuple[str, ...] = ()
     watch_dirs: tuple[str, ...] = ()
     pid_file: str | None = None
+    tick_seconds: float = TICK_SECONDS
 
     def to_json(self) -> str:
         data = dataclasses.asdict(self)
@@ -165,13 +168,21 @@ def serve(
     def on_usage(usage: Usage, session_usage: Usage) -> None:
         emit("usage", usage=usage.as_dict(), session_usage=session_usage.as_dict())
 
-    def tick() -> None:
-        while not stop.wait(TICK_SECONDS):
-            emit("tick")
-
     try:
         request = AttemptRequest.from_json(stdin.read())
-        prepare_session_homes(workspace_root())
+        root = workspace_root()
+
+        def tick() -> None:
+            while not stop.wait(request.tick_seconds):
+                emit("tick")
+
+        threading.Thread(target=tick, name="attempt-tick", daemon=True).start()
+        # The keeper may still be restoring the workspace: nothing is read
+        # or written under it before the keeper says ready, or a resume
+        # would find no transcript and a term gate would check half a tree.
+        while not marker(root, READY_MARKER).exists() and not stop.is_set():
+            time.sleep(READY_POLL_SECONDS)
+        prepare_session_homes(root)
         if request.pid_file:
             pid = Path(request.pid_file)
             pid.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +191,6 @@ def serve(
             directory = Path(request.checkpoint["directory"])
             directory.mkdir(parents=True, exist_ok=True)
             workdirs.verify_or_discard(directory, request.checkpoint["term"])
-        threading.Thread(target=tick, name="attempt-tick", daemon=True).start()
         report = run_attempt(
             request.spec,
             request.task,

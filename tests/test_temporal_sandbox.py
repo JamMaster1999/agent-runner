@@ -190,18 +190,20 @@ class SandboxedAttemptTest(unittest.TestCase):
         env.on_heartbeat = lambda *_: None
         pidfile = pid_file(self.sandbox.workspace, KEY)
 
-        async def scenario() -> None:
+        async def scenario() -> int:
             task = asyncio.create_task(env.run(
                 run_sandboxed_attempt, self.sandbox, ENTRY, codex_spec(), "task", validator={},
             ))
             while not pidfile.exists():
                 await asyncio.sleep(0.05)
+            pid = int(pidfile.read_text())
             env.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+            return pid
 
-        asyncio.run(scenario())
-        pid = int(pidfile.read_text())
+        pid = asyncio.run(scenario())
+        self.assertFalse(pidfile.exists())  # the kill takes the file with it
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:

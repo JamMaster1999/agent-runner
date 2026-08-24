@@ -100,9 +100,10 @@ class Workspace:
         if self.mirror is None:
             return "fresh"
         manifest = self.mirror.get_json(self.key(MANIFEST))
-        if not manifest:
+        files = manifest.get("files") if isinstance(manifest, dict) else None
+        if not files:
             return "fresh"
-        for relative in manifest["files"]:
+        for relative in files:
             target = self.root / relative
             if state.is_denied(target.name) or not _inside(self.root, target):
                 continue
@@ -193,7 +194,11 @@ def keeper(root: Path, group: str, every: float, stop: threading.Event) -> int:
             continue
         if pushed:
             print(f"checkpoint {pushed}", flush=True)
-    pushed = workspace.release()
+    try:
+        pushed = workspace.release()
+    except Exception as exc:
+        state.warn(f"release failed: {exc}")
+        return 1
     print(f"released {pushed}", flush=True)
     return 0
 

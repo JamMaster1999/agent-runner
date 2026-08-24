@@ -26,4 +26,4 @@ This init stays import-light on purpose: no submodule imports here, so
 ``import agent_runner`` is side-effect free and needs no environment.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.7.0"

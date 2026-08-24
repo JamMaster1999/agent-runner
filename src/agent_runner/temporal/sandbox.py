@@ -53,17 +53,27 @@ from agent_runner.temporal.activity import (
 from agent_runner.temporal.retry import failure_details
 
 CANCEL_GRACE_SECONDS = 30.0
+EXEC_GRACE_SECONDS = 600.0
 ENDED_POLLS = 3
 STDERR_TAIL = 4000
 
 
+KILL_SCRIPT = """
+[ -f "$1" ] || exit 0
+pid=$(cat "$1"); rm -f "$1"
+case "$pid" in ''|*[!0-9]*) exit 0;; esac
+kill -TERM "$pid" 2>/dev/null || exit 0
+for i in $(seq {grace}); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done
+kill -KILL "$pid" 2>/dev/null
+"""
+
+
 def kill_stale(sandbox: Sandbox, pidfile: str) -> None:
     """End whatever attempt process a dead supervisor left behind for this
-    key: two attempts of one batch must never run at once, and the file
-    is the only handle the sandbox keeps."""
-    sandbox.exec(
-        "sh", "-c", f'[ -f "{pidfile}" ] && kill -TERM "$(cat "{pidfile}")" 2>/dev/null; rm -f "{pidfile}"'
-    ).wait()
+    key, and wait until it is gone: two attempts of one batch must never
+    run at once, and the file is the only handle the sandbox keeps. The
+    pid is checked to be one — the agent can write to the workspace."""
+    sandbox.exec("sh", "-c", KILL_SCRIPT.format(grace=int(CANCEL_GRACE_SECONDS)), "kill", pidfile).wait()
 
 
 async def run_sandboxed_attempt(
@@ -104,6 +114,13 @@ async def run_sandboxed_attempt(
         resources=tuple(resources),
         watch_dirs=tuple(watch_dirs),
         pid_file=pidfile,
+        tick_seconds=config.heartbeat_seconds,
+    )
+    # The exec's own deadline: the attempt's budget plus the time its
+    # cleanup and validation may take — never open-ended (a dead worker
+    # on the platform's side could otherwise hold the call forever).
+    exec_timeout = (
+        int(timeout_minutes * 60 + EXEC_GRACE_SECONDS) if timeout_minutes is not None else None
     )
     on_event, on_session, on_usage = heartbeat_callbacks(state)
     loop = asyncio.get_running_loop()
@@ -111,14 +128,20 @@ async def run_sandboxed_attempt(
     started_at = now_iso()
     try:
         await asyncio.to_thread(kill_stale, sandbox, pidfile)
-        proc = await asyncio.to_thread(sandbox.exec, *command, stdin=request.to_json().encode())
+        proc = await asyncio.to_thread(
+            sandbox.exec, *command, stdin=request.to_json().encode(), timeout=exec_timeout
+        )
     except ExecutorGone as exc:
         raise _gone(state, info.attempt, started_at, str(exc)) from exc
+    activity.heartbeat(state.payload())  # the attempt is running; the first tick is a while off
+    stream_failure: list[ExecutorGone] = []
 
     def pump() -> None:
         try:
             for line in proc.lines():
                 loop.call_soon_threadsafe(queue.put_nowait, line)
+        except ExecutorGone as exc:
+            stream_failure.append(exc)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -165,7 +188,12 @@ async def run_sandboxed_attempt(
     if cancelled:
         activity.heartbeat(state.payload())
         raise ApplicationError(f"{spec.key}: the attempt process was cancelled under the activity", type=outcomes.INFRA)
-    rc = await asyncio.to_thread(proc.wait)
+    try:
+        if stream_failure:
+            raise stream_failure[0]
+        rc = await asyncio.to_thread(proc.wait)
+    except ExecutorGone as exc:
+        raise _gone(state, info.attempt, started_at, str(exc)) from exc
     if report is None:
         if await _ended(sandbox):
             raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
@@ -192,7 +220,7 @@ async def _ended(sandbox: Sandbox) -> bool:
 
 def _kill(sandbox: Sandbox, pidfile: str) -> None:
     try:
-        sandbox.exec("sh", "-c", f'kill -TERM "$(cat "{pidfile}")" 2>/dev/null').wait()
+        kill_stale(sandbox, pidfile)
     except ExecutorGone:
         pass
 
