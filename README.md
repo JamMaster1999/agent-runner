@@ -20,8 +20,8 @@ Step 4 is where things break down. Workflow engines need activities that return 
 ```bash
 pip install git+https://github.com/JamMaster1999/agent-runner.git
 
-# with the Temporal workflow wrapper, and the S3 state mirror:
-pip install 'agent-runner[temporal,s3] @ git+https://github.com/JamMaster1999/agent-runner.git'
+# with the Temporal workflow wrapper, the S3 workspace backup, and the Modal executor:
+pip install 'agent-runner[temporal,s3,modal] @ git+https://github.com/JamMaster1999/agent-runner.git'
 ```
 
 Requires Python 3.13+ and at least one agent CLI, installed and logged in:
@@ -182,7 +182,7 @@ second.usage    # this attempt's spend alone
 
 Without `session_usage`, `second.session_usage` counts from this attempt only; `second.usage` is right either way. See [What an attempt cost](#what-an-attempt-cost).
 
-With the S3 state mirror configured (`AGENT_RUNNER_STATE_S3=s3://bucket/prefix`), the transcript is copied to the bucket every 20 seconds while the attempt runs and once more when it ends. A retry on any host resumes the session from that copy, and a dashboard on any host can follow the conversation live by reading the same object. The file in the CLI's home stays the working copy; the mirror only ever reads it.
+The transcript lives in the CLI's home. Inside a [sandbox](#sandboxes) that home is part of the workspace the keeper backs up to S3, so a replacement sandbox resumes the session from the last backup. A resume whose transcript is not in the home runs fresh, with a warning, instead of spending the attempt on a reopen that cannot land.
 
 
 
@@ -274,28 +274,63 @@ from pathlib import Path
 from agent_runner.sessions import prepare_session_homes
 
 # Reads CODEX_AUTH_JSON and CLAUDE_CREDENTIALS_JSON from the environment,
-# writes them to the volume the first time, and returns the environment
-# settings that point each CLI at that home.
+# writes them under that root the first time, and returns the environment
+# settings that point each CLI at its home there.
 env = prepare_session_homes(Path("/data"))
 ```
 
+Many sandboxes on one ChatGPT login would log each other out: a refresh by one rotates the token for all. `agent_runner.harness.codex.sandbox_credential(auth_json)` is the login a sandbox should receive — the same tokens with `refresh_token` blanked, which `codex exec` accepts and cannot rotate.
 
 
-## Workers that can pick up any run
 
-A session transcript and a checkpoint folder are files on one machine's disk. If the retry lands on a different machine, the agent's memory of the run is not there, and the work starts over. Set one variable and those files are written through to S3 as they are produced, so any worker can resume any session and read any checkpoint.
+## Sandboxes
 
-```bash
-export AGENT_RUNNER_STATE_S3=s3://my-bucket/agent-state
-# AWS credentials and region come from the standard AWS_* variables
+A long agent run wants a machine of its own: a disk the CLI can fill, a memory ceiling, a hard TTL, and nobody else's processes next to it. agent-runner runs attempts inside sandboxes through one adaptor, so a workflow never spells a platform's API and the same code runs on Modal or on the host the tests run on.
+
+Three pieces:
+
+- **The executor** (`agent_runner.executor`): `create` / `find` / `attach` / `list` sandboxes; `exec` / `poll` / `terminate` one. `ModalExecutor` builds the sandbox image from your own Dockerfile. `LocalExecutor` runs the same lifecycle as subprocesses on this host: the test double and the bare-box backend are one class.
+- **The workspace keeper** (`agent_runner.workspace`): the sandbox's entrypoint. The local disk is the working store — CLI homes, checkpoint folders, attempt workdirs — and the keeper pushes what changed to S3 on a cadence (`AGENT_RUNNER_STATE_S3=s3://bucket/prefix`, the `s3` extra), the manifest last. A replacement sandbox restores the last complete push and resumes where the old one stopped. Credential files never travel, in either direction.
+- **The attempt protocol** (`agent_runner.remote`): the whole `run_attempt` runs inside the sandbox. Your entrypoint hands `serve` the validator; the supervisor outside reads a line stream — session, usage, progress, a tick every 15 seconds, the report last.
+
+```python
+from pathlib import Path
+from agent_runner.executor import ModalExecutor, SandboxSpec
+from agent_runner.temporal.sandbox import run_sandboxed_attempt
+
+executor = ModalExecutor("my-app", dockerfile=Path("Dockerfile"), context_dir=Path("."))
+sandbox = executor.create(SandboxSpec(
+    name="run-7-research",
+    command=("python", "-m", "agent_runner", "keeper"),
+    ttl_seconds=6 * 3600,
+    env={"AGENT_RUNNER_WORKSPACE_GROUP": "mit/run-7/research", "AGENT_RUNNER_STATE_S3": "s3://state"},
+    secrets={"AWS_ACCESS_KEY_ID": key_id, "AWS_SECRET_ACCESS_KEY": secret, "CODEX_AUTH_JSON": login},
+    memory_limit_mb=65536,
+))
+
+# Inside a Temporal activity — one attempt per call; a retry lands in the same sandbox.
+report = await run_sandboxed_attempt(
+    executor.attach(sandbox.id), ("python", "-m", "myproject.attempt"), spec, task,
+    validator={"child": "research"}, agent=agent,
+)
 ```
 
-- **Local disk stays the working layer.** The CLIs read and write their own files exactly as before. Uploads happen after an attempt ends, downloads only when this machine is missing a file a resume needs.
-- **Absent everywhere means a fresh run**, which is what a single-machine setup already did.
-- **A mirror problem never costs a run.** Failed uploads warn and the local copy stands. A worker does refuse to start when the variable is set but unusable, such as a malformed URL or a missing extra, so a typo surfaces at deploy time instead of at 3am.
-- **Logins never travel.** Credential files are excluded in both directions, by name. Every worker seeds its own login from the environment, and a login file on a shared bucket is a login file nobody audits.
+The sandbox side is one file of yours:
 
-Requires the `s3` extra (`pip install 'agent-runner[s3]'`); boto3 is imported only when the variable is set. Unset, this feature does not exist.
+```python
+# myproject/attempt.py
+import sys
+from agent_runner.remote import serve
+
+sys.exit(serve(lambda payload: validator_for(payload)))
+```
+
+What the supervisor guarantees:
+
+- **The heartbeat beats only on what it just fetched.** A sandbox that goes silent past the heartbeat timeout is rescheduled; the retry lands in the same sandbox, kills the stale attempt process by pid, and resumes the session from disk.
+- **`sandbox_gone` is the one error a workflow routes.** TTL, crash, or terminate: the attempt cannot continue there and only a new sandbox can, so the activity raises it non-retryable and the workflow opens the next sandbox, which restores the workspace from S3.
+- **Liveness is output or files.** A CLI that streams nothing but keeps writing under its workdir or a watched folder is working; silence on both for the stall window ends the attempt `stalled`. A process tree past `Policy(rss_limit_mb=...)` is ended `infra` — the memory fuse.
+- **Cancellation ends the attempt process** with one signal before it propagates; the sandbox itself is yours to close.
 
 
 
@@ -349,7 +384,7 @@ Everything specific to one CLI lives in one adapter file under `[src/agent_runne
 
 - `agent_runner.temporal`: the Temporal activity wrapper (heartbeat, resume, retry mapping)
 - `agent_runner.resources`: resource provisioning (e.g., headless Chrome via CDP)
-- `agent_runner.state`: the S3 state mirror (sessions and checkpoints readable from any worker)
+- `agent_runner.executor`, `agent_runner.workspace`, `agent_runner.remote`: sandboxes — where an attempt runs, the workspace it runs in, and the protocol between the two (`agent_runner.state` is the S3 side)
 
 
 
@@ -358,9 +393,10 @@ Everything specific to one CLI lives in one adapter file under `[src/agent_runne
 - **Process hygiene**: the CLI child is always reaped on every exit path (valid, timeout, stall, cancellation, exception). A dead attempt never leaves a live agent burning provider budget.
 - **Environment isolation**: agent processes get a filtered environment, a safe baseline plus only what the spec declared. Operator secrets never leak to model-driven shell commands.
 - **Fatal early termination**: live stream evidence of dead-end conditions (e.g., auth retry loops) terminates the CLI early instead of waiting out its twenty-minute backoff ladder.
-- **Stall watchdog**: alive is not the same as working. A CLI that holds its process open but streams nothing for fifteen minutes is reaped and the attempt ends `stalled`, so a wedged agent is retried in a quarter hour instead of sitting out the run's multi-hour backstop. `AGENT_RUNNER_STALL_SECONDS` tunes the window; only caller code can switch the watchdog off (`Policy(stall_seconds=0)`) — a zero, negative, or unreadable environment value falls back to the default.
+- **Stall watchdog**: alive is not the same as working. A CLI that holds its process open but streams nothing and writes no file for fifteen minutes is reaped and the attempt ends `stalled`, so a wedged agent is retried in a quarter hour instead of sitting out the run's multi-hour backstop. `AGENT_RUNNER_STALL_SECONDS` tunes the window; only caller code can switch the watchdog off (`Policy(stall_seconds=0)`) — a zero, negative, or unreadable environment value falls back to the default.
 - **Credential normalization**: token whitespace from copy-paste is stripped before it reaches the CLI, preventing silent auth failures from line-break-wrapped pastes.
-- **Credentials stay on the worker**: the state mirror carries session transcripts and checkpoints only. Credential files are refused by name on upload and on download, so a shared bucket can neither collect a login nor plant one.
+- **Memory fuse**: a CLI process tree past `Policy(rss_limit_mb=...)` is terminated and the attempt ends `infra`, so one runaway agent never takes its sandbox down with every session in it.
+- **Credentials stay put**: the workspace backup carries session transcripts and checkpoints only. Credential files are refused by name on upload and on download, so a shared bucket can neither collect a login nor plant one.
 
 
 

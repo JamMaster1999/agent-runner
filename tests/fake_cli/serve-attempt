@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""The test project's sandbox entrypoint: ``remote.serve`` with the same
+out.json contract the fake-CLI tests use. A real project's entrypoint has
+this exact shape — build the validate closure from the request's
+``validator`` payload, hand it to ``serve``, exit with its code."""
+
+import json
+import sys
+from pathlib import Path
+
+from agent_runner.remote import serve
+from agent_runner.runtime import Verdict
+
+
+def build_validate(payload):
+    def validate(workdir):
+        try:
+            data = json.loads((Path(workdir) / "out.json").read_text())
+        except (OSError, ValueError):
+            return Verdict(valid=False, message="out.json missing or unparsable", repair_message="REPAIR: write valid out.json")
+        if data.get("ok") is True:
+            return Verdict(valid=True, data={**data, "validator": payload})
+        return Verdict(valid=False, message="ok flag missing", repair_message="REPAIR: set ok=true in out.json")
+
+    return validate
+
+
+if __name__ == "__main__":
+    sys.exit(serve(build_validate))

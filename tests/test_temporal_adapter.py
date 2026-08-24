@@ -163,7 +163,7 @@ class RetryMappingTest(unittest.TestCase):
             session_ref="s" * 4000,
             resets_at=datetime.now(timezone.utc),
         )
-        state = activity_module._HeartbeatState(session_ref="s" * 4000, progress={"message": "m" * 300})
+        state = activity_module.HeartbeatState(session_ref="s" * 4000, progress={"message": "m" * 300})
         for number in range(1, 30):
             state.record(activity_module.attempt_record(number, loud, "2026-08-22T08:00:00+00:00", "2026-08-22T09:00:00+00:00"))
         payload = state.payload()
@@ -747,6 +747,7 @@ class ActivityRunTest(unittest.TestCase):
         from agent_runner import workdirs
 
         stale_dir = workdirs.checkpoint_dir(self.tmp / "vol", "scrape", "2027SPRING")
+        stale_dir.mkdir(parents=True)
         (stale_dir / "progress.json").write_text(
             json.dumps({"term": "2026FALL", "pages": 9})
         )

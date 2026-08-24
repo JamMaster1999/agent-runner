@@ -1,9 +1,10 @@
-"""Auth: volume-backed CLI credential files, the Modal model (ruling D1).
+"""Auth: CLI credential files seeded from the environment (ruling D1).
 
-The mechanism that preserved subscription economics on Modal, owned here as
-core's sessions duty: credential files are seeded ONCE from the environment
-onto a volume-backed CLI home, refreshed tokens the CLI writes back persist
-to the volume, and tokens are normalized on read — a terminal-wrapped paste
+The mechanism that preserves subscription economics on a fleet, owned here
+as core's sessions duty: credential files are seeded ONCE from the
+environment into the CLI home under the workspace root, refreshed tokens
+the CLI writes back stay there, and tokens are normalized on read — a
+terminal-wrapped paste
 into a secrets dashboard can embed a line break mid-token, which produced a
 live production 401 from a valid token (2026-07-30).
 

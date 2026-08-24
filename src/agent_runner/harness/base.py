@@ -151,10 +151,10 @@ class HarnessAdapter(ABC):
 
     # -- credentials & homes (the Modal model, ruling D1) ------------------
 
-    def prepare_home(self, volume_root: Path, env: Mapping[str, str]) -> dict[str, str]:
-        """Point this CLI's home at a directory under ``volume_root`` and
-        seed its credential file there once from ``env`` when absent —
-        refreshed tokens the CLI writes back then persist to the volume.
+    def prepare_home(self, root: Path, env: Mapping[str, str]) -> dict[str, str]:
+        """Point this CLI's home at a directory under ``root`` (the
+        workspace) and seed its credential file there once from ``env``
+        when absent — refreshed tokens the CLI writes back stay there.
         Returns environment overrides (home + auth names). Default: no
         credential-file model."""
         return {}
@@ -229,16 +229,12 @@ class HarnessAdapter(ABC):
                 return ref
         return None
 
-    def session_state(self, session_ref: str) -> tuple[Path, list[Path]] | None:
-        """``(home, files)`` for one session: the CLI home that anchors this
-        harness's transcripts, and the files currently holding
-        ``session_ref`` there (empty when this host has never seen it).
-        Home and files answer together on purpose — an adapter either knows
-        where its transcripts live or it does not, and None means the state
-        mirror leaves this harness alone. Paths are relative to the home, so
-        a file restored from another worker lands exactly where the CLI
-        looks for it. Default: no locatable transcript."""
-        return None
+    def session_present(self, session_ref: str) -> bool:
+        """Whether this CLI's home holds the transcript of ``session_ref``,
+        so a resume has something to reopen. True when the home is not
+        configured (nothing to check); False only when the home is known
+        and the transcript is not in it."""
+        return True
 
     # -- telemetry ---------------------------------------------------------
 
@@ -333,10 +329,3 @@ class HarnessAdapter(ABC):
             alert=False,
             details=text,
         )
-
-    # -- hygiene -----------------------------------------------------------
-
-    def orphan_patterns(self) -> list[str]:
-        """``pgrep -fl`` patterns matching this harness's agent processes,
-        for a worker's orphan-process sweep."""
-        return [self.name]

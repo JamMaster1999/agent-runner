@@ -16,13 +16,14 @@ imports zero Temporal. The optional layers install on demand:
 - ``agent_runner.resources`` — provisioning for declared resources
   (``cdp_browser`` spawns Chrome and hands its endpoint in as a template
   value). Projects that declare nothing carry no browser dependencies.
-- ``agent_runner.state`` (``pip install agent-runner[s3]``) — the state
-  mirror: session transcripts and checkpoint folders written through to
-  S3, so a retry resumes on any host instead of only the one that ran
-  before. Off unless ``AGENT_RUNNER_STATE_S3`` is set.
+- ``agent_runner.executor`` / ``workspace`` / ``remote`` — sandboxes: one
+  adaptor for where an attempt runs (Modal, or this host), the workspace
+  keeper that backs the sandbox's tree up to S3 (``pip install
+  agent-runner[s3]``, on when ``AGENT_RUNNER_STATE_S3`` is set), and the
+  protocol between the attempt inside and the supervisor outside.
 
 This init stays import-light on purpose: no submodule imports here, so
 ``import agent_runner`` is side-effect free and needs no environment.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.7.0"

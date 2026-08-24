@@ -35,13 +35,11 @@ def get_adapter(backend: str) -> HarnessAdapter:
 
 
 def registered_adapters() -> list[HarnessAdapter]:
-    """Adapters in registration order (operator display strings — the
-    reaper's orphan hint — join names and patterns in this order)."""
+    """Adapters in registration order."""
     return list(_REGISTRY.values())
 
 
-# Built-in adapters. Registration order is load-bearing only for operator
-# display strings built from the registry.
+# Built-in adapters.
 from agent_runner.harness.claude_code import ClaudeCodeAdapter  # noqa: E402
 from agent_runner.harness.codex import CodexAdapter  # noqa: E402
 

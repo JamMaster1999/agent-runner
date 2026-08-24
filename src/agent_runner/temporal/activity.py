@@ -14,8 +14,7 @@ Temporal-facing mechanics of one CLI attempt:
   details as ``attempts``
 - the resume budget with fresh-session fallback, recorded
 - checkpoint folders prepared before spawn, term stamps verified before
-  resume (mismatch: discard, log loudly, run fresh), and mirrored after
-  the attempt when a state mirror is configured
+  resume (mismatch: discard, log loudly, run fresh)
 - graceful cancellation: a cancelled activity terminates and reaps the CLI
   before the cancellation propagates
 - the ruled outcome-to-retry mapping on the way out (retry.py)
@@ -78,7 +77,7 @@ class CheckpointSpec:
 
 
 @dataclass
-class _HeartbeatState:
+class HeartbeatState:
     """What rides heartbeat details: one dict, keys stable.
 
     Written from the attempt's worker thread (the on_event/on_session
@@ -94,6 +93,7 @@ class _HeartbeatState:
     usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     session_usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    sandbox: str | None = None      # the sandbox the attempt runs in (the sandboxed wrapper)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def payload(self) -> dict[str, Any]:
@@ -107,6 +107,7 @@ class _HeartbeatState:
                 "usage": dict(self.usage),
                 "session_usage": dict(self.session_usage),
                 "attempts": list(self.attempts),
+                "sandbox": self.sandbox,
             }
 
     def record(self, entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -148,7 +149,7 @@ class AttemptRecord:
 RECORD_KEYS = tuple(f.name for f in dataclasses.fields(AttemptRecord))
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -287,36 +288,9 @@ async def run_agent_attempt(
     if checkpoint is not None:
         # Prepared before spawn; verified before ANY resume of work in it.
         # A stamp from another term is discarded loudly and the run is fresh
-        # for whatever was lost — time, never correctness. The mirror pull
-        # runs first so the gate judges the run's whole progress, including
-        # the attempts that ran on other hosts.
-        workdirs.pull_checkpoints(checkpoint.directory)
+        # for whatever was lost — time, never correctness.
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
-
-    def on_event(event: StreamEvent) -> None:
-        with state.lock:
-            if event.current is not None or event.total is not None:
-                state.progress = {
-                    "current": event.current,
-                    "total": event.total,
-                    "message": event.message,
-                }
-            else:
-                state.progress = {**state.progress, "message": event.message}
-
-    def on_session(ref: str) -> None:
-        with state.lock:
-            if ref != session_ref:
-                # A fresh session opened: the budget is the session's, so the
-                # count restarts with it, and so does its usage.
-                state.resume_count = 0
-                state.session_usage = dict(state.usage)
-            state.session_ref = ref
-
-    def on_usage(usage: Usage, session_usage: Usage) -> None:
-        with state.lock:
-            state.usage = usage.as_dict()
-            state.session_usage = session_usage.as_dict()
+    on_event, on_session, on_usage = heartbeat_callbacks(state)
 
     async def pump() -> None:
         while True:
@@ -325,7 +299,7 @@ async def run_agent_attempt(
 
     stop = threading.Event()
     pump_task = asyncio.create_task(pump())
-    started_at = _now_iso()
+    started_at = now_iso()
     inner = asyncio.create_task(
         asyncio.to_thread(
             run_attempt,
@@ -345,13 +319,11 @@ async def run_agent_attempt(
             resources=resources,
             timeout_minutes=timeout_minutes,
             should_stop=stop.is_set,
+            watch_dirs=(checkpoint.directory,) if checkpoint is not None else (),
         )
     )
     try:
         report = await asyncio.shield(inner)
-        report.attempts = tuple(
-            state.record(attempt_record(info.attempt, report, started_at, _now_iso()))
-        )
     except asyncio.CancelledError:
         # Graceful cancel: terminate and reap the CLI before propagating.
         stop.set()
@@ -366,15 +338,57 @@ async def run_agent_attempt(
             await pump_task
         except asyncio.CancelledError:
             pass
-        # The last word always lands: the final state (session_ref for the
-        # next attempt's resume) is heartbeat-recorded even on failure.
-        activity.heartbeat(state.payload())
-        if checkpoint is not None:
-            # A failed attempt still stamped whatever it finished; mirroring
-            # here is what lets the next attempt claim that work from any
-            # host.
-            workdirs.push_checkpoints(checkpoint.directory)
+    return conclude(state, info, report, started_at, config)
 
+
+def heartbeat_callbacks(
+    state: HeartbeatState,
+) -> tuple[Callable[[StreamEvent], None], Callable[[str], None], Callable[[Usage, Usage], None]]:
+    """The three attempt callbacks that keep ``state`` current — one set,
+    driven by ``run_attempt`` in-process or by a sandbox's event stream,
+    so both wrappers heartbeat the same payload."""
+
+    def on_event(event: StreamEvent) -> None:
+        with state.lock:
+            if event.current is not None or event.total is not None:
+                state.progress = {
+                    "current": event.current,
+                    "total": event.total,
+                    "message": event.message,
+                }
+            else:
+                state.progress = {**state.progress, "message": event.message}
+
+    def on_session(ref: str) -> None:
+        with state.lock:
+            if ref != state.session_ref:
+                # A fresh session opened: the budget is the session's, so the
+                # count restarts with it, and so does its usage.
+                state.resume_count = 0
+                state.session_usage = dict(state.usage)
+            state.session_ref = ref
+
+    def on_usage(usage: Usage, session_usage: Usage) -> None:
+        with state.lock:
+            state.usage = usage.as_dict()
+            state.session_usage = session_usage.as_dict()
+
+    return on_event, on_session, on_usage
+
+
+def conclude(
+    state: HeartbeatState,
+    info: activity.Info,
+    report: AttemptReport,
+    started_at: str,
+    config: TemporalRunConfig,
+) -> AttemptReport:
+    """The attempt's last word: its record joins the history, the final
+    state is heartbeat-recorded (session_ref for the next attempt's resume,
+    even on failure), and anything but ``valid`` becomes the typed retry
+    error."""
+    report.attempts = tuple(state.record(attempt_record(info.attempt, report, started_at, now_iso())))
+    activity.heartbeat(state.payload())
     if report.outcome == outcomes.VALID:
         return report
     deadline = activity_deadline(info)
@@ -392,7 +406,7 @@ def starting_state(
     prior: dict[str, Any] | None,
     agent: AgentDef | None,
     config: TemporalRunConfig,
-) -> _HeartbeatState:
+) -> HeartbeatState:
     """The prior attempt's last heartbeat folded into this attempt's
     starting state: the record so far with the vanished attempts named,
     the session to resume when the prompt is unchanged and the budget
@@ -418,7 +432,7 @@ def starting_state(
             key,
             config.resume_budget,
         )
-    return _HeartbeatState(
+    return HeartbeatState(
         attempt=info.attempt,
         session_ref=session_ref,
         resume_count=resume_count,

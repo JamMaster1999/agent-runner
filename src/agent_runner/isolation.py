@@ -92,7 +92,7 @@ def agent_env(adapter, spec, run_id: str, attempt: int, workdir: Path) -> dict[s
             "RUNNER_ATTEMPT": str(attempt),
             "RUNNER_OUTPUT_PATH": str(workdir),
             "RUNNER_AGENT_NAME": spec.agent_ref,
-            "RUNNER_PHASE": spec.task_type,
+            "RUNNER_TASK_TYPE": spec.task_type,
             "RUNNER_BACKEND": spec.harness,
             "AGENT_RUNNER_PROJECT_ROOT": str(util.project_root()),
             "RUNNER_PYTHON": sys.executable,

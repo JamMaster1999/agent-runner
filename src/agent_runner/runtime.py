@@ -63,6 +63,7 @@ class Policy:
     setting_sources: tuple[str, ...] | None = None
     effort: str | None = None
     resume_preamble: str | None = None
+    rss_limit_mb: int | None = None   # the memory fuse: the CLI tree's resident MB before it is terminated
 
 
 @dataclass(frozen=True)

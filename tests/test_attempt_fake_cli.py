@@ -13,6 +13,7 @@ classification, repair follow-ups, and child reaping.
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
@@ -77,6 +78,8 @@ class FakeCliCase(unittest.TestCase):
                 "RUNNER_CLAUDE_CLI": str(FAKE_CLI),
                 "FAKE_CLI_SCENARIO": str(self.scenario_path),
                 "FAKE_CLI_CALLS": str(self.calls),
+                "CODEX_HOME": str(self.tmp / "codex-home"),
+                "CLAUDE_CONFIG_DIR": str(self.tmp / "claude-home"),
             },
         )
         patcher.start()
@@ -84,6 +87,16 @@ class FakeCliCase(unittest.TestCase):
 
     def scenario(self, calls: list[dict]) -> None:
         self.scenario_path.write_text(json.dumps(calls))
+
+    def transcript(self, ref: str, harness: str = "codex") -> Path:
+        """The transcript a resume needs, where the real CLI would have left it."""
+        if harness == "codex":
+            path = self.tmp / "codex-home" / "sessions" / "2026" / "08" / "24" / f"rollout-2026-08-24T09-15-00-{ref}.jsonl"
+        else:
+            path = self.tmp / "claude-home" / "projects" / "-tmp-project" / f"{ref}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"transcript": true}\n')
+        return path
 
     def recorded_call(self, index: int) -> dict:
         return json.loads((self.calls / f"call-{index:02d}.json").read_text())
@@ -763,6 +776,7 @@ class UsageTest(FakeCliCase):
             ]
         )
         seen: list[tuple[Usage, Usage]] = []
+        self.transcript("th_9")
         report = run_attempt(
             codex_spec(repair_rounds=1), "task", self.workdir,
             validate=self.json_validator(),
@@ -819,6 +833,7 @@ class UsageTest(FakeCliCase):
             ]
         )
         agent = AgentDef(name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n")
+        self.transcript("sess-1", harness="claude")
         report = run_attempt(
             RunSpec(key="fixture__claude", harness="claude", required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS")),
             "task", self.workdir,
@@ -842,6 +857,7 @@ class ResumeTest(FakeCliCase):
                 }
             ]
         )
+        self.transcript("th_9")
         report = run_attempt(
             codex_spec(), "task body", self.workdir,
             validate=self.json_validator(),
@@ -855,6 +871,32 @@ class ResumeTest(FakeCliCase):
         self.assertIn("th_9", call["argv"])
         self.assertTrue(call["stdin"].startswith("RESUME:"))
         self.assertIn("task body", call["stdin"])
+
+    def test_a_session_this_host_never_saw_runs_fresh(self) -> None:
+        # No transcript under the CLI's home: a resume could only fail, so
+        # the attempt runs fresh and says so, instead of spending itself.
+        self.scenario(
+            [
+                {
+                    "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+                    "exit": 0,
+                }
+            ]
+        )
+        with mock.patch.object(sys, "stderr", new=io.StringIO()) as err:
+            report = run_attempt(
+                codex_spec(), "task body", self.workdir,
+                validate=self.json_validator(),
+                session_ref="th_gone",
+                poll_seconds=0.05,
+            )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertFalse(report.resumed)
+        call = self.recorded_call(0)
+        self.assertNotIn("resume", call["argv"])
+        self.assertFalse(call["stdin"].startswith("RESUME:"))
+        self.assertIn("th_gone", err.getvalue())
+        self.assertIn("running fresh", err.getvalue())
 
 
 class CancelTest(FakeCliCase):

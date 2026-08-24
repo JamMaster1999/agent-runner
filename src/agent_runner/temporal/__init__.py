@@ -16,6 +16,8 @@ Called from INSIDE a project's activity, never the other way around:
   fresh
 - a resume budget caps how often one session is reopened; past it the
   attempt falls back to a fresh session, recorded
+- ``run_sandboxed_attempt`` runs the same attempt inside a sandbox the
+  project opened, heartbeating only on what it fetched from its stream
 
 Core never imports this package; importing it without the ``temporalio``
 distribution fails with install guidance.
@@ -40,3 +42,4 @@ from agent_runner.temporal.retry import (  # noqa: E402,F401
     application_error_for,
     recommended_retry_policy,
 )
+from agent_runner.temporal.sandbox import run_sandboxed_attempt  # noqa: E402,F401

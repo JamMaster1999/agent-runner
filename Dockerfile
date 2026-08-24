@@ -37,12 +37,11 @@ LABEL org.opencontainers.image.title="agent-runner base" \
       io.agent-runner.claude-code-version="${CLAUDE_CODE_VERSION}" \
       io.agent-runner.codex-cli-version="${CODEX_CLI_VERSION}"
 
-# System deps: Chrome for the cdp_browser resource, procps for the orphan
-# sweep's pgrep, git + curl + certs as CLI baseline.
+# System deps: Chrome for the cdp_browser resource, git + curl + certs as
+# CLI baseline.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
-        procps \
         git \
         curl \
         ca-certificates \

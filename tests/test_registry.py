@@ -66,19 +66,6 @@ class BuiltinRegistrationTest(unittest.TestCase):
             ),
         )
 
-    def test_registration_order_feeds_the_reaper_hint(self) -> None:
-        # The reaper's orphan hint joins names and pgrep patterns in
-        # registration order; the built-ins must reproduce the pre-adapter
-        # text verbatim. Prefix assertion: later registrations (the stub
-        # below) may follow.
-        adapters = registered_adapters()[:2]
-        self.assertEqual([adapter.name for adapter in adapters], ["codex", "claude"])
-        self.assertEqual("/".join(adapter.name for adapter in adapters), "codex/claude")
-        self.assertEqual(
-            "|".join(pattern for adapter in adapters for pattern in adapter.orphan_patterns()),
-            "codex exec|claude",
-        )
-
     def test_unknown_backend_raises_terminal_runner_error(self) -> None:
         with self.assertRaises(RunnerError) as ctx:
             get_adapter("no-such-harness")
@@ -137,7 +124,7 @@ class StubPluggabilityTest(unittest.TestCase):
         self.assertIsNone(adapter.build_followup(None, Path("/nonexistent"), "ref"))
         self.assertEqual(adapter.bind_credentials(), {})
         self.assertEqual(adapter.env_overrides(), {})
-        self.assertEqual(adapter.orphan_patterns(), ["stub-harness"])
+        self.assertTrue(adapter.session_present("any-ref"))
 
 
 if __name__ == "__main__":

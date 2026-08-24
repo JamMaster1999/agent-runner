@@ -11,6 +11,9 @@ RUNNER_CLAUDE_CLI). Behavior is scripted per invocation:
     {"emit": [ ...JSON objects printed to stdout as JSONL... ],
      "emit_every": seconds,     # pause between emitted lines (a slow agent)
      "stderr": "text",
+     "keep_writing": {"path": "...", "every": s, "seconds": s},
+                                # stream nothing but append to a file on a
+                                # cadence (a long shell step still working)
      "write": [{"path": "...", "text": "..."}],
      "sleep": seconds,          # produce nothing, stay alive (a wedged agent)
      "exit": code}
@@ -71,6 +74,14 @@ def main() -> None:
     if call.get("stderr"):
         sys.stderr.write(call["stderr"])
         sys.stderr.flush()
+    busy = call.get("keep_writing")
+    if busy:
+        os.makedirs(os.path.dirname(busy["path"]) or ".", exist_ok=True)
+        deadline = time.monotonic() + float(busy["seconds"])
+        while time.monotonic() < deadline:
+            with open(busy["path"], "a") as fh:
+                fh.write("tick\n")
+            time.sleep(float(busy.get("every", 0.5)))
     for item in call.get("write", []):
         directory = os.path.dirname(item["path"])
         if directory:
