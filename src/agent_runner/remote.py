@@ -5,16 +5,14 @@ prompt delivery, validation, repair rounds, reaping, all in situ — and the
 supervisor outside sees only a line stream. Two sides, one module:
 
 - ``serve`` is the sandbox side: read one ``AttemptRequest`` from stdin,
-  run the attempt, write JSON events to stdout as they happen (session,
-  progress, usage, a tick every few seconds so silence is never
+  run the attempt, write JSON events to stdout as they happen (its pid,
+  session, progress, usage, a tick every few seconds so silence is never
   ambiguous) and the ``report`` last. The project owns the entrypoint
   command that calls ``serve`` and hands it the one thing only a project
   can build: the validate closure, from the opaque ``validator`` payload
   it put in the request.
 - ``AttemptRequest`` / ``report_to_json`` / ``report_from_json`` are the
-  wire shapes both sides share; ``pid_file`` is where the attempt process
-  leaves its pid so a supervisor can end it (a cancel, or a retry's
-  stale predecessor) with one ``kill``.
+  wire shapes both sides share.
 
 A supervisor may beat its heartbeat only on what it just fetched from
 this stream. No fetch, no beat.
@@ -39,21 +37,11 @@ from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
 from agent_runner.runtime import AttemptReport, Policy, RunSpec, Usage, Verdict
 from agent_runner.sessions import prepare_session_homes
-from agent_runner.state import key_segment
-from agent_runner.workspace import READY_MARKER, RUNNER_DIR, attempts_root, marker, workspace_root
+from agent_runner.workspace import READY_MARKER, marker, workspace_root
 
 TICK_SECONDS = 15.0
 READY_POLL_SECONDS = 1.0
-
-
-def pid_file(root: str | Path, key: str) -> Path:
-    return Path(root) / RUNNER_DIR / "attempts" / f"{key_segment(key)}.pid"
-
-
-def attempt_workdir(root: str | Path, key: str, attempt: int) -> Path:
-    """``<root>/attempts/<key>/attempt-NN`` — under the workspace, outside
-    what it pushes."""
-    return attempts_root(Path(root)) / key_segment(key) / f"attempt-{attempt:02d}"
+READY_TIMEOUT_SECONDS = 900.0   # the keeper's restore of a large workspace, generously
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,22 +73,23 @@ class AttemptRequest:
     @classmethod
     def from_json(cls, text: str) -> "AttemptRequest":
         data = json.loads(text)
-        spec = _tuples(data.pop("spec"))
-        spec["policy"] = Policy(**_tuples(spec["policy"]))
+        spec = known(RunSpec, data.pop("spec"))
+        spec["policy"] = Policy(**known(Policy, spec["policy"]))
         agent = data.pop("agent")
         return cls(
             spec=RunSpec(**spec),
-            agent=AgentDef(**agent) if agent else None,
-            resources=tuple(data.pop("resources")),
-            watch_dirs=tuple(data.pop("watch_dirs")),
-            **data,
+            agent=AgentDef(**known(AgentDef, agent)) if agent else None,
+            **known(cls, data),
         )
 
 
-def _tuples(fields: dict[str, Any]) -> dict[str, Any]:
-    """JSON has no tuples: every top-level list comes back as one (the
-    frozen dataclasses hold tuples, and equality depends on it)."""
-    return {k: tuple(v) if isinstance(v, list) else v for k, v in fields.items()}
+def known(cls: type, data: dict[str, Any]) -> dict[str, Any]:
+    """The fields ``cls`` has, with JSON's lists back as tuples: a request
+    or event from a newer or older runner on the other side of the wire
+    is read for what both sides know, never refused for a field one of
+    them lacks."""
+    names = {f.name for f in dataclasses.fields(cls)}
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in data.items() if k in names}
 
 
 def report_to_json(report: AttemptReport) -> dict[str, Any]:
@@ -180,17 +169,21 @@ def serve(
         # The keeper may still be restoring the workspace: nothing is read
         # or written under it before the keeper says ready, or a resume
         # would find no transcript and a term gate would check half a tree.
-        while not marker(root, READY_MARKER).exists() and not stop.is_set():
+        ready_by = time.monotonic() + READY_TIMEOUT_SECONDS
+        while not marker(root, READY_MARKER).exists():
+            if stop.is_set():
+                raise AttemptCancelled("cancelled while waiting for the workspace")
+            if time.monotonic() > ready_by:
+                raise RuntimeError(f"the keeper never signalled ready under {root}")
             time.sleep(READY_POLL_SECONDS)
         prepare_session_homes(root)
+        emit("pid", pid=os.getpid())  # the one this supervisor may end, whatever the pid file says later
         if request.pid_file:
             pid = Path(request.pid_file)
             pid.parent.mkdir(parents=True, exist_ok=True)
             pid.write_text(str(os.getpid()))
         if request.checkpoint:
-            directory = Path(request.checkpoint["directory"])
-            directory.mkdir(parents=True, exist_ok=True)
-            workdirs.verify_or_discard(directory, request.checkpoint["term"])
+            workdirs.verify_or_discard(Path(request.checkpoint["directory"]), request.checkpoint["term"])
         report = run_attempt(
             request.spec,
             request.task,

@@ -29,11 +29,9 @@ except ImportError:
 
 from agent_runner import outcomes, remote, state, workdirs  # noqa: E402
 from agent_runner.harness.stream import StreamEvent  # noqa: E402
-from agent_runner.workspace import READY_MARKER, marker  # noqa: E402
+from agent_runner.workspace import READY_MARKER, attempt_workdir, marker, pid_file  # noqa: E402
 from agent_runner.remote import (  # noqa: E402
     AttemptRequest,
-    attempt_workdir,
-    pid_file,
     report_from_json,
     report_to_json,
     serve,
@@ -171,7 +169,7 @@ class ServeTest(ServeCase):
 
     def test_checkpoint_stamps_are_verified_before_the_attempt(self) -> None:
         directory = workdirs.checkpoint_dir(self.workspace, "scrape", "2026FALL")
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True)  # a prior attempt's leftovers
         (directory / "progress.json").write_text('{"term": "2025FALL"}')
         (directory / "kept.json").write_text('{"term": "2026FALL"}')
         self.scenario([{"write": [{"path": str(self.workdir() / "out.json"), "text": '{"ok": true}'}]}])

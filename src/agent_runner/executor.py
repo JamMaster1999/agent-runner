@@ -23,10 +23,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 import threading
-import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -307,10 +305,10 @@ class LocalExecutor(Executor):
         home.mkdir(parents=True, exist_ok=True)
         workspace = home / "work"
         env = {**os.environ, **spec.env, **spec.secrets, WORKSPACE_ENV: str(workspace)}
-        log = (home / "keeper.log").open("ab")
-        process = subprocess.Popen(
-            list(spec.command), cwd=str(home), env=env, stdout=log, stderr=subprocess.STDOUT
-        )
+        with (home / "keeper.log").open("ab") as log:
+            process = subprocess.Popen(
+                list(spec.command), cwd=str(home), env=env, stdout=log, stderr=subprocess.STDOUT
+            )
         sandbox = LocalSandbox(spec.name, home, process, env, str(workspace), dict(spec.tags))
         sandbox.ttl = threading.Timer(spec.ttl_seconds, sandbox.terminate)
         sandbox.ttl.daemon = True
@@ -382,7 +380,9 @@ class LocalSandbox(Sandbox):
         threading.Thread(target=_feed, args=(process, stdin), daemon=True).start()
         proc = LocalProc(process, stderr)
         if timeout is not None:
-            threading.Timer(timeout, proc.kill).start()
+            proc.deadline = threading.Timer(timeout, proc.kill)
+            proc.deadline.daemon = True
+            proc.deadline.start()
         self._procs.append(proc)
         return proc
 
@@ -418,13 +418,17 @@ class LocalProc(Proc):
     def __init__(self, process: subprocess.Popen, stderr: Any) -> None:
         self._process = process
         self._stderr = stderr
+        self.deadline: threading.Timer | None = None
 
     def lines(self) -> Iterator[str]:
         for raw in self._process.stdout:
             yield raw.decode("utf-8", errors="replace").rstrip("\n")
 
     def wait(self) -> int:
-        return self._process.wait()
+        rc = self._process.wait()
+        if self.deadline is not None:
+            self.deadline.cancel()
+        return rc
 
     def poll(self) -> int | None:
         return self._process.poll()
@@ -434,6 +438,8 @@ class LocalProc(Proc):
         return self._stderr.read().decode("utf-8", errors="replace")
 
     def kill(self) -> None:
+        if self.deadline is not None:
+            self.deadline.cancel()
         if self._process.poll() is None:
             self._process.kill()
             self._process.wait()

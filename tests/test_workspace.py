@@ -207,10 +207,6 @@ class CheckpointTest(WorkspaceCase):
         self.s3.fail_on = ""
         self.assertEqual(self.workspace.checkpoint(), 1)
 
-    def test_release_is_the_final_checkpoint(self) -> None:
-        write(self.root, ROLLOUT)
-        self.assertEqual(self.workspace.release(), 1)
-
 
 class RoundTripTest(WorkspaceCase):
     def other(self, name: str = "b") -> Workspace:
@@ -219,7 +215,7 @@ class RoundTripTest(WorkspaceCase):
     def test_the_next_sandbox_pulls_the_last_complete_push(self) -> None:
         write(self.root, ROLLOUT, "transcript\n")
         write(self.root, STAMP, '{"term": "2026FALL"}')
-        self.workspace.release()
+        self.workspace.checkpoint()
         other = self.other()
         self.assertEqual(other.prepare(), "pulled")
         self.assertEqual((other.root / ROLLOUT).read_text(), "transcript\n")
@@ -228,7 +224,7 @@ class RoundTripTest(WorkspaceCase):
 
     def test_a_local_copy_is_used_and_never_clobbered(self) -> None:
         write(self.root, ROLLOUT, "old\n")
-        self.workspace.release()
+        self.workspace.checkpoint()
         other = self.other()
         write(other.root, ROLLOUT, "newer, local\n")
         self.assertEqual(other.prepare(), "local")
@@ -243,7 +239,7 @@ class RoundTripTest(WorkspaceCase):
     def test_a_download_failure_warns_and_the_rest_still_lands(self) -> None:
         write(self.root, ROLLOUT)
         write(self.root, STAMP)
-        self.workspace.release()
+        self.workspace.checkpoint()
         self.s3.fail_on = "download_file"
         with mock.patch.object(sys, "stderr", new=io.StringIO()) as err:
             self.assertEqual(self.other().prepare(), "pulled")
@@ -255,7 +251,7 @@ class CredentialsNeverTravelTest(WorkspaceCase):
         write(self.root, "codex-home/auth.json", '{"tokens": {}}')
         write(self.root, "claude-home/.credentials.json", "{}")
         write(self.root, ROLLOUT)
-        self.workspace.release()
+        self.workspace.checkpoint()
         self.assertEqual(
             sorted(self.s3.objects),
             [f"fleet/{GROUP}/{ROLLOUT}", f"fleet/{GROUP}/{MANIFEST}"],
@@ -373,7 +369,7 @@ class MirrorUnsetTest(unittest.TestCase):
             self.assertEqual(workspace.prepare(), "fresh")
             write(workspace.root, ROLLOUT)
             self.assertEqual(workspace.checkpoint(), 0)
-            self.assertEqual(workspace.release(), 0)
+            self.assertEqual(workspace.checkpoint(), 0)
 
 
 class MissingDependencyTest(unittest.TestCase):

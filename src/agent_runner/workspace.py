@@ -7,15 +7,13 @@ them exactly as they would on a laptop. S3 is the backup, reached through
 an object API only — never a mount (the spikes: a mounted bucket commits
 at ``close()`` and cannot host sqlite).
 
-Three verbs, one rule each:
+Two verbs, one rule each:
 
 - ``prepare`` — a local copy present means use it; absent, pull the last
   complete push from S3; nothing anywhere is a fresh workspace.
 - ``checkpoint`` — push every file that changed since the last push, then
   ``manifest.json`` last. The manifest names the files of a complete push,
   so a pull never restores a half-pushed tree.
-- ``release`` — the final checkpoint.
-
 ``keeper`` is the sandbox's entrypoint: prepare, announce readiness, then
 checkpoint every ``every`` seconds until the release marker appears, and
 once more on the way out. What a terminate can destroy is bounded by that
@@ -37,9 +35,10 @@ from pathlib import Path
 from typing import Iterator
 
 from agent_runner import state
+from agent_runner.state import key_segment
+from agent_runner.workdirs import RUNNER_DIR
 
 MANIFEST = "manifest.json"
-RUNNER_DIR = ".runner"                 # markers and pid files: never pushed
 ATTEMPTS_DIR = "attempts"              # attempt workdirs: never pushed
 READY_MARKER = "ready"
 RELEASE_MARKER = "release"
@@ -65,6 +64,18 @@ def marker(root: Path, name: str) -> Path:
     return Path(root) / RUNNER_DIR / name
 
 
+def attempt_workdir(root: str | Path, key: str, attempt: int) -> Path:
+    """``<root>/attempts/<key>/attempt-NN`` — under the workspace, outside
+    what it pushes."""
+    return attempts_root(Path(root)) / key_segment(key) / f"attempt-{attempt:02d}"
+
+
+def pid_file(root: str | Path, key: str) -> Path:
+    """Where an attempt process leaves its pid, so a supervisor can end it
+    (a cancel, or a retry's stale predecessor) with one ``kill``."""
+    return marker(root, "attempts") / f"{key_segment(key)}.pid"
+
+
 class Workspace:
     """One root, one key group in the mirror. With no mirror configured
     ``prepare`` reports fresh and the push verbs do nothing."""
@@ -76,7 +87,6 @@ class Workspace:
         self._pushed: dict[str, tuple[int, int]] = {}
 
     def key(self, relative: str) -> str:
-        assert self.mirror is not None
         return self.mirror.key(self.group, relative)
 
     def files(self) -> dict[str, tuple[int, int]]:
@@ -138,10 +148,6 @@ class Workspace:
             state.warn(f"manifest upload failed: {exc}")
         return pushed
 
-    def release(self) -> int:
-        return self.checkpoint()
-
-
 def _inside(root: Path, target: Path) -> bool:
     try:
         target.resolve().relative_to(root.resolve())
@@ -160,18 +166,18 @@ def _walk(root: Path) -> Iterator[Path]:
     while frontier:
         folder = frontier.pop()
         try:
-            entries = sorted(os.scandir(folder), key=lambda e: e.name)
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if folder == root and entry.name in (RUNNER_DIR, ATTEMPTS_DIR):
+                        continue
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        frontier.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False) and not state.is_denied(entry.name):
+                        yield Path(entry.path)
         except OSError:
             continue
-        for entry in entries:
-            if folder == root and entry.name in (RUNNER_DIR, ATTEMPTS_DIR):
-                continue
-            if entry.is_symlink():
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                frontier.append(Path(entry.path))
-            elif entry.is_file(follow_symlinks=False) and not state.is_denied(entry.name):
-                yield Path(entry.path)
 
 
 def keeper(root: Path, group: str, every: float, stop: threading.Event) -> int:
@@ -183,10 +189,11 @@ def keeper(root: Path, group: str, every: float, stop: threading.Event) -> int:
     marker(root, READY_MARKER).write_text(verdict)
     print(f"ready {verdict}", flush=True)
     release = marker(root, RELEASE_MARKER)
-    while not stop.is_set() and not release.exists():
-        deadline = time.monotonic() + every
-        while time.monotonic() < deadline and not stop.is_set() and not release.exists():
-            time.sleep(1)
+    next_push = time.monotonic() + every
+    while not release.exists() and not stop.wait(min(every, 1.0)):
+        if time.monotonic() < next_push:
+            continue
+        next_push = time.monotonic() + every
         try:
             pushed = workspace.checkpoint()
         except Exception as exc:  # the keeper outlives any one push
@@ -195,7 +202,7 @@ def keeper(root: Path, group: str, every: float, stop: threading.Event) -> int:
         if pushed:
             print(f"checkpoint {pushed}", flush=True)
     try:
-        pushed = workspace.release()
+        pushed = workspace.checkpoint()
     except Exception as exc:
         state.warn(f"release failed: {exc}")
         return 1

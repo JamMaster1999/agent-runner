@@ -12,7 +12,9 @@ Provider contract (duck-typed, no base class needed):
 
 - ``provision(key, attempt, directory)`` returns a live resource with
   ``variables() -> dict[str, str]`` (JSON-encoded scalar values for the
-  template tokens) and ``close()``
+  template tokens), ``scratch() -> Path`` (the folder it churns on its
+  own, which the stall watchdog must not read as the agent's work), and
+  ``close()``
 - ``null_variables() -> dict[str, str]`` supplies the same tokens as JSON
   ``null`` so one template renders with or without the resource
 """

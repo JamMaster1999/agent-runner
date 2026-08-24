@@ -27,14 +27,6 @@ except ImportError:
 from agent_runner import workdirs  # noqa: E402
 
 
-class AttemptWorkdirTest(unittest.TestCase):
-    def test_layout_and_creation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = workdirs.attempt_workdir(Path(tmp), "research_batch_01", 2)
-            self.assertEqual(path, Path(tmp) / "research_batch_01" / "attempt-02")
-            self.assertTrue(path.is_dir())
-
-
 class CheckpointDirTest(unittest.TestCase):
     def test_term_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

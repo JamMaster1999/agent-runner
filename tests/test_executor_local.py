@@ -128,6 +128,7 @@ class LocalExecutorTest(unittest.TestCase):
     def test_terminate_cancels_the_ttl_timer(self) -> None:
         sandbox = self.create(name="long", ttl=3600)
         sandbox.terminate()
+        sandbox.ttl.join(2)
         self.assertFalse(sandbox.ttl.is_alive())
 
 

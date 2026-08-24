@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from typing import Sequence
+from typing import Any, Sequence
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -33,12 +33,7 @@ from agent_runner import outcomes
 from agent_runner.executor import SANDBOX_GONE, ExecutorGone, Sandbox
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
-from agent_runner.remote import (
-    AttemptRequest,
-    attempt_workdir,
-    pid_file,
-    report_from_json,
-)
+from agent_runner.remote import AttemptRequest, known, report_from_json
 from agent_runner.runtime import AttemptReport, RunSpec, Usage
 from agent_runner.temporal.activity import (
     HeartbeatState,
@@ -51,29 +46,33 @@ from agent_runner.temporal.activity import (
     starting_state,
 )
 from agent_runner.temporal.retry import failure_details
+from agent_runner.workspace import attempt_workdir, pid_file
 
-CANCEL_GRACE_SECONDS = 30.0
+CANCEL_GRACE_SECONDS = 30.0   # how long a cancel waits for the stream to close
+KILL_GRACE_SECONDS = 2        # TERM, then KILL
 EXEC_GRACE_SECONDS = 600.0
 ENDED_POLLS = 3
 STDERR_TAIL = 4000
 
 
+# TERM lets serve end its CLI and say "cancelled"; KILL is unblockable and
+# a zombie runs no code, so after it there is nothing left to wait for.
 KILL_SCRIPT = """
 [ -f "$1" ] || exit 0
 pid=$(cat "$1"); rm -f "$1"
 case "$pid" in ''|*[!0-9]*) exit 0;; esac
 kill -TERM "$pid" 2>/dev/null || exit 0
-for i in $(seq {grace}); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done
+sleep {grace}
 kill -KILL "$pid" 2>/dev/null
 """
 
 
 def kill_stale(sandbox: Sandbox, pidfile: str) -> None:
     """End whatever attempt process a dead supervisor left behind for this
-    key, and wait until it is gone: two attempts of one batch must never
-    run at once, and the file is the only handle the sandbox keeps. The
-    pid is checked to be one — the agent can write to the workspace."""
-    sandbox.exec("sh", "-c", KILL_SCRIPT.format(grace=int(CANCEL_GRACE_SECONDS)), "kill", pidfile).wait()
+    key: two attempts of one batch must never run at once, and the file is
+    the only handle the sandbox keeps. The pid is checked to be one — the
+    agent can write to the workspace."""
+    sandbox.exec("sh", "-c", KILL_SCRIPT.format(grace=KILL_GRACE_SECONDS), "kill", pidfile).wait()
 
 
 async def run_sandboxed_attempt(
@@ -134,13 +133,14 @@ async def run_sandboxed_attempt(
     except ExecutorGone as exc:
         raise _gone(state, info.attempt, started_at, str(exc)) from exc
     activity.heartbeat(state.payload())  # the attempt is running; the first tick is a while off
-    stream_failure: list[ExecutorGone] = []
+    stream_failure: list[BaseException] = []
+    attempt_pid: list[int] = []
 
     def pump() -> None:
         try:
             for line in proc.lines():
                 loop.call_soon_threadsafe(queue.put_nowait, line)
-        except ExecutorGone as exc:
+        except BaseException as exc:  # attributed below, never a silent dead thread
             stream_failure.append(exc)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -161,12 +161,16 @@ async def run_sandboxed_attempt(
             if not isinstance(event, dict):
                 continue
             kind = event.pop("e", None)
+            if kind == "pid":
+                attempt_pid.append(int(event.get("pid") or 0))
+                continue
             if kind == "session":
                 on_session(str(event.get("ref") or ""))
             elif kind == "usage":
                 on_usage(Usage.from_dict(event.get("usage") or {}), Usage.from_dict(event.get("session_usage") or {}))
             elif kind == "event":
-                on_event(StreamEvent(**event))
+                on_event(StreamEvent(**known(StreamEvent, event)))
+                continue  # progress rides the next tick's beat
             elif kind == "report":
                 report = report_from_json(event)
             elif kind == "cancelled":
@@ -179,7 +183,11 @@ async def run_sandboxed_attempt(
                 )
             activity.heartbeat(state.payload())  # only what was just fetched
     except asyncio.CancelledError:
-        await asyncio.to_thread(_kill, sandbox, pidfile)
+        # The pid THIS attempt announced, not whatever the shared pid file
+        # holds by now (a successor scheduled by the heartbeat timeout may
+        # already own it).
+        if attempt_pid:
+            await asyncio.to_thread(_kill, sandbox, attempt_pid[-1])
         await asyncio.to_thread(reader.join, CANCEL_GRACE_SECONDS)
         if not reader.is_alive():
             await asyncio.to_thread(proc.wait)  # the stream closed: reap, never leave a zombie
@@ -194,6 +202,10 @@ async def run_sandboxed_attempt(
         rc = await asyncio.to_thread(proc.wait)
     except ExecutorGone as exc:
         raise _gone(state, info.attempt, started_at, str(exc)) from exc
+    except Exception as exc:
+        raise ApplicationError(
+            f"{spec.key}: the attempt stream from sandbox {sandbox.id} failed: {exc!r}", type=outcomes.INFRA
+        ) from exc
     if report is None:
         if await _ended(sandbox):
             raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
@@ -211,16 +223,17 @@ async def _ended(sandbox: Sandbox) -> bool:
     died without a report; a platform can report the sandbox alive for a
     moment after it ended (Modal: ~1 s), so the answer is asked more than
     once before an exit is blamed on the process alone."""
-    for _ in range(ENDED_POLLS):
+    for attempt in range(ENDED_POLLS):
+        if attempt:
+            await asyncio.sleep(1)
         if await asyncio.to_thread(sandbox.poll) is not None:
             return True
-        await asyncio.sleep(1)
     return False
 
 
-def _kill(sandbox: Sandbox, pidfile: str) -> None:
+def _kill(sandbox: Sandbox, pid: int) -> None:
     try:
-        kill_stale(sandbox, pidfile)
+        sandbox.exec("sh", "-c", f"kill -TERM {pid} 2>/dev/null; sleep {KILL_GRACE_SECONDS}; kill -KILL {pid} 2>/dev/null").wait()
     except ExecutorGone:
         pass
 

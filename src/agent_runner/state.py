@@ -79,7 +79,7 @@ def parse_s3_url(url: str) -> tuple[str, str]:
 
 
 def warn(message: str) -> None:
-    print(f"WARNING: state mirror: {message}", file=sys.stderr)
+    print(f"WARNING: workspace: {message}", file=sys.stderr)
 
 
 def s3_client() -> Any:

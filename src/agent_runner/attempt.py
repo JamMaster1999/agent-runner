@@ -60,7 +60,7 @@ from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Ver
 from agent_runner.sessions import RESUME_PREAMBLE
 from agent_runner.templates import substitute
 from agent_runner.util import write_text
-from agent_runner.workspace import RUNNER_DIR
+from agent_runner.workdirs import RUNNER_DIR
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
 REPAIR_TIMEOUT_MINUTES = 15.0
@@ -69,8 +69,6 @@ REPAIR_TIMEOUT_MINUTES = 15.0
 # about 3.6 minutes, so the window is 4x the typical worst: wide enough for
 # a slow model call, narrow enough to catch a wedge inside a quarter hour.
 DEFAULT_STALL_SECONDS = 900.0
-# The file-activity walk is bounded so a huge folder can never turn the
-# watchdog into the stall; a Chrome profile alone is thousands of files.
 RSS_CHECK_SECONDS = 10.0
 
 # Adapter evidence codes -> the outcome vocabulary: one alias, outcome words

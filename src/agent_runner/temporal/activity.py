@@ -289,7 +289,6 @@ async def run_agent_attempt(
         # Prepared before spawn; verified before ANY resume of work in it.
         # A stamp from another term is discarded loudly and the run is fresh
         # for whatever was lost — time, never correctness.
-        checkpoint.directory.mkdir(parents=True, exist_ok=True)
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
     on_event, on_session, on_usage = heartbeat_callbacks(state)
 

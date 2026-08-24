@@ -23,14 +23,7 @@ import sys
 from pathlib import Path
 
 TERM_STAMP_KEY = "term"
-
-
-def attempt_workdir(root: Path, name: str, attempt: int) -> Path:
-    """The attempt's private workspace: ``{root}/{name}/attempt-NN``,
-    created on first touch."""
-    path = Path(root) / name / f"attempt-{attempt:02d}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+RUNNER_DIR = ".runner"   # the runner's own files inside a folder the model is handed: never the model's
 
 
 def checkpoint_dir(root: Path, child: str, term: str) -> Path:
@@ -79,10 +72,11 @@ def verify_checkpoints(directory: Path, term: str) -> tuple[list[Path], list[Pat
 
 
 def verify_or_discard(directory: Path, term: str) -> list[Path]:
-    """The pre-resume gate: files whose stamp matches the run's term
-    survive; every other file is DISCARDED and the discard is logged loudly
-    (stderr) — the run then scrapes fresh for whatever was lost. Returns the
-    surviving files."""
+    """The pre-resume gate, and the folder's creation: files whose stamp
+    matches the run's term survive; every other file is DISCARDED and the
+    discard is logged loudly (stderr) — the run then scrapes fresh for
+    whatever was lost. Returns the surviving files."""
+    Path(directory).mkdir(parents=True, exist_ok=True)
     matching, mismatched = verify_checkpoints(directory, term)
     for path in mismatched:
         print(

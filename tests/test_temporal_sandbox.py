@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,10 +42,9 @@ if HAVE_TEMPORALIO:
 
     from agent_runner import outcomes, state
     from agent_runner.executor import SANDBOX_GONE, LocalExecutor, SandboxSpec
-    from agent_runner.remote import attempt_workdir, pid_file
+    from agent_runner.workspace import READY_MARKER, attempt_workdir, marker, pid_file
     from agent_runner.runtime import RunSpec
     from agent_runner.temporal.sandbox import run_sandboxed_attempt
-    from agent_runner.workspace import READY_MARKER, marker
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 ENTRY = (sys.executable, str(REPO / "tests" / "fake_cli" / "serve-attempt"))
@@ -181,7 +181,7 @@ class SandboxedAttemptTest(unittest.TestCase):
         self.valid_scenario()
         report, _ = self.attempt()
         self.assertEqual(report.outcome, outcomes.VALID)
-        self.assertIsNotNone(stale.wait(5))
+        self.assertEqual(stale.wait(5), -signal.SIGTERM)
         self.assertNotEqual(int(pidfile.read_text()), stale.pid)
 
     def test_cancel_ends_the_attempt_process_before_propagating(self) -> None:
@@ -203,7 +203,6 @@ class SandboxedAttemptTest(unittest.TestCase):
             return pid
 
         pid = asyncio.run(scenario())
-        self.assertFalse(pidfile.exists())  # the kill takes the file with it
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
