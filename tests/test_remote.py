@@ -161,6 +161,7 @@ class ServeTest(ServeCase):
 
     def test_checkpoint_stamps_are_verified_before_the_attempt(self) -> None:
         directory = checkpoint_dir(self.workspace, "scrape", "2026FALL")
+        directory.mkdir(parents=True)
         (directory / "progress.json").write_text('{"term": "2025FALL"}')
         (directory / "kept.json").write_text('{"term": "2026FALL"}')
         self.scenario([{"write": [{"path": str(self.workdir() / "out.json"), "text": '{"ok": true}'}]}])
