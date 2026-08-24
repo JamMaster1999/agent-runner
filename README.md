@@ -182,6 +182,8 @@ second.usage    # this attempt's spend alone
 
 Without `session_usage`, `second.session_usage` counts from this attempt only; `second.usage` is right either way. See [What an attempt cost](#what-an-attempt-cost).
 
+With the S3 state mirror configured (`AGENT_RUNNER_STATE_S3=s3://bucket/prefix`), the transcript is copied to the bucket every 20 seconds while the attempt runs and once more when it ends. A retry on any host resumes the session from that copy, and a dashboard on any host can follow the conversation live by reading the same object. The file in the CLI's home stays the working copy; the mirror only ever reads it.
+
 
 
 ## What an attempt cost

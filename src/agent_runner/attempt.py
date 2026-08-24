@@ -54,7 +54,12 @@ from agent_runner.harness.base import AgentDef, HarnessAdapter
 from agent_runner.harness.stream import JsonlTail, StreamEvent, parse_json_dict
 from agent_runner.isolation import agent_env
 from agent_runner.runtime import AttemptReport, RunnerError, RunSpec, Usage, Verdict
-from agent_runner.sessions import RESUME_PREAMBLE, ensure_session_local, push_session
+from agent_runner.sessions import (
+    RESUME_PREAMBLE,
+    LiveSessionMirror,
+    ensure_session_local,
+    push_session,
+)
 from agent_runner.templates import substitute
 from agent_runner.util import write_text
 
@@ -456,6 +461,12 @@ def run_attempt(
     resources = resources or {}
     process: subprocess.Popen | None = None
     report: AttemptReport | None = None
+    # Whichever session the CLI is actually in: the one it opened, else
+    # the one it was asked to resume.
+    live_mirror = LiveSessionMirror(
+        adapter, lambda: report.session_ref if report is not None else session_ref
+    )
+    live_mirror.start()
     try:
         for resource_spec in spec.resource_specs:
             provider = resources.get(resource_spec.get("kind"))
@@ -703,5 +714,6 @@ def run_attempt(
         # The CLI is reaped, so its transcript is final: mirror it on every
         # exit path (valid, failed, cancelled) — a lost attempt is exactly
         # the one whose session the next attempt wants.
+        live_mirror.stop()
         if report is not None and report.session_ref:
             push_session(adapter, report.session_ref)
