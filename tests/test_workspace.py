@@ -268,6 +268,24 @@ class CredentialsNeverTravelTest(WorkspaceCase):
         self.assertFalse((self.root / "codex-home/auth.json").exists())
         self.assertTrue((self.root / ROLLOUT).exists())
 
+    def test_the_runners_own_folders_and_credential_components_never_restore(self) -> None:
+        planted = {
+            ".runner/release": b"",
+            "attempts/k/attempt-01/out.json": b"{}",
+            "codex-home/auth.json/x": b"squat",
+            ROLLOUT: b"ok",
+        }
+        for relative, body in planted.items():
+            self.s3.objects[f"fleet/{GROUP}/{relative}"] = body
+        self.s3.put_object(
+            Bucket="b", Key=f"fleet/{GROUP}/{MANIFEST}", Body=json.dumps({"files": list(planted)}).encode()
+        )
+        self.assertEqual(self.workspace.prepare(), "pulled")
+        self.assertEqual(sorted(self.workspace.files()), [ROLLOUT])
+        self.assertFalse((self.root / ".runner").exists())
+        self.assertFalse((self.root / "attempts").exists())
+        self.assertFalse((self.root / "codex-home" / "auth.json").exists())
+
     def test_a_manifest_that_walks_out_of_the_root_is_refused(self) -> None:
         self.s3.objects[f"fleet/{GROUP}/../escaped.jsonl"] = b"nope"
         self.s3.put_object(

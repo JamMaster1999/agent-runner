@@ -399,11 +399,22 @@ def _repair(
             capture = _StampedCapture(process.stdout, stdout)
             try:
                 deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
+                next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                 while process.poll() is None:
                     if should_stop is not None and should_stop():
                         raise AttemptCancelled(f"{spec.key}: repair cancelled by caller")
                     if time.monotonic() > deadline:
                         return False
+                    if spec.policy.rss_limit_mb and time.monotonic() > next_rss_check:
+                        next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
+                        resident = tree_rss_mb(process.pid)
+                        if resident is not None and resident > spec.policy.rss_limit_mb:
+                            print(
+                                f"WARNING: {spec.key}: memory fuse — the repair process tree reached "
+                                f"{resident:.0f} MB (limit {spec.policy.rss_limit_mb} MB); repair abandoned",
+                                file=sys.stderr,
+                            )
+                            return False
                     time.sleep(poll_seconds)
             finally:
                 _terminate(process)
