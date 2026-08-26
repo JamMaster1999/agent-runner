@@ -49,7 +49,7 @@ jobs:
           python-version: "3.13"
       - name: Install the package with the temporal extra
         run: pip install -e '.[temporal]'
-      - name: Run suite (exactly the 4 sanctioned skips)
+      - name: Run suite (exactly the 5 sanctioned skips)
         run: |
           set -o pipefail  # tee must not mask the unittest exit code
           python -m unittest discover tests 2>&1 | tee temporal_output.txt
@@ -57,8 +57,9 @@ jobs:
           #   2x test_stream_fixtures live-capture sweeps (.local/runs never exists in CI)
           #   1x the core import sweep (meaningful only Temporal-less; runs in the core job)
           #   1x the missing-extra guidance path (needs temporalio absent)
-          grep -qxE 'OK \(skipped=4\)' temporal_output.txt || {
-            echo '::error::expected exactly OK (skipped=4) - the temporal test environment recipe broke'
+          #   1x the RSS fallback without /proc (test_liveness; Linux has /proc)
+          grep -qxE 'OK \(skipped=5\)' temporal_output.txt || {
+            echo '::error::expected exactly OK (skipped=5) - the temporal test environment recipe broke'
             exit 1
           }
 
