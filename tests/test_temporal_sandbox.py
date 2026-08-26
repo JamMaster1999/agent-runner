@@ -120,6 +120,14 @@ class SandboxedAttemptTest(unittest.TestCase):
         ))
         return report, beats
 
+    def test_the_exec_env_reaches_the_attempt(self) -> None:
+        """A credential riding the exec lands in the CLI home of that attempt."""
+        self.valid_scenario()
+        report, _ = self.attempt(env={"CODEX_AUTH_JSON": '{"token": "attempt-2"}'})
+        self.assertEqual(report.outcome, outcomes.VALID)
+        auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
+        self.assertEqual(auth.read_text(), '{"token": "attempt-2"}')
+
     def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:
         self.valid_scenario()
         report, beats = self.attempt()

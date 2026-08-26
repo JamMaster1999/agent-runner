@@ -70,6 +70,13 @@ class AdapterHomeTest(unittest.TestCase):
             self.assertEqual((home / "auth.json").read_text(), '{"token": "t"}')
             self.assertEqual((home / "auth.json").stat().st_mode & 0o777, 0o600)
 
+    def test_codex_auth_follows_the_attempt_not_the_first_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = get_adapter("codex")
+            adapter.prepare_home(Path(tmp), {"CODEX_AUTH_JSON": '{"token": "first"}'})
+            home = Path(adapter.prepare_home(Path(tmp), {"CODEX_AUTH_JSON": '{"token": "second"}'})["CODEX_HOME"])
+            self.assertEqual((home / "auth.json").read_text(), '{"token": "second"}')
+
     def test_codex_home_without_a_seed_still_points_at_the_volume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             overrides = get_adapter("codex").prepare_home(Path(tmp), {})

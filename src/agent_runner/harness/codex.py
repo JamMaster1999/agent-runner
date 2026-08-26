@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
 from agent_runner import util
-from agent_runner.auth import seed_credential_file
+from agent_runner.auth import write_credential_file
 from agent_runner.harness.base import (
     COMMON_TERMINAL_MARKERS,
     AgentDef,
@@ -216,13 +216,16 @@ class CodexAdapter(HarnessAdapter):
     )
 
     def prepare_home(self, root: Path, env: Mapping[str, str]) -> dict[str, str]:
-        """CODEX_HOME under the workspace root; auth.json seeded once from
-        the CODEX_AUTH_JSON environment value, mode 0600."""
+        """CODEX_HOME under the workspace root; auth.json written from the
+        CODEX_AUTH_JSON environment value on every attempt, mode 0600.
+        Written, not seeded: an attempt may carry a different login than
+        the last one (a caller rotating credentials), and ``codex exec``
+        never refreshes, so nothing the CLI wrote is lost."""
         home = Path(root) / "codex-home"
         home.mkdir(parents=True, exist_ok=True)
-        seed = env.get("CODEX_AUTH_JSON")
-        if seed:
-            seed_credential_file(home / "auth.json", seed)
+        credential = env.get("CODEX_AUTH_JSON")
+        if credential:
+            write_credential_file(home / "auth.json", credential)
         return {"CODEX_HOME": str(home)}
 
     def materialize_agent(self, agent: AgentDef, header: str) -> str:
