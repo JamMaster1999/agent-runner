@@ -88,9 +88,12 @@ async def run_sandboxed_attempt(
     watch_dirs: Sequence[str] = (),
     config: TemporalRunConfig | None = None,
     timeout_minutes: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> AttemptReport:
     """One attempt in ``sandbox`` via ``command`` (the project's entrypoint
-    that calls ``remote.serve``). Returns the ``valid`` report, raises an
+    that calls ``remote.serve``). ``env`` rides the exec, over the sandbox's
+    own — the place for what changes per attempt, such as the credential
+    a caller rotates. Returns the ``valid`` report, raises an
     ``ApplicationError`` typed with the outcome word otherwise, and
     ``sandbox_gone`` (non-retryable) when the sandbox ended under it."""
     config = config or TemporalRunConfig()
@@ -128,7 +131,7 @@ async def run_sandboxed_attempt(
     try:
         await asyncio.to_thread(kill_stale, sandbox, pidfile)
         proc = await asyncio.to_thread(
-            sandbox.exec, *command, stdin=request.to_json().encode(), timeout=exec_timeout
+            sandbox.exec, *command, stdin=request.to_json().encode(), env=env, timeout=exec_timeout
         )
     except ExecutorGone as exc:
         raise _gone(state, info.attempt, started_at, str(exc)) from exc

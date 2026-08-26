@@ -28,16 +28,22 @@ def normalize_token(value: str) -> str:
 
 
 def seed_credential_file(path: Path, value: str) -> bool:
-    """Write ``value`` to ``path`` (mode 0600) only when the file does not
-    exist yet — seeded once; a refreshed credential the CLI already wrote is
-    never clobbered by the stale seed. Returns True when it wrote.
+    """Write ``value`` to ``path`` only when the file does not exist yet —
+    seeded once; a refreshed credential the CLI already wrote is never
+    clobbered by the stale seed. Returns True when it wrote."""
+    if path.exists():
+        return False
+    write_credential_file(path, value)
+    return True
+
+
+def write_credential_file(path: Path, value: str) -> None:
+    """``value`` at ``path``, mode 0600, replacing whatever was there.
 
     The content lands via a pid-unique sibling temp file and one atomic
     rename, so no reader ever observes a partially written (or empty)
     credential file — the touch-then-write it replaces left the file empty
     for a moment, which a concurrently starting CLI read as broken auth."""
-    if path.exists():
-        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.seed.{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -46,4 +52,3 @@ def seed_credential_file(path: Path, value: str) -> bool:
     finally:
         os.close(fd)
     os.replace(tmp, path)
-    return True
