@@ -28,6 +28,7 @@ def application_error_for(
     reset_cap: timedelta,
     retry_by: datetime | None = None,
     now: datetime | None = None,
+    resets_at: datetime | None = None,
 ) -> ApplicationError:
     """The ApplicationError one non-valid attempt outcome raises.
 
@@ -42,12 +43,13 @@ def application_error_for(
     start and finish (the activity's deadline less a margin): a reset
     beyond it fails the attempt non-retryable now instead of idling to
     the backstop. A ``retry_by`` already behind ``now`` is the server's
-    timeout to report, not ours. ``auth`` is non-retryable: the activity
-    fails fast and the caller alerts."""
+    timeout to report, not ours. ``resets_at`` overrides the report's own
+    (a pool's earliest free account). ``auth`` is non-retryable: the
+    activity fails fast and the caller alerts."""
     message = report.error or f"attempt ended {report.outcome}"
     if report.outcome == outcomes.RATE_LIMITED:
         now = now or datetime.now(timezone.utc)
-        resets_at = report.resets_at
+        resets_at = resets_at or report.resets_at
         if resets_at is not None and retry_by is not None and now < retry_by < resets_at:
             return ApplicationError(
                 f"{message} — the limit lifts at {resets_at.isoformat(timespec='seconds')}, "

@@ -33,6 +33,7 @@ from agent_runner import outcomes
 from agent_runner.executor import SANDBOX_GONE, ExecutorGone, Sandbox
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
+from agent_runner.pool import Pool
 from agent_runner.remote import AttemptRequest, known, report_from_json
 from agent_runner.runtime import AttemptReport, RunSpec, Usage
 from agent_runner.temporal.activity import (
@@ -89,15 +90,19 @@ async def run_sandboxed_attempt(
     config: TemporalRunConfig | None = None,
     timeout_minutes: float | None = None,
     env: Mapping[str, str] | None = None,
+    pool: Pool | None = None,
 ) -> AttemptReport:
     """One attempt in ``sandbox`` via ``command`` (the project's entrypoint
     that calls ``remote.serve``). ``env`` rides the exec, over the sandbox's
-    own — the place for what changes per attempt, such as the credential
-    a caller rotates. Returns the ``valid`` report, raises an
+    own — the place for what changes per attempt; ``pool`` adds the
+    credential this attempt's slot holds (agent_runner.pool). Returns the ``valid`` report, raises an
     ``ApplicationError`` typed with the outcome word otherwise, and
     ``sandbox_gone`` (non-retryable) when the sandbox ended under it."""
     config = config or TemporalRunConfig()
     info = activity.info()
+    slot = pool.slot(info.attempt) if pool else 0
+    if pool:
+        env = {**(env or {}), **pool.env(slot)}
     state = starting_state(spec.key, info, prior_heartbeat_details(), agent, config)
     state.sandbox = sandbox.id
     pidfile = str(pid_file(sandbox.workspace, spec.key))
@@ -218,7 +223,7 @@ async def run_sandboxed_attempt(
             error=f"{spec.key}: attempt process exited {rc} without a report",
             detail=(await asyncio.to_thread(proc.stderr))[-STDERR_TAIL:],
         )
-    return conclude(state, info, report, started_at, config)
+    return conclude(state, info, report, started_at, config, pool, slot)
 
 
 async def _ended(sandbox: Sandbox) -> bool:
