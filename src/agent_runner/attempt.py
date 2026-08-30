@@ -63,7 +63,6 @@ from agent_runner.util import write_text
 from agent_runner.workdirs import RUNNER_DIR
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
-REPAIR_TIMEOUT_MINUTES = 15.0
 # Fifteen minutes of total silence. Measured across the 60 most recent
 # production transcripts, the worst gap between events on a healthy run is
 # about 3.6 minutes, so the window is 4x the typical worst: wide enough for
@@ -336,6 +335,64 @@ def _apply(report: AttemptReport, spec: RunSpec, failure: RunnerError) -> Attemp
     return report
 
 
+def _supervise(
+    process: subprocess.Popen,
+    key: str,
+    name: str,
+    drain: Callable[[], bool | RunnerError],
+    *,
+    deadline: float,
+    stall_seconds: float,
+    watched: Sequence[Path],
+    unwatched: Sequence[Path],
+    rss_limit_mb: int | None,
+    should_stop: Callable[[], bool] | None,
+    poll_seconds: float,
+) -> tuple[str, str] | RunnerError | None:
+    """Wait for a CLI under the attempt's rules — the first turn and every
+    repair turn alike. None when it exited on its own; (outcome, error) when
+    a rule ended it: the deadline, the memory fuse, or the stall window —
+    silence on the stream AND no file written under ``watched``, since a
+    long shell command streams nothing and still works. A typed fatal the
+    stream reveals comes back as the RunnerError. Cancel raises."""
+    last_output = time.monotonic()
+    last_write = newest_mtime(watched, unwatched)
+    next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
+    while process.poll() is None:
+        produced = drain()
+        if isinstance(produced, RunnerError):
+            _terminate(process)
+            return produced
+        if produced:
+            last_output = time.monotonic()
+        if should_stop is not None and should_stop():
+            _terminate(process)
+            raise AttemptCancelled(f"{key}: attempt cancelled by caller")
+        if time.monotonic() > deadline:
+            _terminate(process)
+            return outcomes.TIMEOUT, f"{key}: timed out waiting for {name}"
+        if rss_limit_mb and time.monotonic() > next_rss_check:
+            next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
+            resident = tree_rss_mb(process.pid)
+            if resident is not None and resident > rss_limit_mb:
+                _terminate(process)
+                return outcomes.INFRA, (
+                    f"{key}: memory fuse — the {name} process tree reached {resident:.0f} MB (limit {rss_limit_mb} MB)"
+                )
+        if stall_seconds and time.monotonic() - last_output > stall_seconds:
+            written = newest_mtime(watched, unwatched)
+            if written is not None and (last_write is None or written > last_write):
+                last_write = written
+                last_output = time.monotonic()
+                continue
+            _terminate(process)
+            return outcomes.STALLED, (
+                f"{key}: {name} produced no output and wrote no file for {stall_seconds:g} seconds while still running"
+            )
+        time.sleep(poll_seconds)
+    return None
+
+
 def _repair(
     adapter: HarnessAdapter,
     spec: RunSpec,
@@ -347,23 +404,26 @@ def _repair(
     emit: Callable[[StreamEvent], None],
     poll_seconds: float,
     should_stop: Callable[[], bool] | None,
-) -> bool:
-    """One repair round: message the attempt's own session with the
-    project's repair text instead of burning a full re-run. The session
-    already holds the research context, so a repair costs seconds. False on
-    any failure — the caller falls back to the normal retry machinery."""
+    deadline: float,
+    stall_seconds: float,
+    watched: Sequence[Path],
+    unwatched: Sequence[Path],
+) -> str | tuple[str, str] | None:
+    """One repair round in the attempt's own session, under ``_supervise``'s
+    rules. "ran" when it finished, (outcome, error) when a rule ended it,
+    None when nothing ran."""
     message = verdict.repair_message
     if not message:
-        return False
+        return None
     session_ref = adapter.session_ref_from_log(stdout_path)
     if not session_ref:
-        return False
+        return None
     try:
         followup = adapter.build_followup(spec, workdir, session_ref)
     except RunnerError:
-        return False
+        return None
     if followup is None:
-        return False
+        return None
     emit(
         StreamEvent(
             "repair_started",
@@ -397,36 +457,33 @@ def _repair(
                 stderr=stderr,
             )
             capture = _StampedCapture(process.stdout, stdout)
+
+            def drain() -> bool:
+                lines = repair_tail.read_new_lines()
+                for line in lines:
+                    for event in repair_parser.parse_line(line):
+                        emit(event)
+                return bool(lines)
+
             try:
-                deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
-                next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
-                while process.poll() is None:
-                    if should_stop is not None and should_stop():
-                        raise AttemptCancelled(f"{spec.key}: repair cancelled by caller")
-                    if time.monotonic() > deadline:
-                        return False
-                    if spec.policy.rss_limit_mb and time.monotonic() > next_rss_check:
-                        next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
-                        resident = tree_rss_mb(process.pid)
-                        if resident is not None and resident > spec.policy.rss_limit_mb:
-                            print(
-                                f"WARNING: {spec.key}: memory fuse — the repair process tree reached "
-                                f"{resident:.0f} MB (limit {spec.policy.rss_limit_mb} MB); repair abandoned",
-                                file=sys.stderr,
-                            )
-                            return False
-                    time.sleep(poll_seconds)
+                ended = _supervise(
+                    process, spec.key, adapter.display_name, drain,
+                    deadline=deadline, stall_seconds=stall_seconds, watched=watched, unwatched=unwatched,
+                    rss_limit_mb=spec.policy.rss_limit_mb, should_stop=should_stop, poll_seconds=poll_seconds,
+                )
+                if ended is not None:
+                    return ended
             finally:
                 _terminate(process)
                 capture.join()
     except OSError:
-        return False
+        return None
     finally:
         if process is not None:
             for line in repair_tail.read_new_lines():
                 for event in repair_parser.parse_line(line):
                     emit(event)
-    return process is not None and process.returncode == 0
+    return "ran" if process is not None and process.returncode == 0 else None
 
 
 def run_attempt(
@@ -567,7 +624,7 @@ def run_attempt(
 
         fatal_errors: list[RunnerError] = []
 
-        def drain_streams() -> bool:
+        def drain_streams() -> bool | RunnerError:
             """Consume everything the CLI produced since the last pass;
             True when that was anything at all — the watchdog's proof that
             the agent is still producing, not merely running."""
@@ -599,7 +656,9 @@ def run_attempt(
             hook_events = hook_drain.drain()
             for event in hook_events:
                 emit(event)
-            return bool(lines or hook_events)
+            # A typed fatal is proof the attempt cannot succeed; waiting out
+            # the CLI's own retry ladder buys nothing.
+            return fatal_errors[0] if fatal_errors else bool(lines or hook_events)
 
         # The prompt reaches the CLI as a file on stdin: the kernel feeds it,
         # so a CLI that never drains stdin wedges nothing on this side.
@@ -635,7 +694,6 @@ def run_attempt(
                 )
                 deadline = time.monotonic() + timeout * 60
                 stall_seconds = _stall_seconds(spec)
-                last_output = time.monotonic()
                 # The agent's work, not the runner's own files or a
                 # browser profile rewriting itself.
                 watched = (workdir, *watch_dirs)
@@ -645,69 +703,18 @@ def run_attempt(
                     spawn.stderr_path,
                     *(resource.scratch() for resource in provisioned),
                 )
-                last_write = newest_mtime(watched, unwatched)
-                next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
-                while process.poll() is None:
-                    if drain_streams():
-                        last_output = time.monotonic()
-                    if fatal_errors:
-                        # The CLI just proved this attempt cannot succeed;
-                        # waiting out its own retry ladder buys nothing. The
-                        # first typed fatal decides the outcome.
-                        _terminate(process)
-                        return _apply(report, spec, fatal_errors[0])
-                    if should_stop is not None and should_stop():
-                        _terminate(process)
-                        raise AttemptCancelled(
-                            f"{spec.key}: attempt cancelled by caller"
-                        )
-                    if time.monotonic() > deadline:
-                        _terminate(process)
-                        report.outcome = outcomes.TIMEOUT
-                        report.error = (
-                            f"{spec.key}: timed out after {timeout:g} minutes "
-                            f"waiting for {adapter.display_name}"
-                        )
-                        return report
-                    if spec.policy.rss_limit_mb and time.monotonic() > next_rss_check:
-                        next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
-                        resident = tree_rss_mb(process.pid)
-                        if resident is not None and resident > spec.policy.rss_limit_mb:
-                            _terminate(process)
-                            report.outcome = outcomes.INFRA
-                            report.error = (
-                                f"{spec.key}: memory fuse — the {adapter.display_name} "
-                                f"process tree reached {resident:.0f} MB "
-                                f"(limit {spec.policy.rss_limit_mb} MB)"
-                            )
-                            return report
-                    if stall_seconds and time.monotonic() - last_output > stall_seconds:
-                        # Silent is not the same as dead: a long shell
-                        # command streams nothing and still writes files.
-                        # Any write under the watched folders since the
-                        # last look is proof of work and restarts the clock.
-                        written = newest_mtime(watched, unwatched)
-                        if written is not None and (last_write is None or written > last_write):
-                            last_write = written
-                            last_output = time.monotonic()
-                            continue
-                        # Alive is not producing: a CLI whose helper died
-                        # under it holds its process open and streams
-                        # nothing, and a heartbeat that watches the process
-                        # calls that healthy until the caller's multi-hour
-                        # backstop. Silence for the window ends the attempt
-                        # now, so the retry gets a fresh CLI in minutes.
-                        _terminate(process)
-                        report.outcome = outcomes.STALLED
-                        report.error = (
-                            f"{spec.key}: {adapter.display_name} produced no output "
-                            f"and wrote no file for {stall_seconds:g} seconds while still running"
-                        )
-                        report.detail = adapter.error_report(
-                            spawn.stdout_path, spawn.stderr_path
-                        )
-                        return report
-                    time.sleep(poll_seconds)
+                ended = _supervise(
+                    process, spec.key, adapter.display_name, drain_streams,
+                    deadline=deadline, stall_seconds=stall_seconds, watched=watched, unwatched=unwatched,
+                    rss_limit_mb=spec.policy.rss_limit_mb, should_stop=should_stop, poll_seconds=poll_seconds,
+                )
+                if isinstance(ended, RunnerError):
+                    return _apply(report, spec, ended)
+                if ended is not None:
+                    report.outcome, report.error = ended
+                    if report.outcome == outcomes.STALLED:
+                        report.detail = adapter.error_report(spawn.stdout_path, spawn.stderr_path)
+                    return report
             finally:
                 # Never leak a live agent child: any exit from this block —
                 # cancellation, telemetry crash, KeyboardInterrupt — reaps it.
@@ -757,8 +764,12 @@ def run_attempt(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
                     workdir / RUNNER_DIR / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
+                    deadline, stall_seconds, watched, unwatched,
                 )
-                if not repaired:
+                if isinstance(repaired, tuple):
+                    report.outcome, report.error = repaired
+                    return report
+                if repaired is None:
                     break  # nothing ran; the workdir is unchanged
                 report.repair_rounds_used += 1
                 retry_verdict = validate(workdir)
