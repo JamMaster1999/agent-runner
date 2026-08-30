@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -45,6 +46,9 @@ if HAVE_TEMPORALIO:
     from agent_runner.workspace import READY_MARKER, attempt_workdir, marker, pid_file
     from agent_runner.runtime import RunSpec
     from agent_runner.temporal.sandbox import run_sandboxed_attempt
+    from agent_runner.pool import Pool
+    from agent_runner.temporal.activity import TemporalRunConfig
+    from agent_runner.temporal.retry import RESET_DELAY_FLOOR
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 ENTRY = (sys.executable, str(REPO / "tests" / "fake_cli" / "serve-attempt"))
@@ -127,6 +131,25 @@ class SandboxedAttemptTest(unittest.TestCase):
         self.assertEqual(report.outcome, outcomes.VALID)
         auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
         self.assertEqual(auth.read_text(), '{"token": "attempt-2"}')
+
+    def test_a_pool_credential_reaches_the_attempt(self) -> None:
+        self.valid_scenario()
+        pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
+        report, _ = self.attempt(pool=pool)
+        self.assertEqual(report.outcome, outcomes.VALID)
+        auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
+        self.assertEqual(auth.read_text(), '{"token": "slot-0"}')
+
+    def test_a_rate_limited_attempt_holds_its_pool_slot_and_retries_on_the_next(self) -> None:
+        pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
+        self.scenario([{"stderr": "usage limit reached — please run /login or wait for the window", "exit": 1}])
+        with self.assertRaises(ApplicationError) as caught:
+            self.attempt(pool=pool, config=TemporalRunConfig(rate_limit_backoff=timedelta(minutes=20)))
+        self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
+        self.assertAlmostEqual(
+            pool.held[0], datetime.now(timezone.utc) + timedelta(minutes=20), delta=timedelta(seconds=10)
+        )
+        self.assertEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR, "slot 1 is free: retry promptly")
 
     def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:
         self.valid_scenario()
