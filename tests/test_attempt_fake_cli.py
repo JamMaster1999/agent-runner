@@ -529,6 +529,52 @@ class RepairTest(FakeCliCase):
         self.assertIn("th_1", followup["argv"])
         self.assertEqual(followup["stdin"], "REPAIR: set ok=true in out.json")
 
+    def repair_scenario(self, followup: dict) -> None:
+        """Call 0 writes an invalid result; call 1 is the repair round."""
+        self.scenario([
+            {
+                "emit": [{"type": "thread.started", "thread_id": "th_1"}],
+                "write": [{"path": str(self.out_path()), "text": '{"ok": false}'}],
+                "exit": 0,
+            },
+            followup,
+        ])
+
+    def test_a_silent_repair_round_ends_stalled_not_invalid_schema(self) -> None:
+        self.repair_scenario({"sleep": 30, "exit": 0})
+        start = time.monotonic()
+        report = run_attempt(
+            codex_spec(repair_rounds=1, policy=Policy(stall_seconds=0.5)), "task", self.workdir,
+            validate=self.json_validator(), poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.STALLED)
+        self.assertIn("repair round 1", report.error)
+        self.assertLess(time.monotonic() - start, 15)
+
+    def test_a_repair_round_that_keeps_writing_files_is_alive_and_finishes(self) -> None:
+        self.repair_scenario({
+            "keep_writing": {"path": str(self.workdir / "scratch" / "progress.log"), "seconds": 2, "every": 0.2},
+            "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+            "exit": 0,
+        })
+        report = run_attempt(
+            codex_spec(repair_rounds=1, policy=Policy(stall_seconds=0.5)), "task", self.workdir,
+            validate=self.json_validator(), poll_seconds=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual(report.repair_rounds_used, 1)
+
+    def test_a_repair_round_past_the_attempt_deadline_ends_timeout(self) -> None:
+        self.repair_scenario({"sleep": 30, "exit": 0})
+        start = time.monotonic()
+        report = run_attempt(
+            codex_spec(repair_rounds=1, policy=Policy(stall_seconds=0.0)), "task", self.workdir,
+            validate=self.json_validator(), poll_seconds=0.05, timeout_minutes=0.05,
+        )
+        self.assertEqual(report.outcome, outcomes.TIMEOUT)
+        self.assertIn("repair round 1 timed out", report.error)
+        self.assertLess(time.monotonic() - start, 15)
+
     def test_claude_invalid_schema_repairs_into_the_open_session(self) -> None:
         self.scenario(
             [

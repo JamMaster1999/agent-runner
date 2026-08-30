@@ -63,7 +63,6 @@ from agent_runner.util import write_text
 from agent_runner.workdirs import RUNNER_DIR
 
 DEFAULT_ATTEMPT_TIMEOUT_MINUTES = 60.0
-REPAIR_TIMEOUT_MINUTES = 15.0
 # Fifteen minutes of total silence. Measured across the 60 most recent
 # production transcripts, the worst gap between events on a healthy run is
 # about 3.6 minutes, so the window is 4x the typical worst: wide enough for
@@ -347,23 +346,29 @@ def _repair(
     emit: Callable[[StreamEvent], None],
     poll_seconds: float,
     should_stop: Callable[[], bool] | None,
-) -> bool:
+    deadline: float,
+    stall_seconds: float,
+    watched: Sequence[Path],
+    unwatched: Sequence[Path],
+) -> str | None:
     """One repair round: message the attempt's own session with the
-    project's repair text instead of burning a full re-run. The session
-    already holds the research context, so a repair costs seconds. False on
-    any failure — the caller falls back to the normal retry machinery."""
+    project's repair text instead of burning a full re-run. The round runs
+    under the attempt's own rules — its ``deadline`` and the stall window
+    over stream output or file writes. Returns ``"ran"`` when the session
+    finished, ``timeout``/``stalled`` when those rules ended it, None when
+    nothing ran — the caller falls back to the normal retry machinery."""
     message = verdict.repair_message
     if not message:
-        return False
+        return None
     session_ref = adapter.session_ref_from_log(stdout_path)
     if not session_ref:
-        return False
+        return None
     try:
         followup = adapter.build_followup(spec, workdir, session_ref)
     except RunnerError:
-        return False
+        return None
     if followup is None:
-        return False
+        return None
     emit(
         StreamEvent(
             "repair_started",
@@ -398,13 +403,27 @@ def _repair(
             )
             capture = _StampedCapture(process.stdout, stdout)
             try:
-                deadline = time.monotonic() + REPAIR_TIMEOUT_MINUTES * 60
+                last_output = time.monotonic()
+                last_write = newest_mtime(watched, unwatched)
                 next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                 while process.poll() is None:
                     if should_stop is not None and should_stop():
                         raise AttemptCancelled(f"{spec.key}: repair cancelled by caller")
+                    for line in repair_tail.read_new_lines():
+                        last_output = time.monotonic()
+                        for event in repair_parser.parse_line(line):
+                            emit(event)
                     if time.monotonic() > deadline:
-                        return False
+                        _terminate(process)
+                        return outcomes.TIMEOUT
+                    if stall_seconds and time.monotonic() - last_output > stall_seconds:
+                        written = newest_mtime(watched, unwatched)
+                        if written is not None and (last_write is None or written > last_write):
+                            last_write = written
+                            last_output = time.monotonic()
+                            continue
+                        _terminate(process)
+                        return outcomes.STALLED
                     if spec.policy.rss_limit_mb and time.monotonic() > next_rss_check:
                         next_rss_check = time.monotonic() + RSS_CHECK_SECONDS
                         resident = tree_rss_mb(process.pid)
@@ -414,19 +433,19 @@ def _repair(
                                 f"{resident:.0f} MB (limit {spec.policy.rss_limit_mb} MB); repair abandoned",
                                 file=sys.stderr,
                             )
-                            return False
+                            return None
                     time.sleep(poll_seconds)
             finally:
                 _terminate(process)
                 capture.join()
     except OSError:
-        return False
+        return None
     finally:
         if process is not None:
             for line in repair_tail.read_new_lines():
                 for event in repair_parser.parse_line(line):
                     emit(event)
-    return process is not None and process.returncode == 0
+    return "ran" if process is not None and process.returncode == 0 else None
 
 
 def run_attempt(
@@ -757,8 +776,17 @@ def run_attempt(
                     adapter, spec, verdict, workdir, spawn.stdout_path,
                     workdir / RUNNER_DIR / f"repair-{round_number}.md",
                     env, emit, poll_seconds, should_stop,
+                    deadline, stall_seconds, watched, unwatched,
                 )
-                if not repaired:
+                if repaired in (outcomes.TIMEOUT, outcomes.STALLED):
+                    report.outcome = repaired
+                    report.error = (
+                        f"{spec.key}: repair round {round_number} "
+                        + ("timed out" if repaired == outcomes.TIMEOUT else "produced no output and wrote no file")
+                        + f" — the attempt's {timeout:g}-minute budget and {stall_seconds:g}-second stall window apply to repairs too"
+                    )
+                    return report
+                if repaired is None:
                     break  # nothing ran; the workdir is unchanged
                 report.repair_rounds_used += 1
                 retry_verdict = validate(workdir)
