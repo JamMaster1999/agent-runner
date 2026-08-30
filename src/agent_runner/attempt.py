@@ -351,12 +351,9 @@ def _repair(
     watched: Sequence[Path],
     unwatched: Sequence[Path],
 ) -> str | None:
-    """One repair round: message the attempt's own session with the
-    project's repair text instead of burning a full re-run. The round runs
-    under the attempt's own rules — its ``deadline`` and the stall window
-    over stream output or file writes. Returns ``"ran"`` when the session
-    finished, ``timeout``/``stalled`` when those rules ended it, None when
-    nothing ran — the caller falls back to the normal retry machinery."""
+    """One repair round in the attempt's own session, under the attempt's
+    deadline and stall window. "ran" when it finished, timeout/stalled when
+    those ended it, None when nothing ran."""
     message = verdict.repair_message
     if not message:
         return None
@@ -780,11 +777,7 @@ def run_attempt(
                 )
                 if repaired in (outcomes.TIMEOUT, outcomes.STALLED):
                     report.outcome = repaired
-                    report.error = (
-                        f"{spec.key}: repair round {round_number} "
-                        + ("timed out" if repaired == outcomes.TIMEOUT else "produced no output and wrote no file")
-                        + f" — the attempt's {timeout:g}-minute budget and {stall_seconds:g}-second stall window apply to repairs too"
-                    )
+                    report.error = f"{spec.key}: repair round {round_number} ended {repaired}"
                     return report
                 if repaired is None:
                     break  # nothing ran; the workdir is unchanged
