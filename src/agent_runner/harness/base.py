@@ -14,7 +14,9 @@ ruled mapping).
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
@@ -298,6 +300,27 @@ class HarnessAdapter(ABC):
         code stands. Default: exit codes tell the truth."""
         return None
 
+    RESET_PATTERN = re.compile(
+        r"try again at\s+([A-Za-z]{3,9} \d{1,2}(?:st|nd|rd|th)?,? \d{4} \d{1,2}:\d{2}\s?[APap]\.?[Mm])"
+    )
+
+    @classmethod
+    def reset_time_in(cls, text: str) -> datetime | None:
+        """The reset moment a subscription CLI's limit text names ("try
+        again at Sep 5th, 2026 6:07 PM"), read in this process's local
+        timezone — the CLI rendered it there. None when the text names
+        none; the caller's default backoff stands."""
+        match = cls.RESET_PATTERN.search(text or "")
+        if not match:
+            return None
+        cleaned = re.sub(r"(\d{1,2})(st|nd|rd|th)", r"\1", match.group(1)).replace(".", "")
+        for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+            try:
+                return datetime.strptime(cleaned, fmt).astimezone()
+            except ValueError:
+                continue
+        return None
+
     def classify(self, text: str) -> RunnerError | None:
         """Terminal-failure evidence from this harness's marker data; None
         means no proof and the core default (``infra``) applies. Callers
@@ -307,12 +330,16 @@ class HarnessAdapter(ABC):
         for code, markers in self.terminal_markers:
             if any(marker in lower for marker in markers):
                 terminal = code in outcomes.TERMINAL
+                resets_at = (
+                    self.reset_time_in(text) if code == outcomes.RATE_LIMITED else None
+                )
                 return RunnerError(
                     f"{self.name} {code} failure reported by the CLI",
                     code=code,
                     retryable=not terminal,
                     alert=terminal,
                     details=text,
+                    resets_at=resets_at,
                 )
         return None
 

@@ -149,3 +149,30 @@ class ClassifyFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResetTimeParsing(unittest.TestCase):
+    """The reset moment named in a subscription CLI's limit text reaches
+    RunnerError.resets_at; text naming none leaves it None."""
+
+    def test_codex_usage_limit_text_names_the_reset(self) -> None:
+        adapter = get_adapter("codex")
+        error = adapter.classify(
+            "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+            "to purchase more credits or try again at Sep 5th, 2026 6:07 PM."
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, outcomes.RATE_LIMITED)
+        self.assertIsNotNone(error.resets_at)
+        local = error.resets_at.astimezone()
+        self.assertEqual(
+            (local.year, local.month, local.day, local.hour, local.minute),
+            (2026, 9, 5, 18, 7),
+        )
+
+    def test_limit_text_without_a_reset_leaves_none(self) -> None:
+        adapter = get_adapter("codex")
+        error = adapter.classify("Rate limit reached, please slow down")
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, outcomes.RATE_LIMITED)
+        self.assertIsNone(error.resets_at)
