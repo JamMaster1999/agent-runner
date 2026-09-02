@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import os as _os
@@ -119,6 +120,25 @@ class ClassifyFailureTest(unittest.TestCase):
             error = get_adapter("claude").classify_failure(text)
             self.assertEqual(error.code, outcomes.RATE_LIMITED)
             self.assertTrue(error.retryable)
+
+    def test_claude_session_limit_text_names_the_reset(self) -> None:
+        # The CLI renders the reset as a bare clock time inside a day (the
+        # next such moment), a date beyond it, minutes dropped on the hour.
+        adapter = get_adapter("claude")
+        now = datetime(2026, 9, 1, 21, 4, tzinfo=timezone.utc)
+        for text, expected in (
+            ("You've hit your session limit · resets 11:20pm (UTC)", datetime(2026, 9, 1, 23, 20, tzinfo=timezone.utc)),
+            ("You've hit your session limit · resets 2:20pm (UTC)", datetime(2026, 9, 2, 14, 20, tzinfo=timezone.utc)),
+            ("You've hit your limit · resets 3pm (UTC)", datetime(2026, 9, 2, 15, 0, tzinfo=timezone.utc)),
+            ("You've hit your weekly limit · resets Sep 5, 6:07pm (UTC)", datetime(2026, 9, 5, 18, 7, tzinfo=timezone.utc)),
+            ("You've hit your weekly limit · resets Jan 2, 2027, 6pm (UTC)", datetime(2027, 1, 2, 18, 0, tzinfo=timezone.utc)),
+        ):
+            self.assertEqual(adapter.reset_time_in(text, now=now), expected, text)
+        error = adapter.classify("claude result success: You've hit your session limit · resets 8:50pm (UTC)")
+        self.assertEqual(error.code, outcomes.RATE_LIMITED)
+        self.assertIsNotNone(error.resets_at)
+        self.assertGreater(error.resets_at, datetime.now(timezone.utc))
+        self.assertEqual((error.resets_at.hour, error.resets_at.minute), (20, 50))
 
     def test_ambiguous_text_is_retryable_infra(self) -> None:
         text = "network flake: connection reset by peer (HTTP 403 from registrar page)"

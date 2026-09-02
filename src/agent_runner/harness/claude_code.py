@@ -14,10 +14,12 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_runner import outcomes, util
 from agent_runner.auth import normalize_token, seed_credential_file
@@ -75,6 +77,33 @@ class ClaudeCodeAdapter(HarnessAdapter):
     terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
         COMMON_TERMINAL_MARKERS
     )
+    # The subscription cap's synthetic turn names its reset the way the CLI
+    # renders times: "resets 11:20pm (UTC)" within a day, "resets Sep 5,
+    # 6:07pm (UTC)" beyond it (with the year when it differs), the minutes
+    # dropped on the hour, the zone the CLI ran in.
+    RESET_PATTERN = re.compile(
+        r"resets (?:([A-Z][a-z]{2} \d{1,2})(?:, (\d{4}))?, )?(\d{1,2})(?::(\d{2}))?(am|pm) \(([^)]+)\)"
+    )
+
+    @classmethod
+    def reset_time_in(cls, text: str, now: datetime | None = None) -> datetime | None:
+        """The reset the limit text names. A bare clock time is the next
+        such moment after ``now``: the CLI omits the date inside a day."""
+        match = cls.RESET_PATTERN.search(text or "")
+        if not match:
+            return None
+        day, year, hour, minute, half, zone_name = match.groups()
+        try:
+            zone = ZoneInfo(zone_name)
+        except ZoneInfoNotFoundError:
+            zone = datetime.now().astimezone().tzinfo  # the CLI's zone is this process's
+        now = (now or datetime.now(timezone.utc)).astimezone(zone)
+        clock = time(int(hour) % 12 + (12 if half == "pm" else 0), int(minute or 0))
+        if day is None:
+            reset = datetime.combine(now.date(), clock, zone)
+            return reset if reset > now else reset + timedelta(days=1)
+        date = datetime.strptime(f"{day} {year or now.year}", "%b %d %Y").date()
+        return datetime.combine(date, clock, zone)
 
     def prepare_home(self, root: Path, env: Mapping[str, str]) -> dict[str, str]:
         """CLAUDE_CONFIG_DIR under the workspace root (config, credentials,
