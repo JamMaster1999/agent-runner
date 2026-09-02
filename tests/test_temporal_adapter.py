@@ -58,6 +58,22 @@ CAP = timedelta(hours=6)
 class RetryMappingTest(unittest.TestCase):
     """C1 / C5: the outcome-to-retry table."""
 
+    def setUp(self) -> None:
+        # The delays below are exact with the jitter pinned to zero; the
+        # jitter itself is asserted once, on its own.
+        pinned = mock.patch.object(retry_module.random, "random", return_value=0.0)
+        pinned.start()
+        self.addCleanup(pinned.stop)
+
+    def test_a_retry_delay_carries_up_to_a_minute_of_jitter(self) -> None:
+        # Two hundred attempts parked on one reset must not return in the
+        # same second: each waits its reset plus a spread of its own.
+        now = datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc)
+        with mock.patch.object(retry_module.random, "random", return_value=0.5):
+            delay = retry_module.rate_limit_delay(now + timedelta(minutes=50), timedelta(minutes=15), CAP, now)
+        self.assertEqual(delay, timedelta(minutes=50, seconds=30))
+        self.assertEqual(retry_module.RESET_DELAY_SPREAD, timedelta(seconds=60))
+
     def test_rate_limited_backs_off_long_and_free(self) -> None:
         report = AttemptReport(outcome=outcomes.RATE_LIMITED, error="throttled")
         error = application_error_for(report, rate_limit_backoff=timedelta(minutes=45), reset_cap=CAP)
@@ -356,7 +372,8 @@ class ActivityRunTest(unittest.TestCase):
         with self.assertRaises(ApplicationError) as caught:
             self.run_activity(act)
         self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
-        self.assertEqual(caught.exception.next_retry_delay, timedelta(minutes=30))
+        self.assertGreaterEqual(caught.exception.next_retry_delay, timedelta(minutes=30))
+        self.assertLessEqual(caught.exception.next_retry_delay, timedelta(minutes=31), "the backoff plus jitter")
 
     def test_prior_heartbeat_details_resume_the_session(self) -> None:
         # Matrix C2: session_ref from heartbeat details -> the next attempt
@@ -572,7 +589,7 @@ class ActivityRunTest(unittest.TestCase):
         self.assertEqual(error.type, outcomes.RATE_LIMITED)
         self.assertFalse(error.non_retryable)
         self.assertGreater(error.next_retry_delay, timedelta(hours=2, minutes=59))
-        self.assertLessEqual(error.next_retry_delay, timedelta(hours=3))
+        self.assertLessEqual(error.next_retry_delay, timedelta(hours=3, minutes=1))
         self.assertEqual(error.details[0]["attempt"]["resets_at"], resets_at.isoformat(timespec="seconds"))
         self.assertEqual(heartbeats[-1][0]["attempts"][-1]["outcome"], outcomes.RATE_LIMITED)
 

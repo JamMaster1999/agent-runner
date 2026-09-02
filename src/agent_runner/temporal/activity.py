@@ -38,7 +38,6 @@ from agent_runner import outcomes, workdirs
 from agent_runner.attempt import AttemptCancelled, run_attempt
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
-from agent_runner.pool import Pool
 from agent_runner.runtime import AttemptReport, RunSpec, Usage, Verdict
 from agent_runner.temporal.retry import application_error_for
 
@@ -60,6 +59,10 @@ class TemporalRunConfig:
     # finish anyway.
     rate_limit_reset_cap: timedelta = timedelta(hours=6)
     rate_limit_reset_margin: timedelta = timedelta(minutes=15)
+    # The pause (jittered) before a sandboxed attempt re-runs in place after
+    # a rate or server limit — the account is over its concurrency or the
+    # provider is busy, and the window is not spent.
+    rate_limit_pause: timedelta = timedelta(seconds=30)
 
 
 @dataclass
@@ -142,6 +145,7 @@ class AttemptRecord:
     session_ref: str | None = None
     resumed: bool | None = None
     resets_at: str | None = None
+    limit_kind: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     usage: dict[str, Any] = field(default_factory=lambda: Usage().as_dict())
@@ -177,6 +181,7 @@ def attempt_record(
             session_ref=_head(report.session_ref, RECORD_REF_LIMIT) if report.session_ref else None,
             resumed=report.resumed,
             resets_at=report.resets_at.isoformat(timespec="seconds") if report.resets_at else None,
+            limit_kind=report.limit_kind,
             started_at=started_at,
             ended_at=ended_at,
             usage=report.usage.as_dict(),
@@ -390,26 +395,20 @@ def conclude(
     report: AttemptReport,
     started_at: str,
     config: TemporalRunConfig,
-    pool: Pool | None = None,
-    slot: int = 0,
+    resets_at: datetime | None = None,
 ) -> AttemptReport:
     """The attempt's last word: its record joins the history, the final
     state is heartbeat-recorded (session_ref for the next attempt's resume,
     even on failure), and anything but ``valid`` becomes the typed retry
-    error. A rate-limited attempt on a pool holds its slot until the reset
-    the CLI named (else ``rate_limit_backoff``), and the retry waits for
-    the pool's next free slot instead: a five-hour limit is one account's,
-    and the next account is usually free."""
+    error. ``resets_at`` overrides the report's own for the retry delay: a
+    pool's next free account, when the attempt ran on one — a five-hour
+    limit is one account's, and the next account is usually free."""
     report.attempts = tuple(state.record(attempt_record(info.attempt, report, started_at, now_iso())))
     activity.heartbeat(state.payload())
     if report.outcome == outcomes.VALID:
         return report
     deadline = activity_deadline(info)
     now = datetime.now(timezone.utc)
-    resets_at = None
-    if pool is not None and report.outcome == outcomes.RATE_LIMITED:
-        pool.hold(slot, report.resets_at or now + config.rate_limit_backoff)
-        resets_at = pool.next_free(now)
     raise application_error_for(
         report,
         rate_limit_backoff=config.rate_limit_backoff,

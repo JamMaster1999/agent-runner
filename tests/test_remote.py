@@ -220,13 +220,14 @@ class WireShapeTest(unittest.TestCase):
             session_ref="th_1",
             error="capped",
             detail="tail",
+            limit_kind="usage",
             usage=Usage(tok_input=1, tok_output=2),
             session_usage=Usage(tok_input=3),
             resumed=True,
             repair_rounds_used=1,
         )
         back = report_from_json(report_to_json(report))
-        for name in ("outcome", "session_ref", "error", "detail", "usage", "session_usage", "resumed", "repair_rounds_used"):
+        for name in ("outcome", "session_ref", "error", "detail", "limit_kind", "usage", "session_usage", "resumed", "repair_rounds_used"):
             self.assertEqual(getattr(back, name), getattr(report, name), name)
 
     def test_the_paths_are_under_the_workspace_and_key_safe(self) -> None:

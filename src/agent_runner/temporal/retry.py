@@ -11,6 +11,7 @@ activity options are the authority.
 
 from __future__ import annotations
 
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -75,6 +76,7 @@ def application_error_for(
 
 
 RESET_DELAY_FLOOR = timedelta(seconds=30)
+RESET_DELAY_SPREAD = timedelta(seconds=60)
 
 
 def rate_limit_delay(
@@ -85,11 +87,11 @@ def rate_limit_delay(
 ) -> timedelta:
     """How long a rate-limited attempt waits: until the CLI's reset time
     when known (floored, so a reset already past retries promptly, and
-    capped by the caller's ``cap``), else the configured backoff."""
-    if resets_at is None:
-        return default
-    wait = resets_at - (now or datetime.now(timezone.utc))
-    return min(max(wait, RESET_DELAY_FLOOR), cap)
+    capped by the caller's ``cap``), else the configured backoff — plus up
+    to a minute of jitter, so the attempts parked on one reset do not all
+    return in the same second."""
+    wait = default if resets_at is None else max(resets_at - (now or datetime.now(timezone.utc)), RESET_DELAY_FLOOR)
+    return min(wait + RESET_DELAY_SPREAD * random.random(), cap)
 
 
 def failure_details(report: AttemptReport) -> dict[str, Any]:
