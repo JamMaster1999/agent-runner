@@ -391,9 +391,8 @@ def conclude(
     even on failure), and anything but ``valid`` becomes the typed retry
     error. A rate-limited attempt on a pool holds its slot until the reset
     the CLI named (else ``rate_limit_backoff``), and the retry waits for
-    the pool's next free slot — never before the reset this attempt named:
-    a shorter hold elsewhere in the pool (a limit text that named no
-    reset) must not wake it early into the same limit."""
+    the pool's next free slot instead: a five-hour limit is one account's,
+    and the next account is usually free."""
     report.attempts = tuple(state.record(attempt_record(info.attempt, report, started_at, now_iso())))
     activity.heartbeat(state.payload())
     if report.outcome == outcomes.VALID:
@@ -403,7 +402,7 @@ def conclude(
     resets_at = None
     if pool is not None and report.outcome == outcomes.RATE_LIMITED:
         pool.hold(slot, report.resets_at or now + config.rate_limit_backoff)
-        resets_at = max(pool.next_free(now), report.resets_at or now)
+        resets_at = pool.next_free(now)
     raise application_error_for(
         report,
         rate_limit_backoff=config.rate_limit_backoff,
