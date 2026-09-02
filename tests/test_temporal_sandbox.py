@@ -151,7 +151,7 @@ class SandboxedAttemptTest(unittest.TestCase):
         )
         self.assertEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR, "slot 1 is free: retry promptly")
 
-    def test_a_named_reset_is_never_retried_early_on_a_free_slot(self) -> None:
+    def test_a_named_reset_holds_its_slot_and_the_retry_rotates_to_a_free_one(self) -> None:
         pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
         reset = (datetime.now() + timedelta(hours=2)).replace(second=0, microsecond=0)
         self.scenario([{
@@ -162,9 +162,9 @@ class SandboxedAttemptTest(unittest.TestCase):
             self.attempt(pool=pool)
         self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
         self.assertAlmostEqual(pool.held[0], reset.astimezone(timezone.utc), delta=timedelta(seconds=1))
-        self.assertAlmostEqual(
-            caught.exception.next_retry_delay, timedelta(hours=2), delta=timedelta(minutes=2),
-            msg="slot 1 is free, but this attempt's limit lifts in two hours",
+        self.assertEqual(
+            caught.exception.next_retry_delay, RESET_DELAY_FLOOR,
+            "slot 0 is held until its reset; slot 1 is free, so the retry runs there now",
         )
 
     def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:
