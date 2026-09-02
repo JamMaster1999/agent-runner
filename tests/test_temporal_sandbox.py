@@ -186,7 +186,6 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
         activity attempt runs the process again after a pause, resuming the
         session, and the account carries less until it earns it back."""
         pool = self.pool(share=6)
-        pool.accounts[0].active = 3  # three sibling attempts on the account
         first = {
             "emit": [{"type": "thread.started", "thread_id": "th_1"}],
             "stderr": "exceeded retry limit, last status: 429 Too Many Requests",
@@ -215,7 +214,10 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
         calls = sorted((self.tmp / "calls").glob("call-*.json"))
         self.assertEqual(len(calls), 2)
         self.assertIn("resume", json.loads(calls[1].read_text())["argv"], "the second run resumed the session")
-        self.assertEqual(pool.accounts[0].cap, 3, "halved from what the account carried (4 of 6)")
+        self.assertEqual(pool.accounts[0].cap, 1, "halved to one: the account carried one")
+        self.assertGreater(pool.accounts[0].held_until, datetime.now(timezone.utc), "and paused")
+        auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
+        self.assertEqual(auth.read_text(), '{"token": "slot-1"}', "the re-run landed on the free account")
         self.assertTrue(any("rate limit on account 0" in (b["progress"].get("message") or "") for b in beats))
 
     async def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:

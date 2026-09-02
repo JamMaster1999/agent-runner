@@ -232,16 +232,18 @@ async def run_sandboxed_attempt(
             slot = await pool.acquire() if pool else None
             try:
                 report = await run_once({**(env or {}), **pool.env(slot)} if pool else env, started_at)
+                # Told while this attempt still counts: the cap halves to what the account carried.
+                now = datetime.now(timezone.utc)
+                kind = report.limit_kind or KIND_SERVER
+                if pool and report.outcome == outcomes.VALID:
+                    pool.succeeded(slot)
+                elif pool and report.outcome == outcomes.RATE_LIMITED:
+                    pool.limited(slot, kind, until=report.resets_at or now + config.rate_limit_backoff)
             finally:
                 if pool:
                     pool.release(slot)
-            if pool and report.outcome == outcomes.VALID:
-                pool.succeeded(slot)
             if not pool or report.outcome != outcomes.RATE_LIMITED:
                 break
-            now = datetime.now(timezone.utc)
-            kind = report.limit_kind or KIND_SERVER
-            pool.limited(slot, kind, until=report.resets_at or now + config.rate_limit_backoff)
             pause = jitter(config.rate_limit_pause)
             if kind == KIND_USAGE or (deadline and now + pause > deadline - config.rate_limit_reset_margin):
                 break
