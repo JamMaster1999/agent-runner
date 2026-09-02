@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 from abc import ABC, abstractmethod
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
@@ -112,6 +113,11 @@ class Sandbox(ABC):
     @abstractmethod
     async def terminate(self) -> None:
         """Destroy the sandbox and everything in it. Idempotent."""
+
+    async def ensure_alive(self) -> None:
+        rc = await self.poll()
+        if rc is not None:
+            raise ExecutorGone(f"sandbox {self.id} has ended (rc={rc})")
 
 
 class Executor(ABC):
@@ -199,11 +205,10 @@ class ModalExecutor(Executor):
             sandbox = await self.modal.Sandbox.from_id.aio(sandbox_id)
         except self.modal.exception.NotFoundError as exc:
             raise ExecutorGone(f"sandbox {sandbox_id} no longer exists") from exc
-        rc = await sandbox.poll.aio()
-        if rc is not None:
-            raise ExecutorGone(f"sandbox {sandbox_id} has ended (rc={rc})")
         tags = await sandbox.get_tags.aio()
-        return ModalSandbox(self, sandbox, tags.get("name", sandbox_id), tags)
+        handle = ModalSandbox(self, sandbox, tags.get("name", sandbox_id), tags)
+        await handle.ensure_alive()
+        return handle
 
     async def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
         found = []
@@ -232,9 +237,7 @@ class ModalSandbox(Sandbox):
         env: Mapping[str, str] | None = None,
         timeout: int | None = None,
     ) -> Proc:
-        rc = await self.poll()
-        if rc is not None:
-            raise ExecutorGone(f"sandbox {self.id} has ended (rc={rc})")
+        await self.ensure_alive()
         async with self.gone_guard():
             # Line-buffered text: the SDK hands over whole lines, so a JSON
             # line is never torn.
@@ -320,9 +323,7 @@ class LocalExecutor(Executor):
                 *spec.command, cwd=str(home), env=env, stdout=log, stderr=asyncio.subprocess.STDOUT
             )
         sandbox = LocalSandbox(spec.name, home, process, env, str(workspace), dict(spec.tags))
-        sandbox.ttl = asyncio.get_running_loop().call_later(
-            spec.ttl_seconds, lambda: asyncio.ensure_future(sandbox.terminate())
-        )
+        sandbox.ttl = asyncio.get_running_loop().call_later(spec.ttl_seconds, sandbox.expire)
         self._sandboxes[sandbox.id] = sandbox
         return sandbox
 
@@ -334,8 +335,9 @@ class LocalExecutor(Executor):
 
     async def attach(self, sandbox_id: str) -> Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
-        if sandbox is None or await sandbox.poll() is not None:
+        if sandbox is None:
             raise ExecutorGone(f"sandbox {sandbox_id} is not running on this host")
+        await sandbox.ensure_alive()
         return sandbox
 
     async def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
@@ -361,6 +363,7 @@ class LocalSandbox(Sandbox):
         self.workspace = workspace
         self.tags = tags
         self.ttl: asyncio.TimerHandle | None = None
+        self._expiry: asyncio.Task[None] | None = None
         self._home = home
         self._process = process
         self._env = env
@@ -373,10 +376,8 @@ class LocalSandbox(Sandbox):
         env: Mapping[str, str] | None = None,
         timeout: int | None = None,
     ) -> Proc:
-        rc = await self.poll()
-        if rc is not None:
-            raise ExecutorGone(f"sandbox {self.id} has ended (rc={rc})")
-        self._procs = [proc for proc in self._procs if proc.poll() is None]
+        await self.ensure_alive()
+        self._procs = [proc for proc in self._procs if proc.running()]
         process = await asyncio.create_subprocess_exec(
             *command,
             env={**self._env, **(env or {})},
@@ -386,18 +387,16 @@ class LocalSandbox(Sandbox):
             stderr=asyncio.subprocess.PIPE,
             limit=LINE_LIMIT,
         )
-        # stdin and stderr each get a task of their own: a large request
-        # must never deadlock against a child that writes before it reads,
-        # and a chatty stderr must never block the child on a full pipe.
-        proc = LocalProc(process, asyncio.create_task(process.stderr.read()))
-        proc.feeder = asyncio.create_task(_feed(process, stdin))
-        if timeout is not None:
-            proc.deadline = asyncio.get_running_loop().call_later(timeout, proc.kill)
+        proc = LocalProc(process, stdin, timeout)
         self._procs.append(proc)
         return proc
 
     async def poll(self) -> int | None:
         return self._process.returncode
+
+    def expire(self) -> None:
+        # Held: a task nothing references may be dropped before it runs.
+        self._expiry = asyncio.get_running_loop().create_task(self.terminate())
 
     async def terminate(self) -> None:
         if self.ttl is not None:
@@ -405,10 +404,17 @@ class LocalSandbox(Sandbox):
         # The keeper first: a supervisor that sees its exec die must find
         # the sandbox already ended, never a live keeper for one more poll.
         if self._process.returncode is None:
-            self._process.kill()
+            _kill(self._process)
             await self._process.wait()
         for proc in self._procs:
             proc.kill()
+
+
+def _kill(process: asyncio.subprocess.Process) -> None:
+    # Straight to the kernel: Process.kill() polls first and would reap a
+    # child the loop's watcher is about to reap itself.
+    with suppress(ProcessLookupError):
+        os.kill(process.pid, signal.SIGKILL)
 
 
 async def _feed(process: asyncio.subprocess.Process, stdin: bytes | None) -> None:
@@ -416,18 +422,24 @@ async def _feed(process: asyncio.subprocess.Process, stdin: bytes | None) -> Non
         if stdin:
             process.stdin.write(stdin)
             await process.stdin.drain()
-    except (BrokenPipeError, ConnectionResetError, OSError):
+    except OSError:
         pass
     finally:
         process.stdin.close()
 
 
 class LocalProc(Proc):
-    def __init__(self, process: asyncio.subprocess.Process, stderr: asyncio.Task[bytes]) -> None:
+    def __init__(self, process: asyncio.subprocess.Process, stdin: bytes | None, timeout: int | None) -> None:
         self._process = process
-        self._stderr = stderr
-        self.deadline: asyncio.TimerHandle | None = None
-        self.feeder: asyncio.Task[None] | None = None
+        # stdin and stderr each get a task of their own: a large request
+        # must never deadlock against a child that writes before it reads,
+        # and a chatty stderr must never block the child on a full pipe.
+        # Both are held here: a task nothing references may be dropped.
+        self._feeder = asyncio.create_task(_feed(process, stdin))
+        self._stderr = asyncio.create_task(process.stderr.read())
+        self._deadline = (
+            asyncio.get_running_loop().call_later(timeout, self.kill) if timeout is not None else None
+        )
 
     async def lines(self) -> AsyncIterator[str]:
         async for raw in self._process.stdout:
@@ -435,18 +447,18 @@ class LocalProc(Proc):
 
     async def wait(self) -> int:
         rc = await self._process.wait()
-        if self.deadline is not None:
-            self.deadline.cancel()
+        if self._deadline is not None:
+            self._deadline.cancel()
         return rc
 
-    def poll(self) -> int | None:
-        return self._process.returncode
+    def running(self) -> bool:
+        return self._process.returncode is None
 
     async def stderr(self) -> str:
         return (await self._stderr).decode("utf-8", errors="replace")
 
     def kill(self) -> None:
-        if self.deadline is not None:
-            self.deadline.cancel()
-        if self._process.returncode is None:
-            self._process.kill()
+        if self._deadline is not None:
+            self._deadline.cancel()
+        if self.running():
+            _kill(self._process)

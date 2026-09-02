@@ -10,10 +10,10 @@ where the process lives and how liveness is judged:
 - the heartbeat pumps through every phase — the stale kill, the exec,
   the stream — so the server never mistakes a slow platform for a dead
   worker. The attempt process is judged here instead: its stream ticks
-  every ``heartbeat_seconds``, so a stream silent for the activity's
-  heartbeat timeout is a wedged or dead attempt, killed by pid and ended
-  ``infra``. The retry lands back in the same sandbox and resumes the
-  session
+  every ``heartbeat_seconds``, so a sandbox silent for the activity's
+  heartbeat timeout (no line, no exit, no status) is a wedged or dead
+  attempt, killed by pid and ended ``infra``. The retry lands back in the
+  same sandbox and resumes the session
 - a sandbox that is gone (TTL, crash, terminate) raises ``sandbox_gone``,
   non-retryable at the activity: only the workflow can open another
 - a cancelled activity ends the attempt process with one ``kill`` before
@@ -105,7 +105,9 @@ async def run_sandboxed_attempt(
     credential this attempt's slot holds (agent_runner.pool). Returns the
     ``valid`` report, raises an ``ApplicationError`` typed with the outcome
     word otherwise, and ``sandbox_gone`` (non-retryable) when the sandbox
-    ended under it."""
+    ended under it. The activity's heartbeat timeout is how long the
+    attempt's stream may go silent, so it must leave the ticks (every
+    ``config.heartbeat_seconds``) room: several ticks, not one."""
     config = config or TemporalRunConfig()
     info = activity.info()
     slot = pool.slot(info.attempt) if pool else 0
@@ -145,35 +147,23 @@ async def run_sandboxed_attempt(
         return AttemptReport(outcome=outcomes.INFRA, session_ref=state.session_ref, error=error, detail=detail)
 
     async with heartbeating(state, config.heartbeat_seconds):
+        proc: Proc | None = None
+        pid: int | None = None
+        report: AttemptReport | None = None
+        watchdog: asyncio.Timeout | None = None
         try:
             async with asyncio.timeout(START_SECONDS):
                 await kill_stale(sandbox, pidfile)
                 proc = await sandbox.exec(
                     *command, stdin=request.to_json().encode(), env=env, timeout=exec_timeout
                 )
-        except ExecutorGone as exc:
-            raise _gone(state, info.attempt, started_at, str(exc)) from exc
-        except TimeoutError:
-            report = infra(f"{spec.key}: sandbox {sandbox.id} did not start the attempt within {START_SECONDS:g}s")
-            return conclude(state, info, report, started_at, config, pool, slot)
-
-        lines = proc.lines()
-        pid: int | None = None
-        rc: int | None = None
-        report: AttemptReport | None = None
-        try:
+            lines = proc.lines()
             while True:
-                try:
-                    async with asyncio.timeout(silence):
-                        line = await anext(lines, None)
-                except TimeoutError:
-                    if pid:
-                        await _kill(sandbox, pid)
-                    report = infra(f"{spec.key}: the attempt stream from sandbox {sandbox.id} went silent for {silence:g}s")
-                    break
-                if line is None:
-                    rc = await proc.wait()
-                    break
+                async with asyncio.timeout(silence) as watchdog:
+                    line = await anext(lines, None)
+                    if line is None:
+                        rc = await proc.wait()
+                        break
                 try:
                     event = json.loads(line)
                 except ValueError:
@@ -182,7 +172,7 @@ async def run_sandboxed_attempt(
                     continue
                 kind = event.pop("e", None)
                 if kind == "pid":
-                    pid = int(event.get("pid") or 0)
+                    pid = int(event["pid"])
                 elif kind == "session":
                     on_session(str(event.get("ref") or ""))
                 elif kind == "usage":
@@ -195,27 +185,38 @@ async def run_sandboxed_attempt(
                     report = infra(f"{spec.key}: the attempt process was cancelled under the activity")
                 elif kind == "error":
                     report = infra(f"{spec.key}: attempt process failed: {event.get('message')}")
+            if report is None:
+                # The process died without a word, or the sandbox under it.
+                async with asyncio.timeout(silence) as watchdog:
+                    if await _ended(sandbox):
+                        raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
+                    detail = (await proc.stderr())[-STDERR_TAIL:]
+                report = infra(f"{spec.key}: attempt process exited {rc} without a report", detail)
         except asyncio.CancelledError:
             # The pid THIS attempt announced, not whatever the shared pid file
             # holds by now (a successor scheduled by the heartbeat timeout may
             # already own it).
-            if pid:
+            if pid is not None:
                 await _kill(sandbox, pid)
-            with suppress(TimeoutError, ExecutorGone):
-                async with asyncio.timeout(CANCEL_GRACE_SECONDS):
-                    await proc.wait()  # the stream closed: reap, never leave a zombie
+            if proc is not None:
+                with suppress(TimeoutError, ExecutorGone):
+                    async with asyncio.timeout(CANCEL_GRACE_SECONDS):
+                        await proc.wait()  # the stream closed: reap, never leave a zombie
             raise
+        except ApplicationError:
+            raise  # _gone: already recorded, already typed
         except ExecutorGone as exc:
             raise _gone(state, info.attempt, started_at, str(exc)) from exc
         except Exception as exc:
-            report = infra(f"{spec.key}: the attempt stream from sandbox {sandbox.id} failed: {exc!r}")
-        if report is None:
-            if await _ended(sandbox):
-                raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
-            report = infra(
-                f"{spec.key}: attempt process exited {rc} without a report",
-                detail=(await proc.stderr())[-STDERR_TAIL:],
-            )
+            if pid is not None:
+                await _kill(sandbox, pid)
+            if proc is None:
+                what = f"sandbox {sandbox.id} did not start the attempt within {START_SECONDS:g}s"
+            elif watchdog is not None and watchdog.expired():
+                what = f"sandbox {sandbox.id} went silent for {silence:g}s"
+            else:
+                what = f"the attempt in sandbox {sandbox.id} failed: {exc!r}"
+            report = infra(f"{spec.key}: {what}")
     return conclude(state, info, report, started_at, config, pool, slot)
 
 

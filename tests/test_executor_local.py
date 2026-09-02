@@ -7,11 +7,8 @@ is what a dead sandbox answers with.
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,22 +25,10 @@ except ImportError:
 from agent_runner import state  # noqa: E402
 from agent_runner.executor import ExecutorGone, LocalExecutor, SandboxSpec  # noqa: E402
 from agent_runner.workspace import READY_MARKER, RELEASE_MARKER, marker  # noqa: E402
+from tests.support import wait_for  # noqa: E402
 
 GROUP = "mit/run-7/scrape"
 KEEPER = (sys.executable, "-m", "agent_runner", "keeper", "--every", "0.2")
-
-
-async def wait_for(test: unittest.TestCase, predicate, seconds: float = 15.0) -> None:
-    """Until ``predicate()`` (plain or awaitable) is true."""
-    deadline = time.monotonic() + seconds
-    while True:
-        result = predicate()
-        if inspect.isawaitable(result):
-            result = await result
-        if result:
-            return
-        test.assertLess(time.monotonic(), deadline, "timed out waiting")
-        await asyncio.sleep(0.05)
 
 
 async def ended(sandbox) -> bool:

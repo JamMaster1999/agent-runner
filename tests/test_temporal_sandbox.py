@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -48,6 +49,7 @@ if HAVE_TEMPORALIO:
     from agent_runner.pool import Pool
     from agent_runner.temporal.activity import TemporalRunConfig
     from agent_runner.temporal.retry import RESET_DELAY_FLOOR
+    from tests.support import wait_for
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
 ENTRY = (sys.executable, str(REPO / "tests" / "fake_cli" / "serve-attempt"))
@@ -66,13 +68,6 @@ def codex_spec(**overrides) -> RunSpec:
     )
     values.update(overrides)
     return RunSpec(**values)
-
-
-async def wait_for(test: unittest.TestCase, predicate, what: str, seconds: float = 15.0) -> None:
-    deadline = time.monotonic() + seconds
-    while not predicate():
-        test.assertLess(time.monotonic(), deadline, what)
-        await asyncio.sleep(0.05)
 
 
 def alive(pid: int) -> bool:
@@ -125,12 +120,12 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
             "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
         }])
 
-    async def attempt(self, sandbox: Sandbox | None = None, env_: ActivityEnvironment | None = None, **kwargs):
-        env_ = env_ or ActivityEnvironment()
+    async def attempt(self, activity_env: ActivityEnvironment | None = None, **kwargs):
+        activity_env = activity_env or ActivityEnvironment()
         beats: list[dict] = []
-        env_.on_heartbeat = beats.append
-        report = await env_.run(
-            run_sandboxed_attempt, sandbox or self.sandbox, ENTRY, codex_spec(), "task",
+        activity_env.on_heartbeat = beats.append
+        report = await activity_env.run(
+            run_sandboxed_attempt, self.sandbox, ENTRY, codex_spec(), "task",
             validator={"child": "research"}, **kwargs,
         )
         return report, beats
@@ -202,13 +197,15 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
 
         class SlowStart(Sandbox):
             def __init__(self, inner: Sandbox) -> None:
-                self.__dict__.update(inner.__dict__)
+                self.id, self.name, self.workspace, self.tags = inner.id, inner.name, inner.workspace, inner.tags
                 self._inner = inner
 
             async def exec(self, *command, **kwargs):
-                await asyncio.sleep(0.7)
+                if command[0] != "sh":  # the attempt's exec, not the stale kill's
+                    await asyncio.sleep(0.7)
                 proc = await self._inner.exec(*command, **kwargs)
-                started.append(time.monotonic())
+                if command[0] != "sh":
+                    started.append(time.monotonic())
                 return proc
 
             async def poll(self):
@@ -243,10 +240,10 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
 
         freezer = asyncio.create_task(freeze_the_attempt())
         with self.assertRaises(ApplicationError) as caught:
-            await self.attempt(env_=env, config=TemporalRunConfig(heartbeat_seconds=0.2))
+            await self.attempt(activity_env=env, config=TemporalRunConfig(heartbeat_seconds=0.2))
         pid = await freezer
         self.assertEqual(caught.exception.type, outcomes.INFRA)
-        self.assertIn("went silent for 1s", str(caught.exception))
+        self.assertIn(f"sandbox {self.sandbox.id} went silent for 1s", str(caught.exception))
         self.assertEqual(caught.exception.details[0]["attempt"]["outcome"], outcomes.INFRA)
         await wait_for(self, lambda: not alive(pid), "the silent attempt process outlived the attempt", seconds=10)
 
@@ -284,7 +281,12 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_stale_attempt_process_is_killed_before_the_next(self) -> None:
         stale = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)")
-        self.addCleanup(lambda: stale.returncode is None and stale.kill())
+
+        def reap() -> None:
+            with suppress(ProcessLookupError):
+                stale.kill()
+
+        self.addCleanup(reap)
         pidfile = pid_file(self.sandbox.workspace, KEY)
         pidfile.parent.mkdir(parents=True, exist_ok=True)
         pidfile.write_text(str(stale.pid))

@@ -14,8 +14,9 @@ supervisor outside sees only a line stream. Two sides, one module:
 - ``AttemptRequest`` / ``report_to_json`` / ``report_from_json`` are the
   wire shapes both sides share.
 
-A supervisor may beat its heartbeat only on what it just fetched from
-this stream. No fetch, no beat.
+The stream is how a supervisor judges the attempt alive: ``serve`` ticks
+every ``tick_seconds``, and a supervisor that fetches nothing for its
+activity's heartbeat timeout ends the attempt process and the attempt.
 """
 
 from __future__ import annotations
