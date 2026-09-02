@@ -289,7 +289,7 @@ A long agent run wants a machine of its own: a disk the CLI can fill, a memory c
 
 Three pieces:
 
-- **The executor** (`agent_runner.executor`): `create` / `find` / `attach` / `list` sandboxes; `exec` / `poll` / `terminate` one. `ModalExecutor` builds the sandbox image from your own Dockerfile. `LocalExecutor` runs the same lifecycle as subprocesses on this host: the test double and the bare-box backend are one class.
+- **The executor** (`agent_runner.executor`): `create` / `find` / `attach` / `list` sandboxes; `exec` / `poll` / `terminate` one — every call awaited, a process's output an async iterator of lines. `ModalExecutor` builds the sandbox image from your own Dockerfile and speaks Modal's own async API. `LocalExecutor` runs the same lifecycle as asyncio subprocesses on this host: the test double and the bare-box backend are one class.
 - **The workspace keeper** (`agent_runner.workspace`): the sandbox's entrypoint. The local disk is the working store — CLI homes, checkpoint folders, attempt workdirs — and the keeper pushes what changed to S3 on a cadence (`AGENT_RUNNER_STATE_S3=s3://bucket/prefix`, the `s3` extra), the manifest last. A replacement sandbox restores the last complete push and resumes where the old one stopped. Credential files never travel, in either direction.
 - **The attempt protocol** (`agent_runner.remote`): the whole `run_attempt` runs inside the sandbox. Your entrypoint hands `serve` the validator; the supervisor outside reads a line stream — session, usage, progress, a tick every 15 seconds, the report last.
 
@@ -299,7 +299,7 @@ from agent_runner.executor import ModalExecutor, SandboxSpec
 from agent_runner.temporal.sandbox import run_sandboxed_attempt
 
 executor = ModalExecutor("my-app", dockerfile=Path("Dockerfile"), context_dir=Path("."))
-sandbox = executor.create(SandboxSpec(
+sandbox = await executor.create(SandboxSpec(
     name="run-7-research",
     command=("python", "-m", "agent_runner", "keeper"),
     ttl_seconds=6 * 3600,
@@ -310,7 +310,7 @@ sandbox = executor.create(SandboxSpec(
 
 # Inside a Temporal activity — one attempt per call; a retry lands in the same sandbox.
 report = await run_sandboxed_attempt(
-    executor.attach(sandbox.id), ("python", "-m", "myproject.attempt"), spec, task,
+    await executor.attach(sandbox.id), ("python", "-m", "myproject.attempt"), spec, task,
     validator={"child": "research"}, agent=agent,
 )
 ```
@@ -327,7 +327,7 @@ sys.exit(serve(lambda payload: validator_for(payload)))
 
 What the supervisor guarantees:
 
-- **The heartbeat beats only on what it just fetched.** A sandbox that goes silent past the heartbeat timeout is rescheduled; the retry lands in the same sandbox, kills the stale attempt process by pid, and resumes the session from disk.
+- **The heartbeat pumps through every phase** — the stale kill, the exec, the stream — so a platform slow to start two hundred attempts never reads as a dead worker. The attempt process is judged by its own stream: it ticks every `heartbeat_seconds`, and one silent for the activity's heartbeat timeout is killed by pid and ended `infra`; the retry lands in the same sandbox and resumes the session from disk.
 - **`sandbox_gone` is the one error a workflow routes.** TTL, crash, or terminate: the attempt cannot continue there and only a new sandbox can, so the activity raises it non-retryable and the workflow opens the next sandbox, which restores the workspace from S3.
 - **Liveness is output or files.** A CLI that streams nothing but keeps writing under its workdir or a watched folder is working; silence on both for the stall window ends the attempt `stalled`. A process tree past `Policy(rss_limit_mb=...)` is ended `infra` — the memory fuse.
 - **Cancellation ends the attempt process** with one signal before it propagates; the sandbox itself is yours to close.

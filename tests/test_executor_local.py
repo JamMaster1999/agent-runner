@@ -7,7 +7,8 @@ is what a dead sandbox answers with.
 
 from __future__ import annotations
 
-import subprocess
+import asyncio
+import inspect
 import sys
 import tempfile
 import time
@@ -32,14 +33,24 @@ GROUP = "mit/run-7/scrape"
 KEEPER = (sys.executable, "-m", "agent_runner", "keeper", "--every", "0.2")
 
 
-def wait_for(test: unittest.TestCase, predicate, seconds: float = 15.0) -> None:
+async def wait_for(test: unittest.TestCase, predicate, seconds: float = 15.0) -> None:
+    """Until ``predicate()`` (plain or awaitable) is true."""
     deadline = time.monotonic() + seconds
-    while not predicate():
+    while True:
+        result = predicate()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            return
         test.assertLess(time.monotonic(), deadline, "timed out waiting")
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
 
 
-class LocalExecutorTest(unittest.TestCase):
+async def ended(sandbox) -> bool:
+    return await sandbox.poll() is not None
+
+
+class LocalExecutorTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         env = mock.patch.dict(_os.environ, {"PYTHONPATH": str(REPO / "src")})
@@ -58,89 +69,115 @@ class LocalExecutorTest(unittest.TestCase):
             tags={"gtm": "1", "child": "scrape"},
         )
 
-    def create(self, **kwargs):
-        sandbox = self.executor.create(self.spec(**kwargs))
-        self.addCleanup(sandbox.terminate)
-        wait_for(self, marker(sandbox.workspace, READY_MARKER).exists)
+    async def create(self, **kwargs):
+        sandbox = await self.executor.create(self.spec(**kwargs))
+        self.addAsyncCleanup(sandbox.terminate)
+        await wait_for(self, marker(sandbox.workspace, READY_MARKER).exists)
         return sandbox
 
     def keeper_log(self, sandbox) -> str:
         return (self.tmp / "sandboxes" / sandbox.name / "keeper.log").read_text()
 
-    def test_create_runs_the_keeper_in_a_workspace_and_says_ready(self) -> None:
-        sandbox = self.create()
+    async def test_create_runs_the_keeper_in_a_workspace_and_says_ready(self) -> None:
+        sandbox = await self.create()
         self.assertEqual(sandbox.workspace, str(self.tmp / "sandboxes" / "run-7-scrape" / "work"))
         self.assertEqual(marker(sandbox.workspace, READY_MARKER).read_text(), "fresh")
         self.assertIn("ready fresh", self.keeper_log(sandbox))
-        self.assertIsNone(sandbox.poll())
+        self.assertIsNone(await sandbox.poll())
         self.assertEqual(sandbox.tags, {"gtm": "1", "child": "scrape"})
 
-    def test_exec_sees_the_workspace_env_and_secrets_and_reads_stdin(self) -> None:
-        sandbox = self.create()
-        proc = sandbox.exec(
+    async def test_exec_sees_the_workspace_env_and_secrets_and_reads_stdin(self) -> None:
+        sandbox = await self.create()
+        proc = await sandbox.exec(
             sys.executable, "-c",
             "import os, sys; print(os.environ['AGENT_RUNNER_WORKSPACE']); "
             "print(os.environ['FAKE_SECRET']); print(os.environ['EXTRA']); "
             "print(sys.stdin.read()); sys.stderr.write('warned')",
             stdin=b"hello", env={"EXTRA": "yes"},
         )
-        self.assertEqual(list(proc.lines()), [sandbox.workspace, "s3cret", "yes", "hello"])
-        self.assertEqual(proc.wait(), 0)
-        self.assertEqual(proc.stderr(), "warned")
+        self.assertEqual([line async for line in proc.lines()], [sandbox.workspace, "s3cret", "yes", "hello"])
+        self.assertEqual(await proc.wait(), 0)
+        self.assertEqual(await proc.stderr(), "warned")
 
-    def test_find_attach_and_list_recover_a_running_sandbox(self) -> None:
-        sandbox = self.create()
-        self.assertIs(self.executor.find("run-7-scrape"), sandbox)
-        self.assertIsNone(self.executor.find("nobody"))
-        self.assertIs(self.executor.attach(sandbox.id), sandbox)
-        self.assertEqual(self.executor.list({"gtm": "1"}), [sandbox])
-        self.assertEqual(self.executor.list({"gtm": "1", "child": "other"}), [])
-        with self.assertRaises(ExecutorGone):
-            self.executor.attach("local-nobody-1")
+    async def test_a_long_line_arrives_whole(self) -> None:
+        """A report line carries the validated payload whole — megabytes,
+        not the 64 KiB an asyncio pipe reads by default."""
+        sandbox = await self.create()
+        proc = await sandbox.exec(sys.executable, "-c", "print('x' * (2 * 1024 * 1024)); print('end')")
+        lines = [line async for line in proc.lines()]
+        self.assertEqual([len(lines[0]), lines[1]], [2 * 1024 * 1024, "end"])
+        self.assertEqual(await proc.wait(), 0)
 
-    def test_terminate_ends_the_keeper_its_execs_and_every_handle(self) -> None:
-        sandbox = self.create()
-        sleeper = sandbox.exec(sys.executable, "-c", "import time; time.sleep(30)")
-        sandbox.terminate()
-        self.assertIsNotNone(sandbox.poll())
-        self.assertNotEqual(sleeper.wait(), 0)
-        self.assertIsNone(self.executor.find("run-7-scrape"))
-        self.assertEqual(self.executor.list({"gtm": "1"}), [])
-        with self.assertRaises(ExecutorGone):
-            self.executor.attach(sandbox.id)
-        with self.assertRaises(ExecutorGone):
-            sandbox.exec("true")
-        sandbox.terminate()  # idempotent
+    async def test_a_large_stdin_never_deadlocks_a_chatty_child(self) -> None:
+        sandbox = await self.create()
+        proc = await sandbox.exec(
+            sys.executable, "-c",
+            "import sys; sys.stdout.write('y' * (1024 * 1024) + '\\n'); sys.stdout.flush(); "
+            "print(len(sys.stdin.read()))",
+            stdin=b"z" * (1024 * 1024),
+        )
+        lines = [line async for line in proc.lines()]
+        self.assertEqual(lines[1], str(1024 * 1024))
+        self.assertEqual(await proc.wait(), 0)
 
-    def test_the_release_marker_ends_the_keeper_cleanly(self) -> None:
-        sandbox = self.create()
+    async def test_find_attach_and_list_recover_a_running_sandbox(self) -> None:
+        sandbox = await self.create()
+        self.assertIs(await self.executor.find("run-7-scrape"), sandbox)
+        self.assertIsNone(await self.executor.find("nobody"))
+        self.assertIs(await self.executor.attach(sandbox.id), sandbox)
+        self.assertEqual(await self.executor.list({"gtm": "1"}), [sandbox])
+        self.assertEqual(await self.executor.list({"gtm": "1", "child": "other"}), [])
+        with self.assertRaises(ExecutorGone):
+            await self.executor.attach("local-nobody-1")
+
+    async def test_terminate_ends_the_keeper_its_execs_and_every_handle(self) -> None:
+        sandbox = await self.create()
+        sleeper = await sandbox.exec(sys.executable, "-c", "import time; time.sleep(30)")
+        await sandbox.terminate()
+        self.assertIsNotNone(await sandbox.poll())
+        self.assertNotEqual(await sleeper.wait(), 0)
+        self.assertIsNone(await self.executor.find("run-7-scrape"))
+        self.assertEqual(await self.executor.list({"gtm": "1"}), [])
+        with self.assertRaises(ExecutorGone):
+            await self.executor.attach(sandbox.id)
+        with self.assertRaises(ExecutorGone):
+            await sandbox.exec("true")
+        await sandbox.terminate()  # idempotent
+
+    async def test_the_exec_timeout_ends_the_process(self) -> None:
+        sandbox = await self.create()
+        sleeper = await sandbox.exec(sys.executable, "-c", "import time; time.sleep(30)", timeout=1)
+        self.assertEqual([line async for line in sleeper.lines()], [])
+        self.assertNotEqual(await sleeper.wait(), 0)
+
+    async def test_the_release_marker_ends_the_keeper_cleanly(self) -> None:
+        sandbox = await self.create()
         marker(sandbox.workspace, RELEASE_MARKER).touch()
-        wait_for(self, lambda: sandbox.poll() is not None)
-        self.assertEqual(sandbox.poll(), 0)
+        await wait_for(self, lambda: ended(sandbox))
+        self.assertEqual(await sandbox.poll(), 0)
         self.assertIn("released", self.keeper_log(sandbox))
 
-    def test_a_name_reopened_after_release_starts_clean(self) -> None:
-        first = self.create()
+    async def test_a_name_reopened_after_release_starts_clean(self) -> None:
+        first = await self.create()
         marker(first.workspace, RELEASE_MARKER).touch()
-        wait_for(self, lambda: first.poll() is not None)
-        second = self.create()  # same name, same workspace on disk
-        self.assertIsNone(second.poll())
+        await wait_for(self, lambda: ended(first))
+        second = await self.create()  # same name, same workspace on disk
+        self.assertIsNone(await second.poll())
         self.assertFalse(marker(second.workspace, RELEASE_MARKER).exists())
-        proc = second.exec("true")
-        self.assertEqual(proc.wait(), 0)
-        self.assertIsNone(second.poll())
+        proc = await second.exec("true")
+        self.assertEqual(await proc.wait(), 0)
+        self.assertIsNone(await second.poll())
 
-    def test_the_ttl_terminates(self) -> None:
-        sandbox = self.create(name="short", ttl=1)
-        wait_for(self, lambda: sandbox.poll() is not None, seconds=10)
+    async def test_the_ttl_terminates(self) -> None:
+        sandbox = await self.create(name="short", ttl=1)
+        await wait_for(self, lambda: ended(sandbox), seconds=10)
         with self.assertRaises(ExecutorGone):
-            sandbox.exec("true")
+            await sandbox.exec("true")
 
-    def test_terminate_cancels_the_ttl_timer(self) -> None:
-        sandbox = self.create(name="long", ttl=3600)
-        sandbox.terminate()
-        sandbox.ttl.join(2)
-        self.assertFalse(sandbox.ttl.is_alive())
+    async def test_terminate_cancels_the_ttl_timer(self) -> None:
+        sandbox = await self.create(name="long", ttl=3600)
+        await sandbox.terminate()
+        self.assertTrue(sandbox.ttl.cancelled())
 
 
 if __name__ == "__main__":

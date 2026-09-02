@@ -7,11 +7,13 @@ the worker; this one runs it in a sandbox the project opened
 record, same outcome-to-retry mapping on the way out — what changes is
 where the process lives and how liveness is judged:
 
-- the heartbeat beats only on what it just fetched from the stream (a
-  session, a usage line, a tick). No fetch, no beat: a sandbox that goes
-  silent past the heartbeat timeout is rescheduled, and the retry lands
-  back in the same sandbox, kills the stale attempt process by pid, and
-  resumes the session
+- the heartbeat pumps through every phase — the stale kill, the exec,
+  the stream — so the server never mistakes a slow platform for a dead
+  worker. The attempt process is judged here instead: its stream ticks
+  every ``heartbeat_seconds``, so a stream silent for the activity's
+  heartbeat timeout is a wedged or dead attempt, killed by pid and ended
+  ``infra``. The retry lands back in the same sandbox and resumes the
+  session
 - a sandbox that is gone (TTL, crash, terminate) raises ``sandbox_gone``,
   non-retryable at the activity: only the workflow can open another
 - a cancelled activity ends the attempt process with one ``kill`` before
@@ -23,14 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
-from typing import Any, Sequence
+from contextlib import suppress
+from datetime import timedelta
+from typing import Any, Mapping, Sequence
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from agent_runner import outcomes
-from agent_runner.executor import SANDBOX_GONE, ExecutorGone, Sandbox
+from agent_runner.executor import SANDBOX_GONE, ExecutorGone, Proc, Sandbox
 from agent_runner.harness.base import AgentDef
 from agent_runner.harness.stream import StreamEvent
 from agent_runner.pool import Pool
@@ -42,6 +45,7 @@ from agent_runner.temporal.activity import (
     attempt_record,
     conclude,
     heartbeat_callbacks,
+    heartbeating,
     now_iso,
     prior_heartbeat_details,
     starting_state,
@@ -49,6 +53,8 @@ from agent_runner.temporal.activity import (
 from agent_runner.temporal.retry import failure_details
 from agent_runner.workspace import attempt_workdir, pid_file
 
+START_SECONDS = 900.0         # the stale kill plus the exec, on a platform under load
+SILENCE_SECONDS = 120.0       # when the activity names no heartbeat timeout
 CANCEL_GRACE_SECONDS = 30.0   # how long a cancel waits for the stream to close
 KILL_GRACE_SECONDS = 2        # TERM, then KILL
 EXEC_GRACE_SECONDS = 600.0
@@ -68,12 +74,13 @@ kill -KILL "$pid" 2>/dev/null
 """
 
 
-def kill_stale(sandbox: Sandbox, pidfile: str) -> None:
+async def kill_stale(sandbox: Sandbox, pidfile: str) -> None:
     """End whatever attempt process a dead supervisor left behind for this
     key: two attempts of one batch must never run at once, and the file is
     the only handle the sandbox keeps. The pid is checked to be one — the
     agent can write to the workspace."""
-    sandbox.exec("sh", "-c", KILL_SCRIPT.format(grace=KILL_GRACE_SECONDS), "kill", pidfile).wait()
+    proc = await sandbox.exec("sh", "-c", KILL_SCRIPT.format(grace=KILL_GRACE_SECONDS), "kill", pidfile)
+    await proc.wait()
 
 
 async def run_sandboxed_attempt(
@@ -95,9 +102,10 @@ async def run_sandboxed_attempt(
     """One attempt in ``sandbox`` via ``command`` (the project's entrypoint
     that calls ``remote.serve``). ``env`` rides the exec, over the sandbox's
     own — the place for what changes per attempt; ``pool`` adds the
-    credential this attempt's slot holds (agent_runner.pool). Returns the ``valid`` report, raises an
-    ``ApplicationError`` typed with the outcome word otherwise, and
-    ``sandbox_gone`` (non-retryable) when the sandbox ended under it."""
+    credential this attempt's slot holds (agent_runner.pool). Returns the
+    ``valid`` report, raises an ``ApplicationError`` typed with the outcome
+    word otherwise, and ``sandbox_gone`` (non-retryable) when the sandbox
+    ended under it."""
     config = config or TemporalRunConfig()
     info = activity.info()
     slot = pool.slot(info.attempt) if pool else 0
@@ -129,100 +137,85 @@ async def run_sandboxed_attempt(
     exec_timeout = (
         int(timeout_minutes * 60 + EXEC_GRACE_SECONDS) if timeout_minutes is not None else None
     )
+    silence = (info.heartbeat_timeout or timedelta(seconds=SILENCE_SECONDS)).total_seconds()
     on_event, on_session, on_usage = heartbeat_callbacks(state)
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
     started_at = now_iso()
-    try:
-        await asyncio.to_thread(kill_stale, sandbox, pidfile)
-        proc = await asyncio.to_thread(
-            sandbox.exec, *command, stdin=request.to_json().encode(), env=env, timeout=exec_timeout
-        )
-    except ExecutorGone as exc:
-        raise _gone(state, info.attempt, started_at, str(exc)) from exc
-    activity.heartbeat(state.payload())  # the attempt is running; the first tick is a while off
-    stream_failure: list[BaseException] = []
-    attempt_pid: list[int] = []
 
-    def pump() -> None:
+    def infra(error: str, detail: str = "") -> AttemptReport:
+        return AttemptReport(outcome=outcomes.INFRA, session_ref=state.session_ref, error=error, detail=detail)
+
+    async with heartbeating(state, config.heartbeat_seconds):
         try:
-            for line in proc.lines():
-                loop.call_soon_threadsafe(queue.put_nowait, line)
-        except BaseException as exc:  # attributed below, never a silent dead thread
-            stream_failure.append(exc)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-    reader = threading.Thread(target=pump, name="sandbox-stream", daemon=True)
-    reader.start()
-    report: AttemptReport | None = None
-    cancelled = False
-    try:
-        while True:
-            line = await queue.get()
-            if line is None:
-                break
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue  # not ours: the entrypoint's own chatter
-            if not isinstance(event, dict):
-                continue
-            kind = event.pop("e", None)
-            if kind == "pid":
-                attempt_pid.append(int(event.get("pid") or 0))
-                continue
-            if kind == "session":
-                on_session(str(event.get("ref") or ""))
-            elif kind == "usage":
-                on_usage(Usage.from_dict(event.get("usage") or {}), Usage.from_dict(event.get("session_usage") or {}))
-            elif kind == "event":
-                on_event(StreamEvent(**known(StreamEvent, event)))
-                continue  # progress rides the next tick's beat
-            elif kind == "report":
-                report = report_from_json(event)
-            elif kind == "cancelled":
-                cancelled = True
-            elif kind == "error":
-                report = AttemptReport(
-                    outcome=outcomes.INFRA,
-                    session_ref=state.session_ref,
-                    error=f"{spec.key}: attempt process failed: {event.get('message')}",
+            async with asyncio.timeout(START_SECONDS):
+                await kill_stale(sandbox, pidfile)
+                proc = await sandbox.exec(
+                    *command, stdin=request.to_json().encode(), env=env, timeout=exec_timeout
                 )
-            activity.heartbeat(state.payload())  # only what was just fetched
-    except asyncio.CancelledError:
-        # The pid THIS attempt announced, not whatever the shared pid file
-        # holds by now (a successor scheduled by the heartbeat timeout may
-        # already own it).
-        if attempt_pid:
-            await asyncio.to_thread(_kill, sandbox, attempt_pid[-1])
-        await asyncio.to_thread(reader.join, CANCEL_GRACE_SECONDS)
-        if not reader.is_alive():
-            await asyncio.to_thread(proc.wait)  # the stream closed: reap, never leave a zombie
-        raise
+        except ExecutorGone as exc:
+            raise _gone(state, info.attempt, started_at, str(exc)) from exc
+        except TimeoutError:
+            report = infra(f"{spec.key}: sandbox {sandbox.id} did not start the attempt within {START_SECONDS:g}s")
+            return conclude(state, info, report, started_at, config, pool, slot)
 
-    if cancelled:
-        activity.heartbeat(state.payload())
-        raise ApplicationError(f"{spec.key}: the attempt process was cancelled under the activity", type=outcomes.INFRA)
-    try:
-        if stream_failure:
-            raise stream_failure[0]
-        rc = await asyncio.to_thread(proc.wait)
-    except ExecutorGone as exc:
-        raise _gone(state, info.attempt, started_at, str(exc)) from exc
-    except Exception as exc:
-        raise ApplicationError(
-            f"{spec.key}: the attempt stream from sandbox {sandbox.id} failed: {exc!r}", type=outcomes.INFRA
-        ) from exc
-    if report is None:
-        if await _ended(sandbox):
-            raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
-        report = AttemptReport(
-            outcome=outcomes.INFRA,
-            session_ref=state.session_ref,
-            error=f"{spec.key}: attempt process exited {rc} without a report",
-            detail=(await asyncio.to_thread(proc.stderr))[-STDERR_TAIL:],
-        )
+        lines = proc.lines()
+        pid: int | None = None
+        rc: int | None = None
+        report: AttemptReport | None = None
+        try:
+            while True:
+                try:
+                    async with asyncio.timeout(silence):
+                        line = await anext(lines, None)
+                except TimeoutError:
+                    if pid:
+                        await _kill(sandbox, pid)
+                    report = infra(f"{spec.key}: the attempt stream from sandbox {sandbox.id} went silent for {silence:g}s")
+                    break
+                if line is None:
+                    rc = await proc.wait()
+                    break
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # not ours: the entrypoint's own chatter
+                if not isinstance(event, dict):
+                    continue
+                kind = event.pop("e", None)
+                if kind == "pid":
+                    pid = int(event.get("pid") or 0)
+                elif kind == "session":
+                    on_session(str(event.get("ref") or ""))
+                elif kind == "usage":
+                    on_usage(Usage.from_dict(event.get("usage") or {}), Usage.from_dict(event.get("session_usage") or {}))
+                elif kind == "event":
+                    on_event(StreamEvent(**known(StreamEvent, event)))
+                elif kind == "report":
+                    report = report_from_json(event)
+                elif kind == "cancelled":
+                    report = infra(f"{spec.key}: the attempt process was cancelled under the activity")
+                elif kind == "error":
+                    report = infra(f"{spec.key}: attempt process failed: {event.get('message')}")
+        except asyncio.CancelledError:
+            # The pid THIS attempt announced, not whatever the shared pid file
+            # holds by now (a successor scheduled by the heartbeat timeout may
+            # already own it).
+            if pid:
+                await _kill(sandbox, pid)
+            with suppress(TimeoutError, ExecutorGone):
+                async with asyncio.timeout(CANCEL_GRACE_SECONDS):
+                    await proc.wait()  # the stream closed: reap, never leave a zombie
+            raise
+        except ExecutorGone as exc:
+            raise _gone(state, info.attempt, started_at, str(exc)) from exc
+        except Exception as exc:
+            report = infra(f"{spec.key}: the attempt stream from sandbox {sandbox.id} failed: {exc!r}")
+        if report is None:
+            if await _ended(sandbox):
+                raise _gone(state, info.attempt, started_at, f"sandbox {sandbox.id} ended during the attempt (rc={rc})")
+            report = infra(
+                f"{spec.key}: attempt process exited {rc} without a report",
+                detail=(await proc.stderr())[-STDERR_TAIL:],
+            )
     return conclude(state, info, report, started_at, config, pool, slot)
 
 
@@ -234,14 +227,17 @@ async def _ended(sandbox: Sandbox) -> bool:
     for attempt in range(ENDED_POLLS):
         if attempt:
             await asyncio.sleep(1)
-        if await asyncio.to_thread(sandbox.poll) is not None:
+        if await sandbox.poll() is not None:
             return True
     return False
 
 
-def _kill(sandbox: Sandbox, pid: int) -> None:
+async def _kill(sandbox: Sandbox, pid: int) -> None:
     try:
-        sandbox.exec("sh", "-c", f"kill -TERM {pid} 2>/dev/null; sleep {KILL_GRACE_SECONDS}; kill -KILL {pid} 2>/dev/null").wait()
+        proc = await sandbox.exec(
+            "sh", "-c", f"kill -TERM {pid} 2>/dev/null; sleep {KILL_GRACE_SECONDS}; kill -KILL {pid} 2>/dev/null"
+        )
+        await proc.wait()
     except ExecutorGone:
         pass
 
