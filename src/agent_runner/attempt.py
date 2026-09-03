@@ -332,6 +332,7 @@ def _apply(report: AttemptReport, spec: RunSpec, failure: RunnerError) -> Attemp
     report.error = f"{spec.key}: {failure}"
     report.detail = failure.details
     report.resets_at = failure.resets_at
+    report.limit_kind = failure.kind
     return report
 
 

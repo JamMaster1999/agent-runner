@@ -43,20 +43,24 @@ class TerminalMarkerTableTest(unittest.TestCase):
         for adapter in ADAPTERS:
             with self.subTest(adapter=adapter.name):
                 self.assertEqual(
-                    [category for category, _ in adapter.terminal_markers],
-                    [outcomes.RATE_LIMITED, outcomes.AUTH, outcomes.SPAWN_FAILURE],
+                    [category for category, _, _ in adapter.terminal_markers],
+                    [outcomes.RATE_LIMITED] * 3 + [outcomes.AUTH, outcomes.SPAWN_FAILURE],
+                )
+                self.assertEqual(
+                    [kind for _, kind, _ in adapter.terminal_markers],
+                    [outcomes.LIMIT_SERVER, outcomes.LIMIT_USAGE, outcomes.LIMIT_RATE, None, None],
                 )
 
     def test_marker_codes_are_outcome_words(self) -> None:
         for adapter in ADAPTERS:
-            for code, _ in adapter.terminal_markers:
+            for code, _, _ in adapter.terminal_markers:
                 self.assertIn(code, outcomes.OUTCOMES)
 
     def test_every_marker_is_lowercase(self) -> None:
         # Matching lower-cases the input text; a mixed-case marker would
         # silently never match.
         for adapter in ADAPTERS:
-            for _, markers in adapter.terminal_markers:
+            for _, _, markers in adapter.terminal_markers:
                 for marker in markers:
                     self.assertEqual(marker, marker.lower())
 
@@ -68,7 +72,7 @@ class TerminalMarkerTableTest(unittest.TestCase):
 class ClassifyFailureTest(unittest.TestCase):
     def test_each_marker_maps_to_its_outcome_code(self) -> None:
         for adapter in ADAPTERS:
-            for code, markers in adapter.terminal_markers:
+            for code, _, markers in adapter.terminal_markers:
                 for marker in markers:
                     text = f"CLI reported: {marker.upper()} — see logs"
                     with self.subTest(adapter=adapter.name, marker=marker):
@@ -196,3 +200,67 @@ class ResetTimeParsing(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual(error.code, outcomes.RATE_LIMITED)
         self.assertIsNone(error.resets_at)
+
+
+class LimitKindTest(unittest.TestCase):
+    """A rate_limited failure names which limit it was — the thing a
+    credential pool throttles on. The texts are the pinned CLIs' own, as
+    they reached Temporal history on 2026-09-02."""
+
+    CODEX_RATE = (
+        "codex error: Reconnecting... 5/5 (unexpected status 403 Forbidden: Unknown error, "
+        "url: wss://chatgpt.com/backend-api/codex/responses, cf-ray: a34a83eef97509db-ORD) "
+        "codex error: exceeded retry limit, last status: 429 Too Many Requests, request id: a08ed308 "
+        "codex turn.failed: exceeded retry limit, last status: 429 Too Many Requests, request id: a08ed308"
+    )
+    CODEX_USAGE = (
+        "codex turn.failed: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+        "to purchase more credits or try again at Sep 7th, 2026 2:29 AM."
+    )
+    CLAUDE_USAGE = "claude result success: You've hit your session limit · resets 3pm (UTC)"
+    CLAUDE_SERVER = "claude result success: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+
+    def test_the_text_names_the_kind(self) -> None:
+        for adapter, text, kind in (
+            (get_adapter("codex"), self.CODEX_RATE, outcomes.LIMIT_RATE),
+            (get_adapter("codex"), self.CODEX_USAGE, outcomes.LIMIT_USAGE),
+            (get_adapter("codex"), "Selected model is at capacity. Please try a different model.", outcomes.LIMIT_SERVER),
+            (get_adapter("claude"), self.CLAUDE_USAGE, outcomes.LIMIT_USAGE),
+            (get_adapter("claude"), self.CLAUDE_SERVER, outcomes.LIMIT_SERVER),
+            (get_adapter("claude"), "Repeated 529 Overloaded errors", outcomes.LIMIT_SERVER),
+        ):
+            with self.subTest(text=text[:40]):
+                error = adapter.classify_failure(text)
+                self.assertEqual((error.code, error.kind), (outcomes.RATE_LIMITED, kind))
+
+    def test_only_a_usage_limit_names_a_reset(self) -> None:
+        codex = get_adapter("codex")
+        self.assertIsNone(codex.classify(self.CODEX_RATE).resets_at)
+        self.assertIsNotNone(codex.classify(self.CODEX_USAGE).resets_at)
+        self.assertIsNone(get_adapter("claude").classify(self.CLAUDE_SERVER).resets_at)
+
+    def test_claude_typed_events_carry_their_kind(self) -> None:
+        claude = get_adapter("claude")
+        rejected = claude.stream_fatal({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1788390000},
+        })
+        self.assertEqual((rejected.code, rejected.kind), (outcomes.RATE_LIMITED, outcomes.LIMIT_USAGE))
+        self.assertEqual(rejected.resets_at, datetime.fromtimestamp(1788390000, tz=timezone.utc))
+        retrying = {"type": "system", "subtype": "api_retry", "error_status": 429, "error": "rate_limit_error", "max_retries": 10}
+        self.assertIsNone(claude.stream_fatal({**retrying, "attempt": 2}), "a lone 429 is the CLI's to retry")
+        too_many = claude.stream_fatal({**retrying, "attempt": 3})
+        self.assertEqual((too_many.code, too_many.kind, too_many.retryable), (outcomes.RATE_LIMITED, outcomes.LIMIT_RATE, True))
+        self.assertIsNone(too_many.resets_at)
+        self.assertIsNone(claude.stream_fatal({"type": "system", "subtype": "api_retry", "error_status": 529}), "a 529 is the CLI's to retry")
+        dead = claude.stream_fatal({"type": "system", "subtype": "api_retry", "error_status": 401})
+        self.assertEqual((dead.code, dead.kind), (outcomes.AUTH, None))
+
+    def test_a_non_limit_failure_has_no_kind(self) -> None:
+        self.assertIsNone(get_adapter("codex").classify_failure("oauth token has expired").kind)
+        self.assertIsNone(get_adapter("codex").classify_failure("something broke").kind)
+
+    def test_a_request_id_that_happens_to_contain_429_is_not_a_rate_limit(self) -> None:
+        error = get_adapter("codex").classify_failure("401 Unauthorized: invalid token, request id: ab429c77")
+        self.assertEqual(error.code, outcomes.AUTH)
+

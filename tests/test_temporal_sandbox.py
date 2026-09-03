@@ -48,7 +48,7 @@ if HAVE_TEMPORALIO:
     from agent_runner.temporal.sandbox import run_sandboxed_attempt
     from agent_runner.pool import Pool
     from agent_runner.temporal.activity import TemporalRunConfig
-    from agent_runner.temporal.retry import RESET_DELAY_FLOOR
+    from agent_runner.temporal.retry import RESET_DELAY_FLOOR, RESET_DELAY_SPREAD
     from tests.support import wait_for
 
 FAKE_CLI = REPO / "tests" / "fake_cli" / "fake-cli"
@@ -138,27 +138,35 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
         auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
         self.assertEqual(auth.read_text(), '{"token": "attempt-2"}')
 
-    async def test_a_pool_credential_reaches_the_attempt(self) -> None:
+    def pool(self, share: int = 4) -> Pool:
+        return Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'), share=share)
+
+    async def test_a_pool_credential_reaches_the_attempt_and_a_valid_run_grows_the_cap(self) -> None:
         self.valid_scenario()
-        pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
+        pool = self.pool()
+        pool.accounts[0].cap = 2
         report, _ = await self.attempt(pool=pool)
         self.assertEqual(report.outcome, outcomes.VALID)
         auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
         self.assertEqual(auth.read_text(), '{"token": "slot-0"}')
+        self.assertEqual((pool.accounts[0].active, pool.accounts[0].cap), (0, 3), "released, and the cap grew by one")
 
-    async def test_a_rate_limited_attempt_holds_its_pool_slot_and_retries_on_the_next(self) -> None:
-        pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
+    async def test_a_usage_limit_holds_the_account_and_the_retry_runs_on_the_next(self) -> None:
+        pool = self.pool()
         self.scenario([{"stderr": "usage limit reached — please run /login or wait for the window", "exit": 1}])
         with self.assertRaises(ApplicationError) as caught:
             await self.attempt(pool=pool, config=TemporalRunConfig(rate_limit_backoff=timedelta(minutes=20)))
         self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
         self.assertAlmostEqual(
-            pool.held[0], datetime.now(timezone.utc) + timedelta(minutes=20), delta=timedelta(seconds=10)
+            pool.accounts[0].held_until, datetime.now(timezone.utc) + timedelta(minutes=20), delta=timedelta(seconds=10)
         )
-        self.assertEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR, "slot 1 is free: retry promptly")
+        self.assertEqual(pool.accounts[0].active, 0)
+        self.assertGreaterEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR, "account 1 is free: retry promptly")
+        self.assertLessEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR + RESET_DELAY_SPREAD)
+        self.assertEqual(caught.exception.details[0]["attempt"]["limit_kind"], "usage")
 
-    async def test_a_named_reset_holds_its_slot_and_the_retry_rotates_to_a_free_one(self) -> None:
-        pool = Pool("CODEX_AUTH_JSON", ('{"token": "slot-0"}', '{"token": "slot-1"}'))
+    async def test_a_named_reset_holds_the_account_until_then(self) -> None:
+        pool = self.pool()
         reset = (datetime.now() + timedelta(hours=2)).replace(second=0, microsecond=0)
         self.scenario([{
             "stderr": f"You've hit your usage limit. try again at {reset.strftime('%b %d, %Y %I:%M %p')}.",
@@ -167,11 +175,48 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ApplicationError) as caught:
             await self.attempt(pool=pool)
         self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
-        self.assertAlmostEqual(pool.held[0], reset.astimezone(timezone.utc), delta=timedelta(seconds=1))
-        self.assertEqual(
-            caught.exception.next_retry_delay, RESET_DELAY_FLOOR,
-            "slot 0 is held until its reset; slot 1 is free, so the retry runs there now",
+        self.assertAlmostEqual(pool.accounts[0].held_until, reset.astimezone(timezone.utc), delta=timedelta(seconds=1))
+        self.assertLessEqual(
+            caught.exception.next_retry_delay, RESET_DELAY_FLOOR + RESET_DELAY_SPREAD,
+            "account 0 is held until its reset; account 1 is free, so the retry runs there now",
         )
+
+    async def test_a_rate_limit_re_runs_the_attempt_in_place_with_the_cap_halved(self) -> None:
+        """Too many requests on the account is not a spent window: the same
+        activity attempt runs the process again after a pause, resuming the
+        session, and the account carries less until it earns it back."""
+        pool = self.pool(share=6)
+        first = {
+            "emit": [{"type": "thread.started", "thread_id": "th_1"}],
+            "stderr": "exceeded retry limit, last status: 429 Too Many Requests",
+            "exit": 1,
+        }
+        second = {
+            "emit": [{"type": "thread.started", "thread_id": "th_1"}],
+            "write": [{"path": str(self.out_path()), "text": '{"ok": true}'}],
+        }
+        self.scenario([first, second])
+        # The session's transcript is in the CLI home, so a resume has something to reopen.
+        rollout = Path(self.sandbox.workspace) / "codex-home" / "sessions" / "2026" / "09" / "03" / "rollout-1-th_1.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n")
+        env = ActivityEnvironment()  # a real window: the default info's ran out in 1970
+        env.info = dataclasses.replace(
+            env.info, scheduled_time=datetime.now(timezone.utc), schedule_to_close_timeout=timedelta(hours=8)
+        )
+        report, beats = await self.attempt(
+            activity_env=env, pool=pool, config=TemporalRunConfig(rate_limit_pause=timedelta(seconds=0.2))
+        )
+        self.assertEqual(report.outcome, outcomes.VALID)
+        self.assertEqual([a["outcome"] for a in report.attempts], [outcomes.VALID], "one Temporal attempt, one record")
+        calls = sorted((self.tmp / "calls").glob("call-*.json"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("resume", json.loads(calls[1].read_text())["argv"], "the second run resumed the session")
+        # Halved to one (the account carried one); the re-run lands wherever is
+        # free once the pause lifts — back here grows it by one, so at most two.
+        self.assertIn(pool.accounts[0].cap, (1, 2))
+        self.assertEqual(pool.accounts[1].cap, 6, "the other account was never told anything but success")
+        self.assertTrue(any("rate limit: run 2 of 4" in (b["progress"].get("message") or "") for b in beats))
 
     async def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:
         self.valid_scenario()
@@ -314,3 +359,18 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_re_runs_are_bounded_and_then_the_attempt_escapes_to_temporal(self) -> None:
+        pool = self.pool()
+        self.scenario([{"stderr": "exceeded retry limit, last status: 429 Too Many Requests", "exit": 1}])
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(
+            env.info, scheduled_time=datetime.now(timezone.utc), schedule_to_close_timeout=timedelta(hours=8)
+        )
+        config = TemporalRunConfig(rate_limit_pause=timedelta(seconds=0.1), rate_limit_reruns=2)
+        with self.assertRaises(ApplicationError) as caught:
+            await self.attempt(activity_env=env, pool=pool, config=config)
+        self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
+        self.assertEqual(len(list((self.tmp / "calls").glob("call-*.json"))), 3, "the run and two re-runs")
+        self.assertEqual(caught.exception.details[0]["attempt"]["limit_kind"], "rate")
+

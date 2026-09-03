@@ -35,6 +35,9 @@ from agent_runner.harness.claude_stream import ClaudeStreamParser
 from agent_runner.util import write_text
 
 
+RETRIES_BEFORE_RATE_SIGNAL = 3
+
+
 def claude_command() -> str | None:
     """PATH lookup with the RUNNER_CLAUDE_CLI environment override (the
     override is also what points the fake-CLI test rig at a stub)."""
@@ -74,7 +77,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
         doctor=False,
         final_message_artifact=False,
     )
-    terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    terminal_markers: ClassVar[tuple[tuple[str, str | None, tuple[str, ...]], ...]] = (
         COMMON_TERMINAL_MARKERS
     )
     # The subscription cap's synthetic turn names its reset the way the CLI
@@ -291,11 +294,15 @@ class ClaudeCodeAdapter(HarnessAdapter):
         A ``rate_limit_event`` with status ``rejected`` is the subscription
         cap (live tier, 2026-08-21: the CLI then prints a synthetic "You've
         hit your session limit" turn, exits 0, and the result carries
-        ``is_error``); it classifies ``rate_limited`` with the reset time
-        typed on the error, so the retry can wait exactly that long. A 401/403 ``api_retry`` event is a dead credential the
-        CLI will retry ~10 times over ~20 minutes of exponential backoff
-        (2026-08-09); the attempt must fail as auth now, not as timeout after
-        the ladder runs out."""
+        ``is_error``); it classifies ``rate_limited`` of kind ``usage`` with
+        the reset time typed on the error, so the retry can wait exactly
+        that long. An ``api_retry`` event is the CLI's own retry ladder (~10
+        tries over ~20 minutes, 2026-08-09): on 401/403 the credential is
+        dead and the attempt fails as auth now; a 429 the CLI is still
+        retrying past its second try is an account over its concurrency, and
+        the attempt ends ``rate_limited`` of kind ``rate`` so the pool can
+        throttle instead of every session waiting the ladder out (the first
+        two retries cost seconds and ride out a lone 429)."""
         if payload.get("type") == "rate_limit_event":
             info = payload.get("rate_limit_info") or {}
             if info.get("status") != "rejected":
@@ -316,24 +323,18 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 alert=False,
                 details=message,
                 resets_at=resets_at,
+                kind=outcomes.LIMIT_USAGE,
             )
         if payload.get("type") == "system" and payload.get("subtype") == "api_retry":
             try:
                 status = int(payload.get("error_status") or 0)
             except (TypeError, ValueError):
                 return None
+            message = f"claude api_retry: {payload.get('error') or 'retrying'} (HTTP {status})"
             if status in (401, 403):
-                message = (
-                    f"claude api_retry: {payload.get('error') or 'auth failure'} "
-                    f"(HTTP {status})"
-                )
-                return RunnerError(
-                    message,
-                    code=outcomes.AUTH,
-                    retryable=False,
-                    alert=True,
-                    details=message,
-                )
+                return RunnerError(message, code=outcomes.AUTH, retryable=False, alert=True, details=message)
+            if status == 429 and int(payload.get("attempt") or 0) >= RETRIES_BEFORE_RATE_SIGNAL:
+                return RunnerError(message, code=outcomes.RATE_LIMITED, details=message, kind=outcomes.LIMIT_RATE)
         return None
 
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:

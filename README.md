@@ -281,6 +281,10 @@ env = prepare_session_homes(Path("/data"))
 
 Many sandboxes on one ChatGPT login would log each other out: a refresh by one rotates the token for all. `agent_runner.harness.codex.sandbox_credential(auth_json)` is the login a sandbox should receive — the same tokens with `refresh_token` blanked, which `codex exec` accepts and cannot rotate.
 
+Several accounts of one CLI form a **pool**: `agent_runner.pool.Pool(var, credentials, share)`, handed to `run_sandboxed_attempt(pool=...)`. Each attempt runs on the least-loaded account with room under its cap. While every account is full, the attempt waits (heartbeating) instead of failing. `share` is your worker's slots divided among the accounts: the most one account is ever asked to carry.
+
+A rate-limited attempt says which limit it hit. `rate` (too many requests at once) halves the account's cap to what it carried and re-runs the attempt in place after a jittered pause that doubles each time. `server` (the provider is busy) re-runs it after the same pause. Both re-run a few times at most (`TemporalRunConfig.rate_limit_reruns`) and only while the activity's window allows. `usage` (the subscription window is spent) holds the account until the reset the CLI named, and the activity retries on the next free account. Every valid attempt grows its account's cap back by one.
+
 
 
 ## Sandboxes

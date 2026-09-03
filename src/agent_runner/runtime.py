@@ -28,7 +28,8 @@ class RunnerError(Exception):
     proof; ``alert`` marks an operator-worthy fact — the caller maps it onto
     its own alerting (agent-runner itself never notifies anyone).
     ``resets_at`` is when a ``rate_limited`` failure lifts, when the CLI
-    said so.
+    said so; ``kind`` is which limit it was (``outcomes.LIMIT_RATE``,
+    ``LIMIT_USAGE``, ``LIMIT_SERVER``), the thing a credential pool answers.
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class RunnerError(Exception):
         alert: bool = False,
         details: str = "",
         resets_at: datetime | None = None,
+        kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -47,6 +49,7 @@ class RunnerError(Exception):
         self.alert = alert
         self.details = details
         self.resets_at = resets_at
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,8 @@ class AttemptReport:
     the handle a later attempt resumes. ``error`` is the operator-facing
     message for non-valid outcomes; ``detail`` the CLI-owned error text
     behind it; ``resets_at`` when a ``rate_limited`` outcome lifts, if the
-    CLI said. ``data`` is the validator's parsed output on ``valid``.
+    CLI said, and ``limit_kind`` which limit it was (``rate``, ``usage``,
+    ``server``). ``data`` is the validator's parsed output on ``valid``.
     ``usage`` is what this attempt alone spent; ``session_usage`` is the
     session's total at the end of it, every attempt on the session
     included. ``attempts`` is the record of every attempt of this activity,
@@ -169,6 +173,7 @@ class AttemptReport:
     error: str = ""
     detail: str = ""
     resets_at: datetime | None = None
+    limit_kind: str | None = None
     data: dict[str, Any] | None = None
     usage: Usage = field(default_factory=Usage)
     session_usage: Usage = field(default_factory=Usage)

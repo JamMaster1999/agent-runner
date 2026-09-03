@@ -7,26 +7,34 @@ the worker; this one runs it in a sandbox the project opened
 record, same outcome-to-retry mapping on the way out — what changes is
 where the process lives and how liveness is judged:
 
-- the heartbeat pumps through every phase — the stale kill, the exec,
-  the stream — so the server never mistakes a slow platform for a dead
-  worker. The attempt process is judged here instead: its stream ticks
-  every ``heartbeat_seconds``, so a sandbox silent for the activity's
-  heartbeat timeout (no line, no exit, no status) is a wedged or dead
-  attempt, killed by pid and ended ``infra``. The retry lands back in the
-  same sandbox and resumes the session
+- the heartbeat pumps through every phase — the wait for an account, the
+  stale kill, the exec, the stream — so the server never mistakes a slow
+  platform for a dead worker. The attempt process is judged here instead:
+  its stream ticks every ``heartbeat_seconds``, so a sandbox silent for
+  the activity's heartbeat timeout (no line, no exit, no status) is a
+  wedged or dead attempt, killed by pid and ended ``infra``. The retry
+  lands back in the same sandbox and resumes the session
 - a sandbox that is gone (TTL, crash, terminate) raises ``sandbox_gone``,
   non-retryable at the activity: only the workflow can open another
 - a cancelled activity ends the attempt process with one ``kill`` before
   the cancellation propagates; the sandbox itself is the project's to
   close
+- a rate limit is answered by its kind. ``rate`` (too many requests at
+  once) throttles the account and re-runs the attempt in place after a
+  pause that doubles each time, ``server`` (the provider is busy) re-runs
+  it after the same pause, a few times at most and only while the window
+  allows; ``usage`` (the subscription window is spent) — and a limit an
+  older sandbox left unnamed — holds the account until its reset and the
+  activity retries on the pool's next free account
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
-from contextlib import suppress
-from datetime import timedelta
+from contextlib import nullcontext, suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from temporalio import activity
@@ -42,6 +50,7 @@ from agent_runner.runtime import AttemptReport, RunSpec, Usage
 from agent_runner.temporal.activity import (
     HeartbeatState,
     TemporalRunConfig,
+    activity_deadline,
     attempt_record,
     conclude,
     heartbeat_callbacks,
@@ -51,13 +60,15 @@ from agent_runner.temporal.activity import (
     starting_state,
 )
 from agent_runner.temporal.retry import failure_details
+from agent_runner.util import jitter
 from agent_runner.workspace import attempt_workdir, pid_file
 
 START_SECONDS = 900.0         # the stale kill plus the exec, on a platform under load
 SILENCE_SECONDS = 120.0       # when the activity names no heartbeat timeout
 CANCEL_GRACE_SECONDS = 30.0   # how long a cancel waits for the stream to close
 KILL_GRACE_SECONDS = 2        # TERM, then KILL
-EXEC_GRACE_SECONDS = 600.0
+EXEC_GRACE_SECONDS = 600.0    # cleanup and validation after the attempt's own budget
+MIN_RERUN_MINUTES = 5.0       # less than this left in the window: escape to Temporal instead
 ENDED_POLLS = 3
 STDERR_TAIL = 4000
 
@@ -102,28 +113,26 @@ async def run_sandboxed_attempt(
     """One attempt in ``sandbox`` via ``command`` (the project's entrypoint
     that calls ``remote.serve``). ``env`` rides the exec, over the sandbox's
     own — the place for what changes per attempt; ``pool`` adds the
-    credential this attempt's slot holds (agent_runner.pool). Returns the
-    ``valid`` report, raises an ``ApplicationError`` typed with the outcome
-    word otherwise, and ``sandbox_gone`` (non-retryable) when the sandbox
-    ended under it. The activity's heartbeat timeout is how long the
-    attempt's stream may go silent, so it must leave the ticks (every
-    ``config.heartbeat_seconds``) room: several ticks, not one."""
+    credential of the account this attempt runs on (agent_runner.pool).
+    Returns the ``valid`` report, raises an ``ApplicationError`` typed with
+    the outcome word otherwise, and ``sandbox_gone`` (non-retryable) when
+    the sandbox ended under it. The activity's heartbeat timeout is how
+    long the attempt's stream may go silent, so it must leave the ticks
+    (every ``config.heartbeat_seconds``) room: several ticks, not one."""
     config = config or TemporalRunConfig()
     info = activity.info()
-    slot = pool.slot(info.attempt) if pool else 0
-    if pool:
-        env = {**(env or {}), **pool.env(slot)}
     state = starting_state(spec.key, info, prior_heartbeat_details(), agent, config)
     state.sandbox = sandbox.id
     pidfile = str(pid_file(sandbox.workspace, spec.key))
+    silence = (info.heartbeat_timeout or timedelta(seconds=SILENCE_SECONDS)).total_seconds()
+    deadline = activity_deadline(info)
+    on_event, on_session, on_usage = heartbeat_callbacks(state)
     request = AttemptRequest(
         spec=spec,
         task=task,
         workdir=str(attempt_workdir(sandbox.workspace, spec.key, info.attempt)),
         validator=validator,
         agent=agent,
-        session_ref=state.session_ref,
-        session_usage=dict(state.session_usage),
         run_id=info.workflow_run_id or "",
         attempt=info.attempt,
         timeout_minutes=timeout_minutes,
@@ -133,20 +142,29 @@ async def run_sandboxed_attempt(
         pid_file=pidfile,
         tick_seconds=config.heartbeat_seconds,
     )
-    # The exec's own deadline: the attempt's budget plus the time its
-    # cleanup and validation may take — never open-ended (a dead worker
-    # on the platform's side could otherwise hold the call forever).
-    exec_timeout = (
-        int(timeout_minutes * 60 + EXEC_GRACE_SECONDS) if timeout_minutes is not None else None
-    )
-    silence = (info.heartbeat_timeout or timedelta(seconds=SILENCE_SECONDS)).total_seconds()
-    on_event, on_session, on_usage = heartbeat_callbacks(state)
-    started_at = now_iso()
 
     def infra(error: str, detail: str = "") -> AttemptReport:
         return AttemptReport(outcome=outcomes.INFRA, session_ref=state.session_ref, error=error, detail=detail)
 
-    async with heartbeating(state, config.heartbeat_seconds):
+    def budget(at: datetime) -> float | None:
+        """The minutes a re-run may take: the caller's budget, cut to what
+        is left of the activity's window less the cleanup grace. (The first
+        run takes the caller's budget as given — the caller sized it.)"""
+        if deadline is None:
+            return timeout_minutes
+        left = (deadline - at).total_seconds() / 60 - EXEC_GRACE_SECONDS / 60
+        return left if timeout_minutes is None else min(timeout_minutes, left)
+
+    async def run_once(env: Mapping[str, str] | None, minutes: float | None, started_at: str) -> AttemptReport:
+        """One attempt process, start to report. Raises ``sandbox_gone`` and
+        re-raises cancellation; every other failure is a report."""
+        this = dataclasses.replace(
+            request, session_ref=state.session_ref, session_usage=dict(state.session_usage), timeout_minutes=minutes
+        )
+        # The exec's own deadline: the attempt's budget plus the time its
+        # cleanup and validation may take — never open-ended (a dead worker
+        # on the platform's side could otherwise hold the call forever).
+        exec_timeout = int(minutes * 60 + EXEC_GRACE_SECONDS) if minutes is not None else None
         proc: Proc | None = None
         pid: int | None = None
         report: AttemptReport | None = None
@@ -154,9 +172,7 @@ async def run_sandboxed_attempt(
         try:
             async with asyncio.timeout(START_SECONDS):
                 await kill_stale(sandbox, pidfile)
-                proc = await sandbox.exec(
-                    *command, stdin=request.to_json().encode(), env=env, timeout=exec_timeout
-                )
+                proc = await sandbox.exec(*command, stdin=this.to_json().encode(), env=env, timeout=exec_timeout)
             lines = proc.lines()
             while True:
                 async with asyncio.timeout(silence) as watchdog:
@@ -217,7 +233,40 @@ async def run_sandboxed_attempt(
             else:
                 what = f"the attempt in sandbox {sandbox.id} failed: {exc!r}"
             report = infra(f"{spec.key}: {what}")
-    return conclude(state, info, report, started_at, config, pool, slot)
+        return report
+
+    async with heartbeating(state, config.heartbeat_seconds):
+        reruns = 0
+        while True:
+            started_at = now_iso()
+            minutes = timeout_minutes if reruns == 0 else budget(datetime.now(timezone.utc))
+            async with (pool.lease() if pool else nullcontext()) as slot:
+                report = await run_once({**(env or {}), **pool.env(slot)} if pool else env, minutes, started_at)
+                # The pool hears the verdict while this attempt still counts against its account.
+                at = datetime.now(timezone.utc)
+                pause = jitter(config.rate_limit_pause * 2**reruns)
+                if report.outcome == outcomes.VALID and pool:
+                    pool.succeeded(slot)
+                if report.outcome != outcomes.RATE_LIMITED:
+                    break
+                if report.limit_kind == outcomes.LIMIT_RATE and pool:
+                    pool.throttle(slot, at + pause)
+                elif report.limit_kind not in (outcomes.LIMIT_RATE, outcomes.LIMIT_SERVER):
+                    if pool:
+                        pool.hold(slot, report.resets_at or at + config.rate_limit_backoff)
+                    break
+            reruns += 1
+            left = budget(at + pause)
+            if reruns > config.rate_limit_reruns or (left is not None and left < MIN_RERUN_MINUTES):
+                break
+            on_event(StreamEvent(
+                "rate_limited",
+                f"{report.limit_kind} limit: run {reruns + 1} of {config.rate_limit_reruns + 1} in {pause.total_seconds():.0f}s",
+            ))
+            activity.heartbeat(state.payload())
+            await asyncio.sleep(pause.total_seconds())
+    resets_at = pool.next_free() if pool and report.outcome == outcomes.RATE_LIMITED else None
+    return conclude(state, info, report, started_at, config, resets_at)
 
 
 async def _ended(sandbox: Sandbox) -> bool:
