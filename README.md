@@ -340,7 +340,7 @@ What the supervisor guarantees:
 
 ## Giving an agent a browser
 
-A run can declare that it needs a browser. The `cdp_browser` resource starts headless Chrome and hands its DevTools (CDP) address into the task as a template value, so a scraping agent can drive a real browser. Runs that declare nothing carry no browser code.
+A run can declare that it needs a browser. The `cdp_browser` resource starts headless Chrome, announcing itself as plain Chrome so bot rules that block the `HeadlessChrome` token let it through, and hands its DevTools (CDP) address into the task as a template value, so a scraping agent can drive a real browser. Runs that declare nothing carry no browser code.
 
 ```python
 from agent_runner.resources import cdp_browser

@@ -5,15 +5,19 @@ Ported from the production CDP lifecycle: a headless Chrome with
 ``--remote-debugging-port=0``, the live endpoint read from the profile's
 ``DevToolsActivePort`` file, values delivered as JSON-encoded scalars so
 one task template renders a quoted string when the runner supplies a
-browser and ``null`` when the agent manages its own.
+browser and ``null`` when the agent manages its own. The browser
+announces itself as plain Chrome: the ``HeadlessChrome`` token is the
+one string bot rules (Cloudflare's included) block on sight.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +61,16 @@ def find_browser_binary() -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def user_agent(browser: Path) -> str:
+    """What this binary would send if it were not headless: Chrome reports
+    only its major version, so the string is the real one minus the
+    ``Headless`` token."""
+    version = subprocess.run([str(browser), "--version"], capture_output=True, text=True).stdout
+    major = re.search(r"\b(\d+)\.\d+\.\d+\.\d+", version).group(1)
+    platform = "Macintosh; Intel Mac OS X 10_15_7" if sys.platform == "darwin" else "X11; Linux x86_64"
+    return f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 
 
 def parse_devtools_active_port(text: str) -> tuple[str, str]:
@@ -167,6 +181,7 @@ class CdpBrowserProvider:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-networking",
+            f"--user-agent={user_agent(browser)}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-debugging-port=0",
             f"--user-data-dir={profile_dir}",
