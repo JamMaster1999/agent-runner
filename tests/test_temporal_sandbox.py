@@ -208,17 +208,15 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
             activity_env=env, pool=pool, config=TemporalRunConfig(rate_limit_pause=timedelta(seconds=0.2))
         )
         self.assertEqual(report.outcome, outcomes.VALID)
-        self.assertEqual([a["outcome"] for a in report.attempts], [outcomes.RATE_LIMITED, outcomes.VALID])
-        self.assertEqual(report.attempts[0]["limit_kind"], "rate")
-        self.assertEqual({a["attempt"] for a in report.attempts}, {1}, "one Temporal attempt, two runs")
+        self.assertEqual([a["outcome"] for a in report.attempts], [outcomes.VALID], "one Temporal attempt, one record")
         calls = sorted((self.tmp / "calls").glob("call-*.json"))
         self.assertEqual(len(calls), 2)
         self.assertIn("resume", json.loads(calls[1].read_text())["argv"], "the second run resumed the session")
-        self.assertEqual(pool.accounts[0].cap, 1, "halved to one: the account carried one")
-        self.assertGreater(pool.accounts[0].held_until, datetime.now(timezone.utc), "and paused")
-        auth = next(Path(self.sandbox.workspace).rglob("codex-home/auth.json"))
-        self.assertEqual(auth.read_text(), '{"token": "slot-1"}', "the re-run landed on the free account")
-        self.assertTrue(any("rate limit on account 0" in (b["progress"].get("message") or "") for b in beats))
+        # Halved to one (the account carried one); the re-run lands wherever is
+        # free once the pause lifts — back here grows it by one, so at most two.
+        self.assertIn(pool.accounts[0].cap, (1, 2))
+        self.assertEqual(pool.accounts[1].cap, 6, "the other account was never told anything but success")
+        self.assertTrue(any("rate limit: run 2 of 4" in (b["progress"].get("message") or "") for b in beats))
 
     async def test_a_valid_report_with_the_sandbox_in_every_heartbeat(self) -> None:
         self.valid_scenario()
@@ -361,3 +359,18 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_re_runs_are_bounded_and_then_the_attempt_escapes_to_temporal(self) -> None:
+        pool = self.pool()
+        self.scenario([{"stderr": "exceeded retry limit, last status: 429 Too Many Requests", "exit": 1}])
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(
+            env.info, scheduled_time=datetime.now(timezone.utc), schedule_to_close_timeout=timedelta(hours=8)
+        )
+        config = TemporalRunConfig(rate_limit_pause=timedelta(seconds=0.1), rate_limit_reruns=2)
+        with self.assertRaises(ApplicationError) as caught:
+            await self.attempt(activity_env=env, pool=pool, config=config)
+        self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
+        self.assertEqual(len(list((self.tmp / "calls").glob("call-*.json"))), 3, "the run and two re-runs")
+        self.assertEqual(caught.exception.details[0]["attempt"]["limit_kind"], "rate")
+

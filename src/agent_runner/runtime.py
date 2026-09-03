@@ -28,9 +28,8 @@ class RunnerError(Exception):
     proof; ``alert`` marks an operator-worthy fact — the caller maps it onto
     its own alerting (agent-runner itself never notifies anyone).
     ``resets_at`` is when a ``rate_limited`` failure lifts, when the CLI
-    said so; ``kind`` is which limit it was (``agent_runner.pool.KINDS``:
-    ``rate``, ``usage``, or ``server``), the thing a credential pool
-    throttles on.
+    said so; ``kind`` is which limit it was (``outcomes.LIMIT_RATE``,
+    ``LIMIT_USAGE``, ``LIMIT_SERVER``), the thing a credential pool answers.
     """
 
     def __init__(

@@ -13,6 +13,8 @@ unset.
 from __future__ import annotations
 
 import os
+import random
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -57,3 +59,10 @@ def write_text(path: Path, text: str) -> None:
     """mkdir-then-write: attempt-dir files land without a caller import."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def jitter(base: timedelta, spread: float = 0.5) -> timedelta:
+    """``base`` scaled by a random factor in [1 - spread, 1 + spread]: two
+    hundred attempts told to wait the same time must not return together."""
+    return base * random.uniform(1 - spread, 1 + spread)
+

@@ -48,6 +48,11 @@ STALLED = "stalled"
 # invocation, or stdin closed before the prompt arrived.
 SPAWN_FAILURE = "spawn_failure"
 
+# Which limit a rate_limited attempt hit — what a credential pool answers.
+LIMIT_RATE = "rate"        # too many requests at once on the account
+LIMIT_USAGE = "usage"      # the subscription window is spent until it resets
+LIMIT_SERVER = "server"    # the provider is overloaded; no account's doing
+
 OUTCOMES = (
     VALID,
     INVALID_SCHEMA,

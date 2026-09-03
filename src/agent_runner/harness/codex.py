@@ -211,7 +211,7 @@ class CodexAdapter(HarnessAdapter):
         doctor=True,
         final_message_artifact=True,
     )
-    terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    terminal_markers: ClassVar[tuple[tuple[str, str | None, tuple[str, ...]], ...]] = (
         COMMON_TERMINAL_MARKERS
     )
 

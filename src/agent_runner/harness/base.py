@@ -23,31 +23,26 @@ from typing import Any, ClassVar, Mapping
 
 from agent_runner import outcomes
 from agent_runner.harness.stream import iter_jsonl
-from agent_runner.pool import KIND_RATE, KIND_SERVER, KIND_USAGE
 from agent_runner.runtime import RunnerError, RunSpec
 from agent_runner.util import read_tail
 
-# The three limits a CLI reports as text, each by the words the pinned CLIs
-# use for it (Claude Code 2.1.220, Codex 0.146.0 — codex-rs protocol/src/
-# error.rs and the CLI's own limit strings). Order matters: Claude's
+# Terminal-failure markers shared by every CLI dialect so far: (outcome word,
+# limit kind, the words), matched only against CLI-owned error text. Order
+# matters — first match wins: a subscription CLI's "usage limit" text must
+# classify rate_limited before the auth/billing sweep sees it, and Claude's
 # "Server is temporarily limiting requests (not your usage limit) · Rate
-# limited" names all three and is the server's doing. Typed stream events
-# (``stream_fatal``) beat this table wherever a CLI emits one.
-LIMIT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (KIND_SERVER, ("temporarily limiting requests", "overloaded", "high demand", "at capacity")),
-    (KIND_USAGE, ("usage limit", "session limit", "weekly limit", "hit your limit")),
-    (KIND_RATE, ("too many requests", "429", "rate limit", "rate_limit")),
-)
-
-# Terminal-failure markers shared by every CLI dialect so far: the codes ARE
-# outcome words, matched only against CLI-owned error text. Order matters —
-# first match wins, and a subscription CLI's "usage limit" text must classify
-# rate_limited before the auth/billing sweep sees it. An adapter whose CLI
-# genuinely diverges overrides its ``terminal_markers`` class variable.
-COMMON_TERMINAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (outcomes.RATE_LIMITED, tuple(marker for _, markers in LIMIT_MARKERS for marker in markers)),
+# limited" names all three limits and is the server's doing. The words are
+# the pinned CLIs' own (Claude Code 2.1.220; Codex 0.146.0, codex-rs
+# protocol/src/error.rs); typed stream events (``stream_fatal``) beat this
+# table wherever a CLI emits one. An adapter whose CLI genuinely diverges
+# overrides its ``terminal_markers`` class variable.
+COMMON_TERMINAL_MARKERS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
+    (outcomes.RATE_LIMITED, outcomes.LIMIT_SERVER, ("temporarily limiting requests", "overloaded", "high demand", "at capacity")),
+    (outcomes.RATE_LIMITED, outcomes.LIMIT_USAGE, ("usage limit", "session limit", "weekly limit", "hit your limit")),
+    (outcomes.RATE_LIMITED, outcomes.LIMIT_RATE, ("too many requests", "rate limit", "rate_limit")),
     (
         outcomes.AUTH,
+        None,
         (
             "authentication_error",
             "authentication_failed",
@@ -69,6 +64,7 @@ COMMON_TERMINAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         outcomes.SPAWN_FAILURE,
+        None,
         (
             "unknown option",
             "unknown argument",
@@ -79,11 +75,6 @@ COMMON_TERMINAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
 )
-
-
-def limit_kind(lower: str) -> str:
-    """Which limit a rate_limited text names (``LIMIT_MARKERS`` order)."""
-    return next(kind for kind, markers in LIMIT_MARKERS if any(marker in lower for marker in markers))
 
 
 @dataclass(frozen=True)
@@ -156,7 +147,7 @@ class HarnessAdapter(ABC):
     # transcript tails, whose web-research content can contain tokens like
     # '403' or 'api key' incidentally. Marker codes ARE outcome words
     # (agent_runner.outcomes); anything unmatched classifies ``infra``.
-    terminal_markers: ClassVar[tuple[tuple[str, tuple[str, ...]], ...]] = ()
+    terminal_markers: ClassVar[tuple[tuple[str, str | None, tuple[str, ...]], ...]] = ()
 
     # -- credentials & homes (the Modal model, ruling D1) ------------------
 
@@ -334,18 +325,17 @@ class HarnessAdapter(ABC):
         must never pass agent transcript tails; use ``error_report`` for
         attempt logs."""
         lower = (text or "").lower()
-        for code, markers in self.terminal_markers:
+        for code, kind, markers in self.terminal_markers:
             if any(marker in lower for marker in markers):
                 terminal = code in outcomes.TERMINAL
-                limited = code == outcomes.RATE_LIMITED
                 return RunnerError(
                     f"{self.name} {code} failure reported by the CLI",
                     code=code,
                     retryable=not terminal,
                     alert=terminal,
                     details=text,
-                    resets_at=self.reset_time_in(text) if limited else None,
-                    kind=limit_kind(lower) if limited else None,
+                    resets_at=self.reset_time_in(text) if code == outcomes.RATE_LIMITED else None,
+                    kind=kind,
                 )
         return None
 

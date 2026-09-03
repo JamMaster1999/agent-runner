@@ -59,10 +59,11 @@ class TemporalRunConfig:
     # finish anyway.
     rate_limit_reset_cap: timedelta = timedelta(hours=6)
     rate_limit_reset_margin: timedelta = timedelta(minutes=15)
-    # The pause (jittered) before a sandboxed attempt re-runs in place after
-    # a rate or server limit — the account is over its concurrency or the
-    # provider is busy, and the window is not spent.
+    # A sandboxed attempt that hits a rate or server limit (the window is
+    # not spent) re-runs in place: at most ``rate_limit_reruns`` times, after
+    # a jittered pause that starts at ``rate_limit_pause`` and doubles.
     rate_limit_pause: timedelta = timedelta(seconds=30)
+    rate_limit_reruns: int = 3
 
 
 @dataclass
