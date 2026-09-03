@@ -9,6 +9,7 @@ JSON-encoded template values, the null overlay for agent-managed runs).
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,12 +26,24 @@ from agent_runner.resources.cdp_browser import (  # noqa: E402
     CdpBrowserProvider,
     cdp_variables,
     parse_devtools_active_port,
+    user_agent,
 )
 from agent_runner.templates import (  # noqa: E402
     CDP_BROWSER_ENDPOINT,
     CDP_BROWSER_WEBSOCKET_URL,
     substitute,
 )
+
+
+class UserAgentTest(unittest.TestCase):
+    def test_headless_token_is_gone_and_the_major_version_is_the_binarys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "chromium"
+            fake.write_text("#!/bin/sh\necho 'Chromium 128.0.6613.137 built on Debian'\n")
+            fake.chmod(0o755)
+            agent = user_agent(fake)
+        self.assertIn("Chrome/128.0.0.0", agent)
+        self.assertNotIn("Headless", agent)
 
 
 class DevToolsActivePortTest(unittest.TestCase):
