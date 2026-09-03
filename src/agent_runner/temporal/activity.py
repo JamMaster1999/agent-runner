@@ -26,10 +26,11 @@ import asyncio
 import dataclasses
 import hashlib
 import threading
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 from temporalio import activity
 
@@ -292,54 +293,60 @@ async def run_agent_attempt(
         # for whatever was lost — time, never correctness.
         workdirs.verify_or_discard(checkpoint.directory, checkpoint.term)
     on_event, on_session, on_usage = heartbeat_callbacks(state)
+    stop = threading.Event()
+    started_at = now_iso()
+    async with heartbeating(state, config.heartbeat_seconds):
+        inner = asyncio.create_task(
+            asyncio.to_thread(
+                run_attempt,
+                spec,
+                task,
+                workdir,
+                agent=agent,
+                validate=validate,
+                on_event=on_event,
+                on_session=on_session,
+                on_usage=on_usage,
+                session_ref=session_ref,
+                session_usage=Usage.from_dict(state.session_usage),
+                run_id=info.workflow_run_id or "",
+                attempt=info.attempt,
+                variables=variables,
+                resources=resources,
+                timeout_minutes=timeout_minutes,
+                should_stop=stop.is_set,
+                watch_dirs=(checkpoint.directory,) if checkpoint is not None else (),
+            )
+        )
+        try:
+            report = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            # Graceful cancel: terminate and reap the CLI before propagating.
+            stop.set()
+            with suppress(AttemptCancelled, asyncio.CancelledError):
+                await inner
+            raise
+    return conclude(state, info, report, started_at, config)
+
+
+@asynccontextmanager
+async def heartbeating(state: HeartbeatState, seconds: float) -> AsyncIterator[None]:
+    """The heartbeat pump: ``state``'s payload every ``seconds`` for as
+    long as the body runs. The server learns the attempt is alive; whether
+    the agent still is, is the body's own judgment."""
 
     async def pump() -> None:
         while True:
             activity.heartbeat(state.payload())
-            await asyncio.sleep(config.heartbeat_seconds)
+            await asyncio.sleep(seconds)
 
-    stop = threading.Event()
-    pump_task = asyncio.create_task(pump())
-    started_at = now_iso()
-    inner = asyncio.create_task(
-        asyncio.to_thread(
-            run_attempt,
-            spec,
-            task,
-            workdir,
-            agent=agent,
-            validate=validate,
-            on_event=on_event,
-            on_session=on_session,
-            on_usage=on_usage,
-            session_ref=session_ref,
-            session_usage=Usage.from_dict(state.session_usage),
-            run_id=info.workflow_run_id or "",
-            attempt=info.attempt,
-            variables=variables,
-            resources=resources,
-            timeout_minutes=timeout_minutes,
-            should_stop=stop.is_set,
-            watch_dirs=(checkpoint.directory,) if checkpoint is not None else (),
-        )
-    )
+    task = asyncio.create_task(pump())
     try:
-        report = await asyncio.shield(inner)
-    except asyncio.CancelledError:
-        # Graceful cancel: terminate and reap the CLI before propagating.
-        stop.set()
-        try:
-            await inner
-        except (AttemptCancelled, asyncio.CancelledError):
-            pass
-        raise
+        yield
     finally:
-        pump_task.cancel()
-        try:
-            await pump_task
-        except asyncio.CancelledError:
-            pass
-    return conclude(state, info, report, started_at, config)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def heartbeat_callbacks(

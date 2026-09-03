@@ -7,12 +7,17 @@ child's budget. The adaptor is the whole vocabulary a caller may use —
 ``poll`` / ``terminate`` on the sandbox — so no platform call ever
 appears in a project.
 
+The contract is async: every call awaits the platform, and a process's
+output is an async iterator of lines. A supervisor on an event loop
+therefore keeps heartbeating through the slowest create or exec, and
+reads a stream without a thread or a queue between it and the process.
+
 Two backends: ``ModalExecutor`` (a Modal Sandbox on the published worker
-image) and ``LocalExecutor`` (the same lifecycle as subprocesses on this
-host — the bare-box backend and the test double, the same class). Both
-hand the sandbox its workspace root through ``AGENT_RUNNER_WORKSPACE``
-and expose it as ``Sandbox.workspace``, so the caller never guesses a
-path.
+image, on Modal's own async API) and ``LocalExecutor`` (the same lifecycle
+as asyncio subprocesses on this host — the bare-box backend and the test
+double, the same class). Both hand the sandbox its workspace root through
+``AGENT_RUNNER_WORKSPACE`` and expose it as ``Sandbox.workspace``, so the
+caller never guesses a path.
 
 ``ExecutorGone`` is the one failure a caller must route: the sandbox no
 longer exists (TTL, crash, terminate), so the attempt cannot continue in
@@ -21,15 +26,14 @@ it and only a new sandbox can — never a plain retry.
 
 from __future__ import annotations
 
+import asyncio
 import os
-import subprocess
-import tempfile
-import threading
+import signal
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 from agent_runner.runtime import RunnerError
 from agent_runner.workspace import READY_MARKER, RELEASE_MARKER, WORKSPACE_ENV, marker
@@ -38,6 +42,9 @@ SANDBOX_GONE = "sandbox_gone"
 # Modal bills the greater of reserved and used, so the request stays tiny
 # and only the limit (the money backstop) comes from the caller.
 MEMORY_REQUEST_MB = 512
+# The longest line the local backend reads from a process: a report line
+# carries the validated payload whole.
+LINE_LIMIT = 64 * 1024 * 1024
 
 
 class ExecutorGone(RunnerError):
@@ -68,15 +75,15 @@ class Proc(ABC):
     """One command running inside a sandbox."""
 
     @abstractmethod
-    def lines(self) -> Iterator[str]:
+    def lines(self) -> AsyncIterator[str]:
         """Stdout line by line (newline stripped) until the process ends."""
 
     @abstractmethod
-    def wait(self) -> int:
+    async def wait(self) -> int:
         """The exit code."""
 
     @abstractmethod
-    def stderr(self) -> str:
+    async def stderr(self) -> str:
         """Everything the process wrote to stderr, read after it ended."""
 
 
@@ -87,7 +94,7 @@ class Sandbox(ABC):
     tags: dict[str, str]
 
     @abstractmethod
-    def exec(
+    async def exec(
         self,
         *command: str,
         stdin: bytes | None = None,
@@ -100,28 +107,33 @@ class Sandbox(ABC):
         returned ``Proc`` once the sandbox has ended under it."""
 
     @abstractmethod
-    def poll(self) -> int | None:
+    async def poll(self) -> int | None:
         """The entrypoint's exit code once the sandbox ended, else None."""
 
     @abstractmethod
-    def terminate(self) -> None:
+    async def terminate(self) -> None:
         """Destroy the sandbox and everything in it. Idempotent."""
+
+    async def ensure_alive(self) -> None:
+        rc = await self.poll()
+        if rc is not None:
+            raise ExecutorGone(f"sandbox {self.id} has ended (rc={rc})")
 
 
 class Executor(ABC):
     @abstractmethod
-    def create(self, spec: SandboxSpec) -> Sandbox: ...
+    async def create(self, spec: SandboxSpec) -> Sandbox: ...
 
     @abstractmethod
-    def find(self, name: str) -> Sandbox | None:
+    async def find(self, name: str) -> Sandbox | None:
         """The running sandbox of that name, else None."""
 
     @abstractmethod
-    def attach(self, sandbox_id: str) -> Sandbox:
+    async def attach(self, sandbox_id: str) -> Sandbox:
         """A handle on a running sandbox by id; ``ExecutorGone`` otherwise."""
 
     @abstractmethod
-    def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
+    async def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
         """Every running sandbox carrying all of ``tags``."""
 
 
@@ -131,7 +143,7 @@ class Executor(ABC):
 class ModalExecutor(Executor):
     """Sandboxes on Modal, on the image built from the project's own
     Dockerfile (one recipe, any backend). ``modal`` is imported here and
-    nowhere else."""
+    nowhere else; every call is the SDK's own ``.aio`` form."""
 
     def __init__(
         self,
@@ -150,9 +162,9 @@ class ModalExecutor(Executor):
         self._app: Any = None
         self._image: Any = None
 
-    def app(self) -> Any:
+    async def app(self) -> Any:
         if self._app is None:
-            self._app = self.modal.App.lookup(self.app_name, create_if_missing=True)
+            self._app = await self.modal.App.lookup.aio(self.app_name, create_if_missing=True)
         return self._app
 
     def image(self) -> Any:
@@ -162,12 +174,12 @@ class ModalExecutor(Executor):
             )
         return self._image
 
-    def create(self, spec: SandboxSpec) -> Sandbox:
+    async def create(self, spec: SandboxSpec) -> Sandbox:
         # The name rides in the tags so attach/list can recover it.
         tags = {**spec.tags, "name": spec.name}
-        sandbox = self.modal.Sandbox.create(
+        sandbox = await self.modal.Sandbox.create.aio(
             *spec.command,
-            app=self.app(),
+            app=await self.app(),
             name=spec.name,
             image=self.image(),
             timeout=spec.ttl_seconds,
@@ -179,31 +191,32 @@ class ModalExecutor(Executor):
         )
         return ModalSandbox(self, sandbox, spec.name, tags)
 
-    def find(self, name: str) -> Sandbox | None:
+    async def find(self, name: str) -> Sandbox | None:
         try:
-            sandbox = self.modal.Sandbox.from_name(self.app_name, name)
+            sandbox = await self.modal.Sandbox.from_name.aio(self.app_name, name)
         except self.modal.exception.NotFoundError:
             return None
-        if sandbox.poll() is not None:
+        if await sandbox.poll.aio() is not None:
             return None
-        return ModalSandbox(self, sandbox, name, sandbox.get_tags())
+        return ModalSandbox(self, sandbox, name, await sandbox.get_tags.aio())
 
-    def attach(self, sandbox_id: str) -> Sandbox:
+    async def attach(self, sandbox_id: str) -> Sandbox:
         try:
-            sandbox = self.modal.Sandbox.from_id(sandbox_id)
+            sandbox = await self.modal.Sandbox.from_id.aio(sandbox_id)
         except self.modal.exception.NotFoundError as exc:
             raise ExecutorGone(f"sandbox {sandbox_id} no longer exists") from exc
-        if sandbox.poll() is not None:
-            raise ExecutorGone(f"sandbox {sandbox_id} has ended (rc={sandbox.poll()})")
-        tags = sandbox.get_tags()
-        return ModalSandbox(self, sandbox, tags.get("name", sandbox_id), tags)
+        tags = await sandbox.get_tags.aio()
+        handle = ModalSandbox(self, sandbox, tags.get("name", sandbox_id), tags)
+        await handle.ensure_alive()
+        return handle
 
-    def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
+    async def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
         found = []
-        for sandbox in self.modal.Sandbox.list(app_id=self.app().app_id, tags=dict(tags)):
-            if sandbox.poll() is not None:
+        app = await self.app()
+        async for sandbox in self.modal.Sandbox.list.aio(app_id=app.app_id, tags=dict(tags)):
+            if await sandbox.poll.aio() is not None:
                 continue
-            all_tags = sandbox.get_tags()
+            all_tags = await sandbox.get_tags.aio()
             found.append(ModalSandbox(self, sandbox, all_tags.get("name", sandbox.object_id), all_tags))
         return found
 
@@ -217,41 +230,44 @@ class ModalSandbox(Sandbox):
         self.workspace = executor.workspace
         self.tags = tags
 
-    def exec(
+    async def exec(
         self,
         *command: str,
         stdin: bytes | None = None,
         env: Mapping[str, str] | None = None,
         timeout: int | None = None,
     ) -> Proc:
-        if self.poll() is not None:
-            raise ExecutorGone(f"sandbox {self.id} has ended (rc={self.poll()})")
-        with self.gone_guard():
-            process = self._sandbox.exec(*command, env=dict(env or {}), timeout=timeout)
+        await self.ensure_alive()
+        async with self.gone_guard():
+            # Line-buffered text: the SDK hands over whole lines, so a JSON
+            # line is never torn.
+            process = await self._sandbox.exec.aio(
+                *command, env=dict(env or {}), timeout=timeout, text=True, bufsize=1
+            )
             if stdin is not None:
                 process.stdin.write(stdin)
             process.stdin.write_eof()
-            process.stdin.drain()
+            await process.stdin.drain.aio()
         return ModalProc(self, process)
 
-    @contextmanager
-    def gone_guard(self) -> Iterator[None]:
+    @asynccontextmanager
+    async def gone_guard(self) -> AsyncIterator[None]:
         """Modal answers a dead sandbox with NotFoundError, ConflictError
         ("already finished"), or a dropped connection, depending on which
         call notices first. Any of them on an ended sandbox is one thing."""
         try:
             yield
         except self._modal.exception.Error as exc:
-            if self.poll() is not None:
+            if await self.poll() is not None:
                 raise ExecutorGone(f"sandbox {self.id} is gone: {exc}") from exc
             raise
 
-    def poll(self) -> int | None:
-        return self._sandbox.poll()
+    async def poll(self) -> int | None:
+        return await self._sandbox.poll.aio()
 
-    def terminate(self) -> None:
+    async def terminate(self) -> None:
         try:
-            self._sandbox.terminate()
+            await self._sandbox.terminate.aio()
         except self._modal.exception.NotFoundError:
             pass
 
@@ -261,26 +277,18 @@ class ModalProc(Proc):
         self._sandbox = sandbox
         self._process = process
 
-    def lines(self) -> Iterator[str]:
-        # The stream arrives in chunks, not lines; split here so a JSON
-        # line is never handed over torn.
-        buffer = ""
-        with self._sandbox.gone_guard():
-            for chunk in self._process.stdout:
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    yield line
-        if buffer:
-            yield buffer
+    async def lines(self) -> AsyncIterator[str]:
+        async with self._sandbox.gone_guard():
+            async for line in self._process.stdout:
+                yield line.rstrip("\n")
 
-    def wait(self) -> int:
-        with self._sandbox.gone_guard():
-            return self._process.wait()
+    async def wait(self) -> int:
+        async with self._sandbox.gone_guard():
+            return await self._process.wait.aio()
 
-    def stderr(self) -> str:
+    async def stderr(self) -> str:
         try:
-            return self._process.stderr.read()
+            return await self._process.stderr.read.aio()
         except Exception:
             return ""
 
@@ -300,7 +308,7 @@ class LocalExecutor(Executor):
         self.root = Path(root)
         self._sandboxes: dict[str, LocalSandbox] = {}
 
-    def create(self, spec: SandboxSpec) -> Sandbox:
+    async def create(self, spec: SandboxSpec) -> Sandbox:
         home = self.root / spec.name
         home.mkdir(parents=True, exist_ok=True)
         workspace = home / "work"
@@ -311,33 +319,32 @@ class LocalExecutor(Executor):
             marker(workspace, name).unlink(missing_ok=True)
         env = {**os.environ, **spec.env, **spec.secrets, WORKSPACE_ENV: str(workspace)}
         with (home / "keeper.log").open("ab") as log:
-            process = subprocess.Popen(
-                list(spec.command), cwd=str(home), env=env, stdout=log, stderr=subprocess.STDOUT
+            process = await asyncio.create_subprocess_exec(
+                *spec.command, cwd=str(home), env=env, stdout=log, stderr=asyncio.subprocess.STDOUT
             )
         sandbox = LocalSandbox(spec.name, home, process, env, str(workspace), dict(spec.tags))
-        sandbox.ttl = threading.Timer(spec.ttl_seconds, sandbox.terminate)
-        sandbox.ttl.daemon = True
-        sandbox.ttl.start()
+        sandbox.ttl = asyncio.get_running_loop().call_later(spec.ttl_seconds, sandbox.expire)
         self._sandboxes[sandbox.id] = sandbox
         return sandbox
 
-    def find(self, name: str) -> Sandbox | None:
+    async def find(self, name: str) -> Sandbox | None:
         for sandbox in self._sandboxes.values():
-            if sandbox.name == name and sandbox.poll() is None:
+            if sandbox.name == name and await sandbox.poll() is None:
                 return sandbox
         return None
 
-    def attach(self, sandbox_id: str) -> Sandbox:
+    async def attach(self, sandbox_id: str) -> Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
-        if sandbox is None or sandbox.poll() is not None:
+        if sandbox is None:
             raise ExecutorGone(f"sandbox {sandbox_id} is not running on this host")
+        await sandbox.ensure_alive()
         return sandbox
 
-    def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
+    async def list(self, tags: Mapping[str, str]) -> list[Sandbox]:
         return [
             sandbox
             for sandbox in self._sandboxes.values()
-            if sandbox.poll() is None and all(sandbox.tags.get(k) == v for k, v in tags.items())
+            if await sandbox.poll() is None and all(sandbox.tags.get(k) == v for k, v in tags.items())
         ]
 
 
@@ -346,7 +353,7 @@ class LocalSandbox(Sandbox):
         self,
         name: str,
         home: Path,
-        process: subprocess.Popen,
+        process: asyncio.subprocess.Process,
         env: dict[str, str],
         workspace: str,
         tags: dict[str, str],
@@ -355,96 +362,103 @@ class LocalSandbox(Sandbox):
         self.name = name
         self.workspace = workspace
         self.tags = tags
-        self.ttl: threading.Timer | None = None
+        self.ttl: asyncio.TimerHandle | None = None
+        self._expiry: asyncio.Task[None] | None = None
         self._home = home
         self._process = process
         self._env = env
         self._procs: list[LocalProc] = []
 
-    def exec(
+    async def exec(
         self,
         *command: str,
         stdin: bytes | None = None,
         env: Mapping[str, str] | None = None,
         timeout: int | None = None,
     ) -> Proc:
-        if self.poll() is not None:
-            raise ExecutorGone(f"sandbox {self.id} has ended (rc={self.poll()})")
-        stderr = tempfile.TemporaryFile()
-        self._procs = [proc for proc in self._procs if proc.poll() is None]
-        process = subprocess.Popen(
-            list(command),
+        await self.ensure_alive()
+        self._procs = [proc for proc in self._procs if proc.running()]
+        process = await asyncio.create_subprocess_exec(
+            *command,
             env={**self._env, **(env or {})},
             cwd=str(self._home),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=LINE_LIMIT,
         )
-        # Feed stdin from a thread: a large request must never deadlock
-        # against a child that starts writing before it finishes reading.
-        threading.Thread(target=_feed, args=(process, stdin), daemon=True).start()
-        proc = LocalProc(process, stderr)
-        if timeout is not None:
-            proc.deadline = threading.Timer(timeout, proc.kill)
-            proc.deadline.daemon = True
-            proc.deadline.start()
+        proc = LocalProc(process, stdin, timeout)
         self._procs.append(proc)
         return proc
 
-    def poll(self) -> int | None:
-        return self._process.poll()
+    async def poll(self) -> int | None:
+        return self._process.returncode
 
-    def terminate(self) -> None:
+    def expire(self) -> None:
+        # Held: a task nothing references may be dropped before it runs.
+        self._expiry = asyncio.get_running_loop().create_task(self.terminate())
+
+    async def terminate(self) -> None:
         if self.ttl is not None:
             self.ttl.cancel()
         # The keeper first: a supervisor that sees its exec die must find
         # the sandbox already ended, never a live keeper for one more poll.
-        if self._process.poll() is None:
-            self._process.kill()
-            self._process.wait()
+        if self._process.returncode is None:
+            _kill(self._process)
+            await self._process.wait()
         for proc in self._procs:
             proc.kill()
 
 
-def _feed(process: subprocess.Popen, stdin: bytes | None) -> None:
+def _kill(process: asyncio.subprocess.Process) -> None:
+    # Straight to the kernel: Process.kill() polls first and would reap a
+    # child the loop's watcher is about to reap itself.
+    with suppress(ProcessLookupError):
+        os.kill(process.pid, signal.SIGKILL)
+
+
+async def _feed(process: asyncio.subprocess.Process, stdin: bytes | None) -> None:
     try:
         if stdin:
             process.stdin.write(stdin)
-    except (BrokenPipeError, OSError):
+            await process.stdin.drain()
+    except OSError:
         pass
     finally:
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
+        process.stdin.close()
 
 
 class LocalProc(Proc):
-    def __init__(self, process: subprocess.Popen, stderr: Any) -> None:
+    def __init__(self, process: asyncio.subprocess.Process, stdin: bytes | None, timeout: int | None) -> None:
         self._process = process
-        self._stderr = stderr
-        self.deadline: threading.Timer | None = None
+        # stdin and stderr each get a task of their own: a large request
+        # must never deadlock against a child that writes before it reads,
+        # and a chatty stderr must never block the child on a full pipe.
+        # Both are held here: a task nothing references may be dropped.
+        self._feeder = asyncio.create_task(_feed(process, stdin))
+        self._stderr = asyncio.create_task(process.stderr.read())
+        self._deadline = (
+            asyncio.get_running_loop().call_later(timeout, self.kill) if timeout is not None else None
+        )
 
-    def lines(self) -> Iterator[str]:
-        for raw in self._process.stdout:
+    async def lines(self) -> AsyncIterator[str]:
+        async for raw in self._process.stdout:
             yield raw.decode("utf-8", errors="replace").rstrip("\n")
 
-    def wait(self) -> int:
-        rc = self._process.wait()
-        if self.deadline is not None:
-            self.deadline.cancel()
+    async def wait(self) -> int:
+        rc = await self._process.wait()
+        if self._deadline is not None:
+            self._deadline.cancel()
         return rc
 
-    def poll(self) -> int | None:
-        return self._process.poll()
+    def running(self) -> bool:
+        return self._process.returncode is None
 
-    def stderr(self) -> str:
-        self._stderr.seek(0)
-        return self._stderr.read().decode("utf-8", errors="replace")
+    async def stderr(self) -> str:
+        return (await self._stderr).decode("utf-8", errors="replace")
 
     def kill(self) -> None:
-        if self.deadline is not None:
-            self.deadline.cancel()
-        if self._process.poll() is None:
-            self._process.kill()
-            self._process.wait()
+        if self._deadline is not None:
+            self._deadline.cancel()
+        if self.running():
+            _kill(self._process)
