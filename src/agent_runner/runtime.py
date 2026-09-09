@@ -160,7 +160,10 @@ class AttemptReport:
     message for non-valid outcomes; ``detail`` the CLI-owned error text
     behind it; ``resets_at`` when a ``rate_limited`` outcome lifts, if the
     CLI said, and ``limit_kind`` which limit it was (``rate``, ``usage``,
-    ``server``). ``data`` is the validator's parsed output on ``valid``.
+    ``server``). ``window_resets_at`` is when the account's usage window
+    resets as the CLI last said during the attempt, whatever the outcome —
+    the pool keeps it per account for a later failure that names no reset.
+    ``data`` is the validator's parsed output on ``valid``.
     ``usage`` is what this attempt alone spent; ``session_usage`` is the
     session's total at the end of it, every attempt on the session
     included. ``attempts`` is the record of every attempt of this activity,
@@ -174,6 +177,7 @@ class AttemptReport:
     detail: str = ""
     resets_at: datetime | None = None
     limit_kind: str | None = None
+    window_resets_at: datetime | None = None
     data: dict[str, Any] | None = None
     usage: Usage = field(default_factory=Usage)
     session_usage: Usage = field(default_factory=Usage)

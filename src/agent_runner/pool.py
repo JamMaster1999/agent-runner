@@ -31,6 +31,7 @@ class Account:
     cap: int
     active: int = 0
     held_until: datetime | None = None
+    resets_at: datetime | None = None   # the usage window's reset, as the last attempt on the account heard it
 
     def held(self, at: datetime) -> bool:
         return self.held_until is not None and self.held_until > at
@@ -101,6 +102,16 @@ class Pool:
         """Nothing new runs on the account before ``until``; a hold never shortens one."""
         account = self.accounts[slot]
         account.held_until = max(account.held_until or until, until)
+
+    def observe(self, slot: int, resets_at: datetime | None) -> None:
+        """An attempt heard when the account's usage window resets."""
+        if resets_at is not None:
+            self.accounts[slot].resets_at = resets_at
+
+    def window_reset(self, slot: int, at: datetime) -> datetime | None:
+        """The remembered reset while it is still ahead; None once it passed."""
+        resets_at = self.accounts[slot].resets_at
+        return resets_at if resets_at is not None and resets_at > at else None
 
     def next_free(self, at: datetime | None = None) -> datetime:
         """When a retry may run: now while an account is free, else the earliest hold to lift."""

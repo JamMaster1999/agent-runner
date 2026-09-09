@@ -101,6 +101,7 @@ def report_to_json(report: AttemptReport) -> dict[str, Any]:
         "detail": report.detail,
         "resets_at": report.resets_at.isoformat() if report.resets_at else None,
         "limit_kind": report.limit_kind,
+        "window_resets_at": report.window_resets_at.isoformat() if report.window_resets_at else None,
         "data": report.data,
         "usage": report.usage.as_dict(),
         "session_usage": report.session_usage.as_dict(),
@@ -111,6 +112,7 @@ def report_to_json(report: AttemptReport) -> dict[str, Any]:
 
 def report_from_json(data: dict[str, Any]) -> AttemptReport:
     resets_at = data.get("resets_at")
+    window_resets_at = data.get("window_resets_at")
     return AttemptReport(
         outcome=data["outcome"],
         session_ref=data.get("session_ref"),
@@ -118,6 +120,7 @@ def report_from_json(data: dict[str, Any]) -> AttemptReport:
         detail=data.get("detail") or "",
         resets_at=datetime.fromisoformat(resets_at) if resets_at else None,
         limit_kind=data.get("limit_kind"),
+        window_resets_at=datetime.fromisoformat(window_resets_at) if window_resets_at else None,
         data=data.get("data"),
         usage=Usage.from_dict(data.get("usage") or {}),
         session_usage=Usage.from_dict(data.get("session_usage") or {}),

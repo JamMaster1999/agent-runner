@@ -165,6 +165,16 @@ class SandboxedAttemptTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(caught.exception.next_retry_delay, RESET_DELAY_FLOOR + RESET_DELAY_SPREAD)
         self.assertEqual(caught.exception.details[0]["attempt"]["limit_kind"], "usage")
 
+    async def test_a_timeless_usage_limit_holds_the_account_until_the_reset_it_reported_before(self) -> None:
+        pool = self.pool()
+        reset = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=3)
+        pool.observe(0, reset)
+        self.scenario([{"stderr": "usage limit reached — please run /login or wait for the window", "exit": 1}])
+        with self.assertRaises(ApplicationError) as caught:
+            await self.attempt(pool=pool, config=TemporalRunConfig(rate_limit_backoff=timedelta(minutes=20)))
+        self.assertEqual(caught.exception.type, outcomes.RATE_LIMITED)
+        self.assertEqual(pool.accounts[0].held_until, reset, "the remembered window, not the backoff")
+
     async def test_a_named_reset_holds_the_account_until_then(self) -> None:
         pool = self.pool()
         reset = (datetime.now() + timedelta(hours=2)).replace(second=0, microsecond=0)
