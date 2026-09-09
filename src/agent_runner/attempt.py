@@ -332,6 +332,10 @@ def _apply(report: AttemptReport, spec: RunSpec, failure: RunnerError) -> Attemp
     report.error = f"{spec.key}: {failure}"
     report.detail = failure.details
     report.resets_at = failure.resets_at
+    if report.resets_at is None and failure.kind == outcomes.LIMIT_USAGE:
+        # A spent window whose failure text names no reset: the window the
+        # CLI reported earlier in this attempt is the same window.
+        report.resets_at = report.window_resets_at
     report.limit_kind = failure.kind
     return report
 
@@ -636,6 +640,9 @@ def run_attempt(
                     fatal = adapter.stream_fatal(payload)
                     if fatal is not None:
                         fatal_errors.append(fatal)
+                    window_reset = adapter.stream_window_reset(payload)
+                    if window_reset is not None:
+                        report.window_resets_at = window_reset
                     # The session ref rides the lines already being tailed —
                     # no log rescan, ever.
                     if report.session_ref is None or report.session_ref == session_ref:

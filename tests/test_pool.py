@@ -69,6 +69,16 @@ class PoolTest(unittest.IsolatedAsyncioTestCase):
         pool.hold(1, until=reset + timedelta(hours=1))
         self.assertEqual(pool.next_free(NOW), reset, "every account held: the earliest reset")
 
+    async def test_an_observed_window_reset_is_remembered_while_it_is_ahead(self) -> None:
+        pool = Pool("TOKEN", ("a", "b"), share=4)
+        self.assertIsNone(pool.window_reset(0, NOW), "nothing heard yet")
+        pool.observe(0, None)
+        self.assertIsNone(pool.window_reset(0, NOW), "an attempt that heard nothing changes nothing")
+        pool.observe(0, NOW + timedelta(hours=3))
+        self.assertEqual(pool.window_reset(0, NOW), NOW + timedelta(hours=3))
+        self.assertIsNone(pool.window_reset(1, NOW), "per account")
+        self.assertIsNone(pool.window_reset(0, NOW + timedelta(hours=4)), "a passed reset says nothing about the next window")
+
     async def test_a_hold_lifts_by_the_clock_without_a_release(self) -> None:
         pool = Pool("TOKEN", ("a",), share=1)
         pool.hold(0, until=soon(0.3))

@@ -38,7 +38,7 @@ from agent_runner.util import read_tail
 # overrides its ``terminal_markers`` class variable.
 COMMON_TERMINAL_MARKERS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     (outcomes.RATE_LIMITED, outcomes.LIMIT_SERVER, ("temporarily limiting requests", "overloaded", "high demand", "at capacity")),
-    (outcomes.RATE_LIMITED, outcomes.LIMIT_USAGE, ("usage limit", "session limit", "weekly limit", "hit your limit")),
+    (outcomes.RATE_LIMITED, outcomes.LIMIT_USAGE, ("usage limit", "session limit", "weekly limit", "hit your limit", "disabled claude subscription access")),
     (outcomes.RATE_LIMITED, outcomes.LIMIT_RATE, ("too many requests", "rate limit", "rate_limit")),
     (
         outcomes.AUTH,
@@ -290,6 +290,14 @@ class HarnessAdapter(ABC):
         the CLI's own backoff ladder. Typed evidence beats marker text — the
         event's own status code decides the outcome word, so a CLI wording
         change can never misroute it. Default: no such evidence."""
+        return None
+
+    def stream_window_reset(self, payload: dict[str, Any]) -> datetime | None:
+        """When the account's current usage window resets, if this LIVE
+        stream event says — a fact about the account, not a verdict on the
+        attempt. The last one heard rides the report, and the pool remembers
+        it per account: a later failure that names no reset waits until then
+        instead of a blind backoff. Default: the CLI never says."""
         return None
 
     def terminal_failure(self, stdout_path: Path) -> str | None:

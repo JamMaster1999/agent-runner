@@ -219,6 +219,10 @@ class LimitKindTest(unittest.TestCase):
     )
     CLAUDE_USAGE = "claude result success: You've hit your session limit · resets 3pm (UTC)"
     CLAUDE_SERVER = "claude result success: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+    CLAUDE_ORG_403 = (
+        "claude result success: Your organization has disabled Claude subscription access for Claude Code"
+        " · Use an Anthropic API key instead, or ask your admin to enable access"
+    )
 
     def test_the_text_names_the_kind(self) -> None:
         for adapter, text, kind in (
@@ -226,6 +230,7 @@ class LimitKindTest(unittest.TestCase):
             (get_adapter("codex"), self.CODEX_USAGE, outcomes.LIMIT_USAGE),
             (get_adapter("codex"), "Selected model is at capacity. Please try a different model.", outcomes.LIMIT_SERVER),
             (get_adapter("claude"), self.CLAUDE_USAGE, outcomes.LIMIT_USAGE),
+            (get_adapter("claude"), self.CLAUDE_ORG_403, outcomes.LIMIT_USAGE),
             (get_adapter("claude"), self.CLAUDE_SERVER, outcomes.LIMIT_SERVER),
             (get_adapter("claude"), "Repeated 529 Overloaded errors", outcomes.LIMIT_SERVER),
         ):
@@ -255,6 +260,22 @@ class LimitKindTest(unittest.TestCase):
         self.assertIsNone(claude.stream_fatal({"type": "system", "subtype": "api_retry", "error_status": 529}), "a 529 is the CLI's to retry")
         dead = claude.stream_fatal({"type": "system", "subtype": "api_retry", "error_status": 401})
         self.assertEqual((dead.code, dead.kind), (outcomes.AUTH, None))
+
+    def test_claude_limit_events_name_the_window_reset_whatever_their_status(self) -> None:
+        # The spent-window 403 (2026-09-09) names no time; the reset comes from
+        # the rate_limit_event every turn carries, allowed or not, with the
+        # five-hour window preferred over the top-level (limiting) one.
+        claude = get_adapter("claude")
+        allowed = {"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "rateLimitType": "seven_day", "resetsAt": 1788990000,
+            "unifiedWindows": {"five_hour": {"utilization": 0.9, "resetsAt": 1788390000}},
+        }}
+        self.assertEqual(claude.stream_window_reset(allowed), datetime.fromtimestamp(1788390000, tz=timezone.utc))
+        bare = {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed_warning", "resetsAt": 1788990000}}
+        self.assertEqual(claude.stream_window_reset(bare), datetime.fromtimestamp(1788990000, tz=timezone.utc))
+        self.assertIsNone(claude.stream_window_reset({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}))
+        self.assertIsNone(claude.stream_window_reset({"type": "assistant"}))
+        self.assertIsNone(get_adapter("codex").stream_window_reset(allowed), "codex never says")
 
     def test_a_non_limit_failure_has_no_kind(self) -> None:
         self.assertIsNone(get_adapter("codex").classify_failure("oauth token has expired").kind)

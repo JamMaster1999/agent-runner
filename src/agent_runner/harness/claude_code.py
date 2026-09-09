@@ -337,6 +337,22 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 return RunnerError(message, code=outcomes.RATE_LIMITED, details=message, kind=outcomes.LIMIT_RATE)
         return None
 
+    def stream_window_reset(self, payload: dict[str, Any]) -> datetime | None:
+        """Every ``rate_limit_event`` — allowed, warning, or rejected — names
+        when the limiting window resets (``resetsAt``; the five-hour window
+        under ``unifiedWindows`` when the CLI reports both), read from the
+        API's rate-limit headers on the turn just made. The subscription's
+        "organization has disabled" 403 (2026-09-09) carries no time at all,
+        so this is where the reset for that failure comes from."""
+        if payload.get("type") != "rate_limit_event":
+            return None
+        info = payload.get("rate_limit_info") or {}
+        window = (info.get("unifiedWindows") or {}).get("five_hour") or {}
+        try:
+            return datetime.fromtimestamp(int(window.get("resetsAt") or info["resetsAt"]), tz=timezone.utc)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            return None
+
     def stream_error_line(self, payload: dict[str, Any]) -> str | None:
         """claude --print emits a final `result` event."""
         if (payload.get("type") or "") == "result":

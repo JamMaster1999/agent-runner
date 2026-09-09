@@ -1078,6 +1078,56 @@ class StreamFatalAbortTest(FakeCliCase):
         self.assertIn("out_of_credits", report.detail)
         self.assertEqual(report.resets_at.isoformat(), "2026-08-21T20:50:00+00:00")
 
+    def test_claude_org_403_waits_for_the_window_an_allowed_event_named(self) -> None:
+        # Once the five-hour window is spent with extra usage off, the API
+        # answers most turns with a 403 the CLI renders as "organization has
+        # disabled subscription access" — no reset in it (2026-09-09). The
+        # allowed rate_limit_event from the turn before carries the window.
+        self.scenario(
+            [
+                {
+                    "emit": [
+                        {"type": "system", "subtype": "init", "session_id": "sess-403", "model": "m"},
+                        {
+                            "type": "rate_limit_event",
+                            "rate_limit_info": {
+                                "status": "allowed",
+                                "rateLimitType": "five_hour",
+                                "resetsAt": 1788390000,
+                                "unifiedWindows": {"five_hour": {"utilization": 0.98, "resetsAt": 1788390000}},
+                            },
+                            "session_id": "sess-403",
+                        },
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": True,
+                            "result": "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access",
+                        },
+                    ],
+                    "exit": 1,
+                }
+            ]
+        )
+        agent = AgentDef(
+            name="fixture-claude-agent", description="fixture", config={}, body="Fixture body.\n"
+        )
+        report = run_attempt(
+            RunSpec(
+                key="fixture__claude",
+                harness="claude",
+                required_env=("FAKE_CLI_SCENARIO", "FAKE_CLI_CALLS"),
+            ),
+            "task",
+            self.workdir,
+            agent=agent,
+            poll_seconds=0.05,
+            timeout_minutes=0.5,
+        )
+        self.assertEqual((report.outcome, report.limit_kind), (outcomes.RATE_LIMITED, outcomes.LIMIT_USAGE))
+        self.assertEqual(report.window_resets_at.isoformat(), "2026-09-02T23:00:00+00:00")
+        self.assertEqual(report.resets_at, report.window_resets_at, "the timeless 403 waits for the window")
+
     def test_claude_rate_limit_allowed_event_is_not_fatal(self) -> None:
         # The CLI also emits rate_limit_event with status "allowed" as a
         # usage notice; only "rejected" ends the attempt.

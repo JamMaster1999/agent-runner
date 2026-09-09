@@ -245,6 +245,8 @@ async def run_sandboxed_attempt(
                 # The pool hears the verdict while this attempt still counts against its account.
                 at = datetime.now(timezone.utc)
                 pause = jitter(config.rate_limit_pause * 2**reruns)
+                if pool:
+                    pool.observe(slot, report.window_resets_at)
                 if report.outcome == outcomes.VALID and pool:
                     pool.succeeded(slot)
                 if report.outcome != outcomes.RATE_LIMITED:
@@ -253,7 +255,10 @@ async def run_sandboxed_attempt(
                     pool.throttle(slot, at + pause)
                 elif report.limit_kind not in (outcomes.LIMIT_RATE, outcomes.LIMIT_SERVER):
                     if pool:
-                        pool.hold(slot, report.resets_at or at + config.rate_limit_backoff)
+                        # A spent window: until the reset the CLI named, else the
+                        # one this account reported on an earlier attempt, else
+                        # the configured backoff.
+                        pool.hold(slot, report.resets_at or pool.window_reset(slot, at) or at + config.rate_limit_backoff)
                     break
             reruns += 1
             left = budget(at + pause)

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -221,13 +222,14 @@ class WireShapeTest(unittest.TestCase):
             error="capped",
             detail="tail",
             limit_kind="usage",
+            window_resets_at=datetime(2026, 9, 9, 12, tzinfo=timezone.utc),
             usage=Usage(tok_input=1, tok_output=2),
             session_usage=Usage(tok_input=3),
             resumed=True,
             repair_rounds_used=1,
         )
         back = report_from_json(report_to_json(report))
-        for name in ("outcome", "session_ref", "error", "detail", "limit_kind", "usage", "session_usage", "resumed", "repair_rounds_used"):
+        for name in ("outcome", "session_ref", "error", "detail", "limit_kind", "window_resets_at", "usage", "session_usage", "resumed", "repair_rounds_used"):
             self.assertEqual(getattr(back, name), getattr(report, name), name)
 
     def test_the_paths_are_under_the_workspace_and_key_safe(self) -> None:
