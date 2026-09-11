@@ -79,6 +79,16 @@ class PoolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pool.window_reset(1, NOW), "per account")
         self.assertIsNone(pool.window_reset(0, NOW + timedelta(hours=4)), "a passed reset says nothing about the next window")
 
+    async def test_a_replaced_credential_rides_the_next_attempt_on_the_same_account(self) -> None:
+        pool = Pool("TOKEN", ("a", "b"), share=4)
+        pool.accounts[0].cap = 2
+        pool.hold(0, until=soon(3600))
+        pool.replace(0, "a-fresh")
+        self.assertEqual(pool.env(0), {"TOKEN": "a-fresh"})
+        self.assertEqual(pool.env(1), {"TOKEN": "b"}, "the other account is untouched")
+        self.assertEqual(pool.accounts[0].cap, 2, "the same account: its cap stays")
+        self.assertTrue(pool.accounts[0].held(NOW + timedelta(seconds=1)), "and so does its hold")
+
     async def test_a_hold_lifts_by_the_clock_without_a_release(self) -> None:
         pool = Pool("TOKEN", ("a",), share=1)
         pool.hold(0, until=soon(0.3))
