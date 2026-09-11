@@ -83,6 +83,11 @@ class Pool:
     def env(self, slot: int) -> dict[str, str]:
         return {self.var: self.credentials[slot]}
 
+    def replace(self, slot: int, credential: str) -> None:
+        """The account's credential from the next attempt on: the same
+        account with fresh tokens, so its cap and hold stay."""
+        self.credentials = self.credentials[:slot] + (credential,) + self.credentials[slot + 1:]
+
     def succeeded(self, slot: int) -> None:
         account = self.accounts[slot]
         account.cap = min(self.share, account.cap + 1)

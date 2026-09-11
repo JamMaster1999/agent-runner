@@ -13,10 +13,14 @@ nothing read from disk."""
 
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
 import shutil
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
@@ -166,6 +170,46 @@ def codex_exec_command(
         parts.append(thread_id)
     parts.append("-")
     return parts
+
+
+REFRESH_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"   # the Codex CLI's public OAuth client (codex-rs/login/src/auth/manager.rs)
+
+
+def login_expires_at(auth_json: str) -> datetime:
+    """When the login's access token expires: the JWT's ``exp`` claim."""
+    claims = json.loads(auth_json)["tokens"]["access_token"].split(".")[1]
+    payload = base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4))
+    return datetime.fromtimestamp(json.loads(payload)["exp"], timezone.utc)
+
+
+def refresh_login(auth_json: str) -> str:
+    """The operator's ``auth.json`` with fresh tokens: the exchange
+    ``codex login`` makes on the operator's behalf, one POST of the refresh
+    token to OpenAI's token endpoint. The refresh token rotates — the one
+    sent is dead once this returns — so the caller must keep the result. A
+    refresh token the server no longer accepts raises ``auth``: the login
+    must be made again by a person."""
+    data = json.loads(auth_json)
+    body = {"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": data["tokens"]["refresh_token"]}
+    request = urllib.request.Request(
+        REFRESH_URL, data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "agent-runner"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            fresh = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:300]
+        if exc.code in (400, 401):
+            raise RunnerError(
+                f"the Codex login can no longer refresh (HTTP {exc.code}): {detail}",
+                code="auth", retryable=False, alert=True,
+            ) from exc
+        raise
+    data["tokens"].update({name: fresh[name] for name in ("id_token", "access_token", "refresh_token")})
+    data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return json.dumps(data)
 
 
 def sandbox_credential(auth_json: str) -> str:
